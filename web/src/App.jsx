@@ -221,6 +221,16 @@ export default function App() {
 
   useEffect(() => { api('/api/interfaces').then((j) => setInterfaces(Array.isArray(j) ? j : [])).catch(() => {}) }, [])
 
+  // Shared fetch, used by both the periodic poller and addTarget() below —
+  // addTarget calls this directly right after adding, instead of waiting up
+  // to 600ms for the next scheduled tick. Without that, there was a window
+  // where selId already pointed at the brand-new target but `targets` (still
+  // holding the pre-add poll response) didn't contain it yet; `sel` falls
+  // back to `targets[0]` whenever the id isn't found, so the panel kept
+  // showing the FIRST target instead of the one just added — worse the more
+  // targets you already had, since the odds of catching that gap go up.
+  const refreshState = async () => { try { const s = await api(`/api/state?focus=${focus}`); setState(s); return s } catch { return null } }
+
   useEffect(() => {
     let alive = true
     const tick = async () => { try { const s = await api(`/api/state?focus=${focus}`); if (alive) setState(s) } catch {} }
@@ -323,7 +333,11 @@ export default function App() {
     const q = new URLSearchParams({ target: form.target.trim(), family: form.family, probe: form.probe, trace: form.trace, timeout: form.timeout, payload: form.payload, maxhops: form.maxhops, raw: form.raw ? '1' : '0' })
     if (iface) q.set('src', iface)
     const r = await api(`/api/add?${q}`, { method: 'POST' })
-    setForm({ ...form, target: '' }); if (r.id) { setSelId(r.id); setSelHop(null) }
+    setForm({ ...form, target: '' })
+    if (r.id) {
+      await refreshState() // ensure `targets` contains the new one before selecting it
+      setSelId(r.id); setSelHop(null)
+    }
   }
   const ctrl = (id, ep, extra = '') => api(`/api/${ep}?id=${id}${extra}`, { method: 'POST' })
   const openDetail = (ip) => {
@@ -494,6 +508,12 @@ export default function App() {
             <>
               <div className="statusbar">
                 <b>{sel.name}</b> → {sel.dest_ip || 'unresolved'} <span className="badge">{sel.family}</span> · {sel.hops.length} hops
+                {sel.warmup_remaining > 0 && (
+                  <span className="badge inline-flex items-center align-middle" title="Newly-added targets probe every hop continuously right away, which can briefly trip ICMP rate-limiting on routers/edges and show an artificial spike. We wait a moment and let it settle before showing stats/graph.">
+                    <span className="spinner sm" style={{ marginRight: 5 }} />
+                    settling… {Math.ceil(sel.warmup_remaining)}s
+                  </span>
+                )}
                 {(() => { const p = sel.hops.filter((h) => ['loss', 'warn', 'bad', 'down'].includes(hopStatus(h))); return p.length > 0 && <span className="err"> ⚠ {p.length} hop{p.length > 1 ? 's' : ''} with loss/latency</span> })()}
                 {sel.error && <span className="err"> ⚠ {sel.error}</span>}
                 <div className="spacer" />
@@ -555,7 +575,7 @@ export default function App() {
                     <table>
                       <thead><tr>
                         <th>Hop</th><th>PL%</th><th>IP</th><th>Host</th><th>ASN</th><th>Network</th>
-                        <th>Sent</th><th>Recv</th><th>Loss%</th><th>Cur</th><th>Avg</th><th>Min</th><th>Max</th><th>Jitter</th>
+                        <th>Sent</th><th>Recv</th><th>Loss%</th><th>Cur</th><th title="Median — stays stable through a single spike, unlike Avg/Max">Med</th><th>Avg</th><th>Min</th><th>Max</th><th>Jitter</th>
                         {view.trend && <th>Trend</th>}
                         {view.latency && <th className="lathead"><span>Latency Graph</span><span className="scalemax">{scaleMax} ms</span></th>}
                       </tr></thead>
@@ -580,7 +600,7 @@ export default function App() {
                               <td className={h.recv < h.sent ? 'loss' : ''}>{h.recv}</td>
                               <td className={h.loss > 0 ? 'loss' : ''}>{h.loss.toFixed(1)}%</td>
                               <td style={{ color: latColor(h.cur, alerts.ms), fontWeight: 600 }}>{h.cur == null ? '*' : fmt(h.cur)}</td>
-                              <td>{fmt(h.avg)}</td><td>{fmt(h.min)}</td><td>{fmt(h.max)}</td><td>{fmt(h.jitter)}</td>
+                              <td className="font-semibold">{fmt(h.med)}</td><td>{fmt(h.avg)}</td><td>{fmt(h.min)}</td><td>{fmt(h.max)}</td><td>{fmt(h.jitter)}</td>
                               {view.trend && <td><Sparkline points={sel.series[String(h.hop)] || []} color={hopColor(i, h.hop === selHop)} /></td>}
                               {view.latency && <td className="latcell"><LatencyGraph h={h} prevAvg={prevAvg} nextAvg={nextAvg} scaleMax={scaleMax} alertMs={alerts.ms} /></td>}
                             </tr>

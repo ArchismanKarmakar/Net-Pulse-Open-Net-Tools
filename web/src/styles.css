@@ -22,17 +22,21 @@
   --shadow-inset: inset 0 1px 0 rgba(255,255,255,.03);
 }
 :root[data-theme=light] {
-  --bg:#eef1f6; --panel:#ffffff; --panel2:#e9eef4; --input-bg:#ffffff;
-  --border:#d3dae4; --border2:#b7c1d0; --btn-bg:#eef2f7; --btn-hover:#dde5ef;
+  --bg:#e8edf3; --panel:#ffffff; --panel2:#eaeff5; --input-bg:#ffffff;
+  --border:#c9d2df; --border2:#aab6c7; --btn-bg:#eef2f7; --btn-hover:#dbe3ef;
   --text:#0f1620; --muted:#3d4a5c; --faint:#5f6b7c; --sel:#dff5fa;
   --accent:#0e7490; --accent2:#0369a1;
   --good:#047857; --good-soft:#0d9488;
   --warn:#a15c07; --warn-soft:#c2760a;
   --bad:#b3400f; --danger:#c81e1e;
-  --grid:#dde4ec; --axis:#5f6b7c;
-  --shadow-sm: 0 1px 2px rgba(30,41,59,.08);
-  --shadow-md: 0 8px 24px -8px rgba(30,41,59,.16), 0 1px 3px rgba(30,41,59,.1);
-  --shadow-inset: inset 0 1px 0 rgba(255,255,255,.7);
+  /* grid needs to visibly contrast against bg, not just differ numerically —
+     the previous value (#dde4ec on #eef1f6) was nearly the same pale tone, so
+     the dot-grid chart texture that's obvious in dark mode was nearly
+     invisible here. */
+  --grid:#b7c2d1; --axis:#5f6b7c;
+  --shadow-sm: 0 1px 3px rgba(30,41,59,.14);
+  --shadow-md: 0 10px 28px -8px rgba(30,41,59,.22), 0 2px 6px rgba(30,41,59,.12);
+  --shadow-inset: inset 0 1px 0 rgba(255,255,255,.8);
 }
 
 /* Theme switch: freeze every transition for one frame while the CSS

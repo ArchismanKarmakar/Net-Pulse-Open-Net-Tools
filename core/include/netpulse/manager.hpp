@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -41,11 +42,29 @@ namespace netpulse {
 // why the app got progressively laggier over time instead of staying flat
 // like PingPlotter. Jumping straight to `cutoff` via lower_bound turns that
 // into O(log N + only the in-window samples), independent of total history.
-inline std::vector<Sample>::const_iterator focus_begin(const std::vector<Sample>& pts,
-                                                         std::optional<double> cutoff) {
+// std::deque (not vector) gives the SAME O(log N) random-access binary search
+// but O(1) pop_front for trimming old samples — see SampleBuf below for why
+// that distinction matters for anything left running 24/7.
+using SampleBuf = std::deque<Sample>;
+
+inline SampleBuf::const_iterator focus_begin(const SampleBuf& pts, std::optional<double> cutoff) {
     if (!cutoff) return pts.begin();
     return std::lower_bound(pts.begin(), pts.end(), *cutoff,
                              [](const Sample& s, double c) { return s.first < c; });
+}
+
+// How many raw samples per hop to retain, given the probe rate. Sized to
+// comfortably cover the longest focus window the UI offers (24h), not a flat
+// one-size-fits-all number: a slow-probing target (e.g. one sample every 10s)
+// needs far fewer than a fast one (e.g. 10/s) to cover the same 24h, so this
+// scales storage to what's actually needed instead of over-provisioning
+// every target for the fastest case. Clamped to a sane floor/ceiling so a
+// misconfigured probe interval can't starve retention or blow up memory.
+inline size_t sample_cap_for(double probe_interval) {
+    constexpr double kMaxFocusSecs = 86400.0; // "Last 24 hours", the longest UI option
+    double interval = probe_interval > 0.01 ? probe_interval : 1.0;
+    double needed = (kMaxFocusSecs / interval) * 1.1; // +10% headroom
+    return static_cast<size_t>(std::clamp(needed, 2000.0, 100000.0));
 }
 
 inline std::string esc(const std::string& s) {
@@ -81,12 +100,27 @@ struct WebTarget {
     std::mutex mtx;
     Snapshot latest;
     bool has = false;
-    std::map<uint8_t, std::vector<Sample>> series;
+    std::map<uint8_t, SampleBuf> series;
+    double added_at = 0; // for the warm-up window — see kWarmupSecs below
     ~WebTarget() {
         if (stop) stop->store(true);
         if (th.joinable()) th.join();
     }
 };
+
+// A freshly-added target immediately probes every hop continuously and at
+// full rate — a much heavier, more sustained burst of ICMP than a one-shot
+// `tracert` ever generates. Some routers/edges rate-limit ICMP generation
+// (RFC 1812) and can visibly throttle or queue replies for the first several
+// seconds of that burst before settling, producing exactly the "big ramp
+// right after adding a target" pattern. That's an external network behavior,
+// not something NetPulse can prevent outright — but we don't have to show it:
+// samples from the first kWarmupSecs after a target is added are still
+// probed (so hop/route discovery isn't delayed) but are excluded from the
+// exposed stats and chart series, so the UI only ever shows data from once
+// things have settled. This does NOT suppress a similar rate-limit event if
+// it recurs LATER in a long-running session — only the one at start.
+constexpr double kWarmupSecs = 12.0;
 
 struct Stat {
     double loss = 0;
@@ -96,7 +130,7 @@ struct Stat {
     size_t sent = 0, recv = 0;
 };
 
-inline Stat compute_stat(const std::vector<Sample>& pts, std::optional<double> focus) {
+inline Stat compute_stat(const SampleBuf& pts, std::optional<double> focus) {
     std::optional<double> cutoff;
     if (focus) cutoff = now_secs() - *focus;
     Stat s;
@@ -117,10 +151,23 @@ inline Stat compute_stat(const std::vector<Sample>& pts, std::optional<double> f
         double avg = sum / rtts.size(), var = 0;
         for (double r : rtts) var += (r - avg) * (r - avg);
         var /= rtts.size();
-        double jit = 0;
-        for (size_t i = 1; i < rtts.size(); ++i) jit += std::abs(rtts[i] - rtts[i - 1]);
-        if (rtts.size() > 1) jit /= (rtts.size() - 1);
-        s.min = mn; s.max = mx; s.avg = avg; s.std = std::sqrt(var); s.jitter = jit;
+        s.min = mn; s.max = mx; s.avg = avg; s.std = std::sqrt(var);
+        // Jitter as the MEDIAN (not mean) of successive absolute differences.
+        // With a mean, a single huge outlier contributes two enormous jumps
+        // (up, then back down) that get averaged over the WHOLE focus window,
+        // so reported jitter stays inflated for as long as that one sample
+        // remains in view — exactly the "takes forever to come back down"
+        // complaint. The median of the same jump sequence is unmoved by one
+        // or two extreme jumps as long as most recent samples are normal, so
+        // it reflects current network behavior almost immediately instead of
+        // the historical worst moment in the window.
+        std::vector<double> diffs;
+        for (size_t i = 1; i < rtts.size(); ++i) diffs.push_back(std::abs(rtts[i] - rtts[i - 1]));
+        if (!diffs.empty()) {
+            std::sort(diffs.begin(), diffs.end());
+            size_t dm = diffs.size() / 2;
+            s.jitter = (diffs.size() % 2) ? diffs[dm] : (diffs[dm - 1] + diffs[dm]) / 2.0;
+        }
         std::vector<double> sorted = rtts;
         std::sort(sorted.begin(), sorted.end());
         size_t m = sorted.size() / 2;
@@ -135,6 +182,7 @@ public:
         auto t = std::make_unique<WebTarget>();
         t->id = nextId_++;
         t->name = name;
+        t->added_at = now_secs();
         t->stop = std::make_unique<std::atomic<bool>>(false);
         t->paused = std::make_unique<std::atomic<bool>>(false);
         WebTarget* raw = t.get();
@@ -158,12 +206,23 @@ public:
 #elif defined(__linux__)
             ::setpriority(PRIO_PROCESS, 0, -5); // best-effort; ignored without CAP_SYS_NICE
 #endif
-            sess->run(stop, paused, [raw](const Snapshot& snap) {
+            sess->run(stop, paused, [raw, sess](const Snapshot& snap) {
                 std::lock_guard<std::mutex> lk(raw->mtx);
+                // Right-sized for this target's own probe rate (see
+                // sample_cap_for) rather than one flat number for everyone,
+                // and trimmed with pop_front — O(1) on a deque, unlike the
+                // O(n) vector::erase(begin()) this used to do on EVERY sample
+                // once a hop's history filled up. That one-line difference is
+                // exactly what made a target left running 24/7 get steadily
+                // slower forever after ~55 hours: every single new probe
+                // reply was shifting up to 200,000 elements to make room.
+                size_t cap = sample_cap_for(sess->settings_snapshot().probe_interval);
+                bool warming_up = (now_secs() - raw->added_at) < kWarmupSecs;
                 for (const auto& np : snap.new_points) {
+                    if (warming_up) continue; // don't expose warm-up-period samples to stats/chart
                     auto& v = raw->series[np.hop];
                     if (v.empty() || v.back().first != np.ts) v.emplace_back(np.ts, np.rtt);
-                    if (v.size() > 200000) v.erase(v.begin());
+                    while (v.size() > cap) v.pop_front();
                 }
                 raw->latest = snap;
                 raw->has = true;
@@ -218,6 +277,10 @@ public:
             std::lock_guard<std::mutex> tl(t.mtx);
             o << "{\"id\":" << t.id << ",\"name\":\"" << esc(t.name) << "\",";
             o << "\"paused\":" << ((t.paused && t.paused->load()) ? "true" : "false") << ",";
+            {
+                double remaining = kWarmupSecs - (now_secs() - t.added_at);
+                o << "\"warmup_remaining\":" << (remaining > 0 ? remaining : 0.0) << ",";
+            }
             o << "\"dest_ip\":\"" << esc(t.latest.dest_ip ? *t.latest.dest_ip : "") << "\",";
             o << "\"family\":\"" << (t.latest.family ? (*t.latest.family == Family::V4 ? "IPv4" : "IPv6") : "") << "\",";
             o << "\"error\":\"" << esc(t.latest.error ? *t.latest.error : "") << "\",";
@@ -237,8 +300,8 @@ public:
             double cutoff = focus ? now_secs() - *focus : 0;
             for (size_t h = 0; h < t.latest.hops.size(); ++h) {
                 const auto& hop = t.latest.hops[h];
-                const std::vector<Sample>& pts =
-                    t.series.count(hop.hop) ? t.series[hop.hop] : std::vector<Sample>{};
+                static const SampleBuf kEmpty;
+                const SampleBuf& pts = t.series.count(hop.hop) ? t.series[hop.hop] : kEmpty;
                 Stat s = compute_stat(pts, focus);
                 o << "{\"hop\":" << int(hop.hop)
                   << ",\"address\":\"" << esc(hop.address ? *hop.address : "*") << "\""

@@ -22,6 +22,14 @@
 
 namespace netpulse {
 
+// Delay between successive hops' FIRST probe, so a fresh session ramps up
+// gradually instead of bursting every hop's packet in the same instant. 25ms
+// matches PingPlotter's own documented fix for this (Options > Engine >
+// Packet Send Delay). For 30 hops that's still well under a second of total
+// ramp-up (30 * 25ms = 750ms) — imperceptible, but enough to stop looking
+// like a burst to a router's rate limiter.
+constexpr double kSendStaggerSecs = 0.025;
+
 Session::Session(uint64_t id, std::string target, Settings settings)
     : id_(id), target_(std::move(target)), settings_(std::move(settings)) {
     icmp_id_ = static_cast<uint16_t>((static_cast<uint64_t>(now_secs())) ^ id_ ^ 0x4242u);
@@ -146,7 +154,18 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
         double soonest = now + 0.25;
         for (uint8_t ttl = 1; ttl <= max_hop; ++ttl) {
             double& nx = next_send[ttl];
-            if (nx == 0.0) nx = now;
+            // Stagger each hop's FIRST send instead of firing all of them in
+            // the same instant. Sending to every hop simultaneously (up to
+            // `max_hops` packets within microseconds of each other) is
+            // exactly the "parallel burst" pattern that trips ICMP
+            // rate-limiting on routers (RFC 1812) — this is the same fix
+            // PingPlotter itself exposes as "Packet Send Delay" in
+            // Edit > Options > Engine, and mtr's inherently sequential,
+            // one-hop-at-a-time design avoids the burst altogether. Once
+            // staggered, each hop's own `interval` cadence naturally
+            // preserves that offset on every subsequent round, so this only
+            // needs to happen once, here.
+            if (nx == 0.0) nx = now + (ttl - 1) * kSendStaggerSecs;
             if (now >= nx) {
                 uint16_t seq = next_seq();
                 if (prober->send(*dest_, ttl, icmp_id_, seq, s.payload_size))

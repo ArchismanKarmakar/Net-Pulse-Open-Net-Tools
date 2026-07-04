@@ -120,7 +120,7 @@ struct WebTarget {
 // exposed stats and chart series, so the UI only ever shows data from once
 // things have settled. This does NOT suppress a similar rate-limit event if
 // it recurs LATER in a long-running session — only the one at start.
-constexpr double kWarmupSecs = 20.0;
+constexpr double kWarmupSecs = 10.0;
 
 struct Stat {
     double loss = 0;

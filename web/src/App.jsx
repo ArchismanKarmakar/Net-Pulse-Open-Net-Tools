@@ -170,6 +170,39 @@ export default function App() {
   const [editForm, setEditForm] = useState(null)
   const [theme, setTheme] = useState(() => { try { return localStorage.getItem('np-theme') || 'dark' } catch { return 'dark' } })
   const chartRef = useRef(null)
+
+  // ---- resizable panels (sidebar width, table/chart split) ----
+  const [sidebarWidth, setSidebarWidth] = useState(() => { const v = Number(localStorage.getItem('np-sidebar-w')); return v >= 230 ? v : 300 })
+  const [tablePct, setTablePct] = useState(() => { const v = Number(localStorage.getItem('np-table-pct')); return v >= 15 && v <= 70 ? v : 38 })
+  const dragRef = useRef(null)
+  const onDrag = (e) => {
+    const d = dragRef.current; if (!d) return
+    if (d.kind === 'sidebar') {
+      setSidebarWidth(Math.min(520, Math.max(230, d.startW + (e.clientX - d.startX))))
+    } else {
+      const total = d.box ? d.box.clientHeight : 600
+      setTablePct(Math.min(70, Math.max(15, d.startPct + ((e.clientY - d.startY) / total) * 100)))
+    }
+  }
+  const endDrag = () => {
+    dragRef.current = null
+    document.body.style.cursor = ''
+    localStorage.setItem('np-sidebar-w', String(sidebarWidth))
+    localStorage.setItem('np-table-pct', String(tablePct))
+    window.removeEventListener('mousemove', onDrag)
+    window.removeEventListener('mouseup', endDrag)
+  }
+  const startDrag = (kind) => (e) => {
+    e.preventDefault()
+    dragRef.current = { kind, startX: e.clientX, startY: e.clientY, startW: sidebarWidth, startPct: tablePct, box: e.currentTarget.closest('main') }
+    document.body.style.cursor = kind === 'sidebar' ? 'col-resize' : 'row-resize'
+    window.addEventListener('mousemove', onDrag)
+    window.addEventListener('mouseup', endDrag)
+  }
+  // Shared "which hop represents the destination" lookup, used by both the
+  // targets-list health colour and its brief stats line.
+  const destHopOf = (t) => { const hops = t.hops || []; return hops.find((h) => h.is_dest) || (hops.length ? hops[hops.length - 1] : null) }
+
   const focus = FOCUS[focusIdx][1]
 
   useEffect(() => {
@@ -224,7 +257,7 @@ export default function App() {
   //   red (down, target unreachable)
   const targetState = (t) => {
     const hops = t.hops || []
-    const d = hops.find((h) => h.is_dest) || (hops.length ? hops[hops.length - 1] : null)
+    const d = destHopOf(t)
     if (!d) return 'ok'
     const lat = d.med ?? d.avg
     const latHigh = lat != null && lat > alerts.ms
@@ -283,6 +316,26 @@ export default function App() {
     }
     return [...byTs.values()].sort((a, b) => a.ts - b.ts)
   }, [sel, shownHops])
+
+  // Outlier-aware Y-axis: a single rate-limited/queued ICMP reply can read
+  // thousands of ms and, left unchecked, flattens the whole normal-latency
+  // band into a line along the bottom (exactly what happened in the 16000ms-
+  // scale screenshot). Default: clip the axis to just above the 95th
+  // percentile so the everyday ~ms band stays readable; real spikes still
+  // draw, they just run off the top of the chart. Togglable per target.
+  const [clipOutliers, setClipOutliers] = useState(true)
+  const { yDomain, clippedSpikes } = useMemo(() => {
+    const vals = []
+    for (const row of chartData) for (const k in row) if (k !== 'ts' && row[k] != null) vals.push(row[k])
+    if (!vals.length || !clipOutliers) return { yDomain: [0, 'auto'], clippedSpikes: 0 }
+    vals.sort((a, b) => a - b)
+    const p95 = vals[Math.floor(vals.length * 0.95)]
+    const max = vals[vals.length - 1]
+    if (max <= p95 * 1.5 || max < 100) return { yDomain: [0, 'auto'], clippedSpikes: 0 }
+    const top = Math.max(Math.ceil(p95 * 1.25), 10)
+    return { yDomain: [0, top], clippedSpikes: vals.filter((v) => v > top).length }
+  }, [chartData, clipOutliers])
+
 
   const exportPng = () => {
     const svg = chartRef.current?.querySelector('svg'); if (!svg) return
@@ -352,20 +405,34 @@ export default function App() {
           <span className="divider" />
           <label className="cb"><input type="checkbox" checked={view.trend} onChange={(e) => setView({ ...view, trend: e.target.checked })} />Trend</label>
           <label className="cb"><input type="checkbox" checked={view.latency} onChange={(e) => setView({ ...view, latency: e.target.checked })} />Latency graph</label>
+          <label className="cb"><input type="checkbox" checked={clipOutliers} onChange={(e) => setClipOutliers(e.target.checked)} title="Keep the everyday latency band readable when a rate-limited hop spikes to thousands of ms" />Clip spikes</label>
         </div>
       </header>
 
       <div className="body">
-        <aside>
+        <aside style={{ width: sidebarWidth }} className="shrink-0 relative">
           <h3>Targets</h3>
           <ul>
             {targets.map((t) => {
               const st = targetState(t)
+              const d = destHopOf(t)
               return (
                 <li key={t.id} className={(sel && t.id === sel.id ? 'sel ' : '') + 's-' + st} onClick={() => { setSelId(t.id); setSelHop(null) }}>
-                  <span className={'dot st-' + st} /> {t.name}
-                  {STATE_LABEL[st] && <span className={'statelabel st-' + st}>{STATE_LABEL[st]}</span>}
+                  <div className="flex items-center">
+                    <span className={'dot st-' + st} /> <span className="truncate">{t.name}</span>
+                    {STATE_LABEL[st] && <span className={'statelabel st-' + st}>{STATE_LABEL[st]}</span>}
+                  </div>
                   <small>{t.dest_ip} {t.family}{t.paused ? ' · paused' : ''}</small>
+                  {d && (
+                    <div className="grid grid-cols-3 gap-x-2.5 gap-y-0.5 mt-1.5 pt-1.5 border-t border-border text-[10px] font-mono text-muted">
+                      <span>min <b className="text-ink">{fmt(d.min)}</b></span>
+                      <span>avg <b className="text-ink">{fmt(d.avg)}</b></span>
+                      <span>med <b className="text-ink">{fmt(d.med)}</b></span>
+                      <span>max <b className="text-ink">{fmt(d.max)}</b></span>
+                      <span>jit <b className="text-ink">{fmt(d.jitter)}</b></span>
+                      <span>pl <b className={d.loss > 0 ? '' : 'text-ink'} style={d.loss > 0 ? { color: 'var(--bad)' } : undefined}>{d.loss.toFixed(0)}%</b></span>
+                    </div>
+                  )}
                 </li>
               )
             })}
@@ -379,7 +446,13 @@ export default function App() {
           )}
           <button onClick={() => exportTargets(false)}>Export targets CSV</button>
           <button onClick={() => exportTargets(true)}>Export targets JSON</button>
+          <div
+            onMouseDown={startDrag('sidebar')}
+            title="Drag to resize"
+            className="resize-handle-x absolute top-0 right-0 h-full w-1.5"
+          />
         </aside>
+
 
         <main>
           {!sel ? <div className="empty">Add a target to begin.</div> : (
@@ -397,10 +470,13 @@ export default function App() {
               {sel.config && (
                 <div className="cfgstrip">
                   <span className="cfglabel">CONFIG</span>
+                  <span className="divider" />
                   <span>probe <b>{sel.config.probe}s</b></span>
                   <span>timeout <b>{sel.config.timeout === 0 ? 'auto' : sel.config.timeout + 's'}</b></span>
+                  <span className="divider" />
                   <span>payload <b>{sel.config.payload}B</b></span>
                   <span>max hops <b>{sel.config.maxhops}</b></span>
+                  <span className="divider" />
                   <span>family <b>{sel.config.family}</b></span>
                   <span>iface <b>{sel.config.src || 'auto'}</b></span>
                   <span>mode <b>{sel.config.raw ? 'raw' : 'dgram'}</b></span>
@@ -440,7 +516,7 @@ export default function App() {
                 </div>
               ) : (
                 <>
-                  <div className="tablewrap">
+                  <div className="tablewrap" style={{ maxHeight: `${tablePct}%` }}>
                     <table>
                       <thead><tr>
                         <th>Hop</th><th>PL%</th><th>IP</th><th>Host</th><th>ASN</th><th>Network</th>
@@ -479,12 +555,20 @@ export default function App() {
                     </table>
                   </div>
 
+                  <div onMouseDown={startDrag('table')} title="Drag to resize" className="resize-handle-y -my-1.5" />
+
+                  {clippedSpikes > 0 && (
+                    <div className="text-xs text-faint px-1 -mb-1">
+                      ⓘ {clippedSpikes} sample{clippedSpikes > 1 ? 's' : ''} above {yDomain[1]} ms run off the top of the chart so the normal range stays readable —
+                      <button className="ml-1.5 px-1.5 py-0 text-xs" onClick={() => setClipOutliers(false)}>show full range</button>
+                    </div>
+                  )}
                   <div className="chart" ref={chartRef}>
                     <ResponsiveContainer width="100%" height="100%">
                       <LineChart data={chartData} margin={{ top: 10, right: 20, bottom: 4, left: 0 }}>
                         <CartesianGrid stroke="var(--grid)" />
                         <XAxis dataKey="ts" type="number" domain={["dataMin","dataMax"]} tickFormatter={timeFmt} stroke="var(--axis)" tick={{ fill: "var(--axis)" }} fontSize={12} />
-                        <YAxis stroke="var(--axis)" tick={{ fill: "var(--axis)" }} fontSize={12} label={{ value: "ms", angle: -90, position: "insideLeft", fill: "var(--axis)" }} />
+                        <YAxis stroke="var(--axis)" tick={{ fill: "var(--axis)" }} fontSize={12} domain={yDomain} allowDataOverflow label={{ value: "ms", angle: -90, position: "insideLeft", fill: "var(--axis)" }} />
                         <Tooltip labelFormatter={timeFmt} contentStyle={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 6, color: "var(--text)" }} labelStyle={{ color: "var(--muted)" }} itemStyle={{ color: "var(--text)" }} />
                         <Legend />
                         {shownHops.map((h, i) => (

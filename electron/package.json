@@ -1,7 +1,7 @@
 {
   "name": "netpulse-desktop",
   "version": "0.6.0",
-  "description": "NetPulse — cross-platform path-latency desktop app (Electron + C++ Node-API engine)",
+  "description": "NetPulse \u2014 cross-platform path-latency desktop app (Electron + C++ Node-API engine)",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
@@ -9,5 +9,7 @@
   },
   "devDependencies": {
     "electron": "^29.1.0"
-  }
+  },
+  "license": "MIT",
+  "author": "Archisman Karmakar"
 }

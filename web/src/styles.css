@@ -1,0 +1,219 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================
+   Design tokens. Dark is the default instrument-panel look;
+   light overrides via [data-theme=light]. Every colour used
+   anywhere in the app is one of these — no stray hex values.
+   ============================================================ */
+:root {
+  --bg:#0a0d12; --panel:#11151c; --panel2:#161b24; --input-bg:#0d1117;
+  --border:#1e2530; --border2:#2c3542; --btn-bg:#1a212c; --btn-hover:#252f3d;
+  --text:#eef1f6; --muted:#a3aebd; --faint:#76818f; --sel:#152029;
+  --accent:#22d3ee; --accent2:#38bdf8;
+  --good:#34d399; --good-soft:#6ee7b7;
+  --warn:#f59e0b; --warn-soft:#fbbf24;
+  --bad:#fb923c; --danger:#f87171;
+  --grid:#1a212c; --axis:#76818f;
+  /* elevation: subtle depth instead of a flat single-tone panel wash */
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.35);
+  --shadow-md: 0 4px 16px -4px rgba(0,0,0,.45), 0 1px 3px rgba(0,0,0,.3);
+  --shadow-inset: inset 0 1px 0 rgba(255,255,255,.03);
+}
+:root[data-theme=light] {
+  --bg:#e8edf3; --panel:#ffffff; --panel2:#eaeff5; --input-bg:#ffffff;
+  --border:#c9d2df; --border2:#aab6c7; --btn-bg:#eef2f7; --btn-hover:#dbe3ef;
+  --text:#0f1620; --muted:#3d4a5c; --faint:#5f6b7c; --sel:#dff5fa;
+  --accent:#0e7490; --accent2:#0369a1;
+  --good:#047857; --good-soft:#0d9488;
+  --warn:#a15c07; --warn-soft:#c2760a;
+  --bad:#b3400f; --danger:#c81e1e;
+  /* grid needs to visibly contrast against bg, not just differ numerically —
+     the previous value (#dde4ec on #eef1f6) was nearly the same pale tone, so
+     the dot-grid chart texture that's obvious in dark mode was nearly
+     invisible here. */
+  --grid:#b7c2d1; --axis:#5f6b7c;
+  --shadow-sm: 0 1px 3px rgba(30,41,59,.14);
+  --shadow-md: 0 10px 28px -8px rgba(30,41,59,.22), 0 2px 6px rgba(30,41,59,.12);
+  --shadow-inset: inset 0 1px 0 rgba(255,255,255,.8);
+}
+
+/* Theme switch: freeze every transition for one frame while the CSS
+   variables flip, then restore. Without this, every transitioning element on
+   screen (rows, buttons, dots) animates its colour change at once and the
+   whole switch visibly janks — this makes it instant instead. */
+.theme-switching, .theme-switching * { transition: none !important; }
+
+@layer base {
+  :root { color-scheme: dark; }
+  :root[data-theme=light] { color-scheme: light; }
+  * { box-sizing: border-box; }
+  html, body, #root { margin: 0; height: 100%; }
+  body { @apply bg-bg text-ink antialiased; font: 14px/1.45 theme('fontFamily.sans'); }
+  h1 { @apply m-0 text-[17px] font-semibold tracking-tight; }
+  button { @apply bg-btnbg border border-border2 text-ink rounded-lg px-2.5 py-1.5 cursor-pointer; transition: background-color .12s, box-shadow .12s, transform .08s; }
+  button:hover { @apply bg-btnhover; box-shadow: var(--shadow-sm); }
+  button:active { transform: translateY(0.5px); }
+  button:focus-visible, select:focus-visible, input:focus-visible { @apply outline-none ring-2 ring-accent; }
+  /* Broad selector (not just [type=text]) so an input that's missing an
+     explicit `type` attribute is never left unstyled — this is exactly what
+     broke the target search box: no `type` meant it fell through every rule
+     scoped to input[type=...] and rendered as a raw, unstyled native input. */
+  input:not([type=checkbox]), select {
+    @apply bg-inputbg border border-border2 text-ink rounded-lg px-2 py-1.5 text-[13px] transition-colors;
+  }
+  input::placeholder { color: var(--faint); opacity: 1; }
+  table { @apply w-full border-collapse text-[13px]; }
+  th, td { @apply text-left px-2.5 py-[5px] border-b border-border whitespace-nowrap; }
+  th { @apply sticky top-0 bg-panel2 text-muted font-medium text-[11px] uppercase tracking-wide; }
+}
+
+@layer components {
+  /* ---- app shell ---- */
+  .app { @apply flex flex-col h-screen; background-image: radial-gradient(1200px 600px at 15% -10%, color-mix(in srgb, var(--accent) 5%, transparent), transparent 60%); }
+  header { @apply bg-panel border-b border-border px-3.5 py-2.5; box-shadow: var(--shadow-sm); position: relative; z-index: 20; }
+  .body { @apply flex-1 flex min-h-0; }
+  main { @apply flex-1 flex flex-col min-w-0 p-2.5 gap-2.5; }
+  .empty { @apply m-auto text-faint text-sm; }
+
+  /* ---- header controls ---- */
+  .controls { @apply flex flex-wrap gap-2 items-center; }
+  .controls.second { @apply mt-1.5; }
+  .controls .target { @apply min-w-[320px]; }
+  .controls label { @apply flex items-center gap-1 text-muted text-xs; }
+  .controls label.cb { @apply gap-1.5; }
+  .controls input[type=number] { @apply w-16; }
+  .divider { @apply w-px h-5 bg-border2 mx-1; }
+  button.primary, .apply { @apply bg-accent border-accent text-[#04222b] font-semibold; }
+  button.primary:hover, .apply:hover { @apply brightness-110; }
+  .themebtn { @apply bg-transparent border-none text-base px-1 ml-2; }
+
+  /* ---- targets sidebar ---- */
+  aside { @apply w-[230px] border-r border-border p-2.5 flex flex-col gap-2; background: var(--panel); }
+  aside h3 { @apply m-0 text-[11px] text-muted uppercase tracking-wider; }
+  aside ul { @apply list-none m-0 p-0 flex-1 overflow-auto flex flex-col gap-1; }
+  aside li { @apply px-2.5 py-2 rounded-lg cursor-pointer flex flex-col; }
+  aside li:hover { @apply bg-panel2; }
+  aside li.sel { @apply bg-sel outline outline-1 outline-border2; box-shadow: var(--shadow-sm); }
+  aside li small { @apply text-faint text-[11px]; }
+  aside li.s-discovering { background: color-mix(in srgb, var(--accent) 12%, var(--panel)); }
+  aside li.s-okloss { background: color-mix(in srgb, var(--good-soft) 12%, var(--panel)); }
+  aside li.s-warn   { background: color-mix(in srgb, var(--warn-soft) 15%, var(--panel)); }
+  aside li.s-bad    { background: color-mix(in srgb, var(--bad) 14%, var(--panel)); }
+  aside li.s-down   { background: color-mix(in srgb, var(--danger) 15%, var(--panel)); }
+  .row { @apply flex gap-1.5; }
+  .row button { @apply flex-1; }
+
+  /* ---- LED-style status dots (signature element) ----
+     Network hardware speaks in status LEDs; the target list and each hop row
+     borrow that vernacular instead of tinting whole rows red/green. */
+  /* ---- two-lamp signal (destination + path), German Hauptsignal-style ---- */
+  .signal { @apply inline-flex gap-[3px] mr-2 p-[3px] rounded shrink-0; background: var(--btn-bg); border: 1px solid var(--border2); }
+  .lamp { @apply w-[7px] h-[7px] rounded-[1px]; background: var(--faint); opacity: .35; }
+  .lamp.st-ok     { background: var(--good); opacity: 1; }
+  .lamp.st-okloss { background: var(--good-soft); opacity: 1; }
+  .lamp.st-warn   { background: var(--warn-soft); opacity: 1; }
+  .lamp.st-bad    { background: var(--bad); opacity: 1; }
+  .lamp.st-down   { background: var(--danger); opacity: 1; box-shadow: theme('boxShadow.led'); color: var(--danger); }
+  .lamp.st-discovering { background: var(--accent); opacity: 1; animation: lamp-pulse 1s ease-in-out infinite; }
+  @keyframes lamp-pulse { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
+
+  .dot { @apply inline-block w-2 h-2 rounded-full mr-1.5; background: var(--good); }
+  .dot.st-ok     { background: var(--good); }
+  .dot.st-okloss { background: var(--good-soft); }
+  .dot.st-warn   { background: var(--warn-soft); }
+  .dot.st-bad    { background: var(--bad); }
+  .dot.st-down   { background: var(--danger); box-shadow: theme('boxShadow.led'); color: var(--danger); }
+  .statelabel { @apply text-[10px] px-1.5 rounded ml-1.5 font-semibold; }
+  .statelabel.st-discovering { color: var(--accent); animation: lamp-pulse 1s ease-in-out infinite; }
+  .statelabel.st-ok     { color: var(--good); }
+  .statelabel.st-okloss { color: var(--good-soft); }
+  .statelabel.st-warn   { color: var(--warn-soft); }
+  .statelabel.st-bad    { color: var(--bad); }
+  .statelabel.st-down   { color: var(--danger); }
+
+  .hopdot { @apply inline-block w-[9px] h-[9px] rounded-full mr-2 align-middle; box-shadow: 0 0 0 1px rgba(0,0,0,.18) inset; }
+  .hopdot.st-ok     { background: var(--good); }
+  .hopdot.st-minor  { background: var(--good-soft); }
+  .hopdot.st-loss   { background: var(--warn); }
+  .hopdot.st-warn   { background: var(--warn-soft); }
+  .hopdot.st-bad    { background: var(--bad); box-shadow: theme('boxShadow.led'); color: var(--bad); }
+  .hopdot.st-down   { background: var(--danger); box-shadow: theme('boxShadow.led'); color: var(--danger); }
+  .hopdot.st-silent { background: var(--faint); opacity: .45; } /* no ICMP reply — normal, not a fault */
+
+  /* ---- status bar / config strip / edit panel ---- */
+  .statusbar { @apply flex items-center gap-2.5 px-2.5 py-2 bg-panel border border-border rounded-xl; box-shadow: var(--shadow-sm), var(--shadow-inset); }
+  .statusbar .spacer { @apply flex-1; }
+  .statusbar .err { color: var(--bad); @apply text-[13px]; }
+  .rtt { @apply text-muted text-xs mr-1.5; }
+  .rtt b { @apply text-ink text-[15px]; }
+  .rttsub { @apply text-faint text-[11px]; }
+  .badge { @apply px-2 py-0.5 rounded-md text-[11px] mx-0.5 font-medium; background: color-mix(in srgb, var(--accent) 16%, var(--panel)); color: var(--accent); }
+
+  .cfgstrip { @apply flex items-center gap-3.5 px-3 py-2 mt-1.5 bg-panel border border-border rounded-xl text-xs text-muted flex-wrap; box-shadow: var(--shadow-sm), var(--shadow-inset); }
+  .cfgstrip .cfglabel { @apply font-bold tracking-wider text-faint text-[10px]; }
+  .cfgstrip b { @apply text-ink font-semibold; }
+  .cfgstrip button { @apply text-xs px-2.5 py-1; }
+
+  .editpanel { @apply flex items-end gap-3 px-3 py-3 mt-1.5 bg-panel border border-border2 rounded-xl flex-wrap; box-shadow: var(--shadow-md); }
+  .editpanel label { @apply flex flex-col gap-1 text-[11px] text-muted; }
+  .editpanel input, .editpanel select { @apply w-[120px]; }
+  .editpanel .apply { @apply self-end px-3.5 py-1.5 rounded-md font-semibold border-none cursor-pointer; }
+
+  /* ---- table ---- */
+  .tablewrap { @apply max-h-[38%] overflow-auto border border-border rounded-xl; box-shadow: var(--shadow-sm); }
+  tbody tr { @apply cursor-pointer transition-colors duration-100; }
+  tbody tr:hover { @apply bg-panel2; }
+  tr.selrow { background: var(--sel); }
+  td.loss, i.loss { color: var(--danger); }
+  td.host, td.net { @apply text-muted max-w-[200px] overflow-hidden text-ellipsis cursor-pointer; }
+  td.net:hover, td.asn:hover { @apply underline; }
+  td.asn { @apply font-mono text-xs cursor-pointer whitespace-nowrap; color: var(--accent2); }
+  td.asn.boundary { border-left: 2px solid var(--warn); @apply pl-1.5; }
+  td.mono { @apply font-mono text-xs text-ink; }
+  td i { @apply not-italic text-muted text-xs; }
+  th.lathead { @apply flex justify-between items-center min-w-[360px]; }
+  th.lathead .scalemax { @apply text-faint font-normal normal-case tracking-normal; }
+  td.latcell { @apply px-2 py-0.5; }
+  svg.latgraph { @apply block rounded-sm; }
+  .plbar { @apply inline-block w-[42px] h-1.5 rounded-full overflow-hidden align-middle mr-1.5; background: var(--border); }
+  .plbar span { display: block; height: 100%; background: linear-gradient(90deg, var(--warn), var(--danger)); }
+  .legend { @apply inline-flex items-center gap-1 text-muted text-xs; }
+  .legend .g { @apply w-2.5 h-2.5 rounded-sm inline-block; background: var(--good); }
+  .legend .ramp { @apply w-[90px] h-2 rounded-md inline-block; background: linear-gradient(90deg, var(--good), var(--warn), var(--danger)); }
+
+  /* ---- chart: oscilloscope-style dot-grid background (signature element) ---- */
+  .chart { @apply flex-1 min-h-[200px] border border-border rounded-xl p-2 bg-dotgrid bg-dotgrid; background-color: var(--bg); box-shadow: var(--shadow-sm), var(--shadow-inset); }
+
+  /* ---- loading / tracing state ---- */
+  .loading { @apply flex-1 flex flex-col items-center justify-center gap-3.5 text-muted; }
+  .loading-text { @apply text-base; color: var(--text); }
+  .loading-sub { @apply text-xs text-faint; }
+  .spinner { @apply w-8 h-8 rounded-full border-[3px] animate-spin; border-color: var(--border2); border-top-color: var(--accent); }
+  .spinner.sm { @apply w-4 h-4 border-2; }
+
+  /* ---- BGP / routing drawer ---- */
+  .drawer { @apply w-80 border-l border-border p-3.5 overflow-y-auto; background: var(--panel); box-shadow: -8px 0 24px -8px rgba(0,0,0,.25); }
+  .drawer-head { @apply flex justify-between items-center mb-2.5; }
+  .drawer-head b { @apply font-mono text-sm; }
+  .drawer-head .x { @apply bg-transparent border-none text-muted text-base px-1; }
+  .drawer .muted { @apply flex items-center gap-2; color: var(--muted); }
+  .kv { @apply flex justify-between gap-2.5 py-1.5 border-b border-border text-[13px]; }
+  .kv span { @apply text-muted; }
+  .kv b { @apply text-right break-words; }
+  .chip { @apply border rounded px-1.5 text-[11px]; }
+  .paths { @apply mt-2.5; }
+  .paths-h { @apply text-muted text-xs mb-1; }
+  .aspath { @apply font-mono text-[11px] border border-border rounded px-1.5 py-0.5 mb-0.5 break-all; background: var(--panel2); }
+  .drawer-links { @apply flex flex-wrap gap-2 mt-3; }
+  .drawer-links a { @apply text-xs no-underline; color: var(--accent2); }
+  .drawer-links a:hover { @apply underline; }
+
+  /* ---- resize handles (sidebar width, table/chart split) ---- */
+  .resize-handle-x { @apply cursor-col-resize transition-colors; }
+  .resize-handle-x:hover, .resize-handle-x:active { background: color-mix(in srgb, var(--accent) 45%, transparent); }
+  .resize-handle-y { @apply w-full h-3 cursor-row-resize flex items-center justify-center transition-colors relative z-10; }
+  .resize-handle-y::before { content: ''; @apply block w-10 h-1 rounded-full; background: var(--border2); }
+  .resize-handle-y:hover::before, .resize-handle-y:active::before { background: var(--accent); }
+}

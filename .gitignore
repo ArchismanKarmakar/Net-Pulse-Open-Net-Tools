@@ -1,0 +1,9 @@
+build/
+*.o
+*.a
+web/node_modules
+web/dist
+electron/node_modules
+napi/build
+napi/node_modules
+.DS_Store

@@ -1,0 +1,19 @@
+{
+  "name": "netpulse-native",
+  "version": "0.6.1",
+  "description": "NetPulse C++ path-latency engine as a CMake.js Node-API addon (in-process, no port)",
+  "main": "index.js",
+  "scripts": {
+    "build": "cmake-js compile",
+    "build:debug": "cmake-js compile -D",
+    "build:electron": "cmake-js compile --runtime electron --runtime-version 29.1.0",
+    "clean": "cmake-js clean",
+    "_note": "Run a build script explicitly AFTER installing CMake. `npm i` only fetches deps."
+  },
+  "dependencies": {
+    "node-addon-api": "^8.0.0",
+    "cmake-js": "^7.3.0"
+  },
+  "license": "MIT",
+  "author": "Archisman Karmakar"
+}

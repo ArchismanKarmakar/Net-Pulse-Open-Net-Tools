@@ -1,0 +1,44 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "NetPulse: Build engine (Node-API addon)",
+      "type": "shell",
+      "windows": { "command": "npm install; npx cmake-js compile --runtime electron --runtime-version $(node -p \"require('../electron/node_modules/electron/package.json').version\")" },
+      "linux":   { "command": "npm install && npx cmake-js compile --runtime electron --runtime-version \"$(node -p \"require('../electron/node_modules/electron/package.json').version\")\"" },
+      "options": { "cwd": "${workspaceFolder}/napi" },
+      "problemMatcher": []
+    },
+    {
+      "label": "NetPulse: Build UI",
+      "type": "shell",
+      "command": "npm install && npm run build",
+      "options": { "cwd": "${workspaceFolder}/web" },
+      "problemMatcher": []
+    },
+    {
+      "label": "NetPulse: Install Electron",
+      "type": "shell",
+      "command": "npm install",
+      "options": { "cwd": "${workspaceFolder}/electron" },
+      "problemMatcher": []
+    },
+    {
+      "label": "NetPulse: Run app",
+      "type": "shell",
+      "command": "npm start",
+      "options": { "cwd": "${workspaceFolder}/electron" },
+      "dependsOn": ["NetPulse: Install Electron", "NetPulse: Build UI", "NetPulse: Build engine (Node-API addon)"],
+      "dependsOrder": "sequence",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "NetPulse: Run C++ unit tests only",
+      "type": "shell",
+      "command": "cmake --build build --config Debug --target netpulse_tests && (cd build/Debug && ./netpulse_tests || .\\netpulse_tests.exe)",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    }
+  ]
+}

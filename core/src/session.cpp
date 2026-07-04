@@ -28,7 +28,50 @@ namespace netpulse {
 // Packet Send Delay). For 30 hops that's still well under a second of total
 // ramp-up (30 * 25ms = 750ms) — imperceptible, but enough to stop looking
 // like a burst to a router's rate limiter.
-constexpr double kSendStaggerSecs = 0.025;
+constexpr double kSendStaggerSecs = 0.01;
+
+// --- Route DISCOVERY vs steady-state MONITORING cadence -------------------
+// Before the destination is reached, the visible route can only advance as
+// fast as replies come back, and each hop only re-probes once per `interval`.
+// At the steady 1s cadence, a single probe lost on the way to the destination
+// freezes discovery for a whole second (several, if more are lost): the trace
+// looks "stalled" (stuck at N hops / 0 hops with the spinner spinning) and
+// then the full path snaps in "late" once a retry gets through. A related lag:
+// even after the path is found, the destination's first kDiscoveryDropCount
+// replies are consumed as settling, so at 1s spacing the RTT columns stay
+// blank and the spinner stays up for ~kDiscoveryDropCount seconds.
+//
+// The fix is to re-probe UNANSWERED hops more often while discovering — but
+// this must NOT turn into a high-rate packet burst. Raw-socket ICMP sent in
+// fast bursts to a single address is exactly the pattern behavioral AV,
+// Windows Defender's network monitor, and Smart App Control's heuristics flag
+// as flooding/scanning. An earlier version of this that simply dropped every
+// hop's retry interval to ¼s pushed the aggregate to ~120 packets/second and
+// was (correctly) treated as hostile. So discovery here is governed by TWO
+// mechanisms working together:
+//
+//   1. A per-hop DESIRED cadence — unanswered hops become "due" quickly
+//      (kDiscoveryInterval), answered hops stay at the steady `interval`.
+//   2. A single GLOBAL token-bucket rate limiter (kMaxProbeRate / kProbeBurst)
+//      that paces ALL sends into a smooth, low, constant stream and prioritises
+//      the probes that actually advance discovery. This caps the aggregate
+//      send rate at or below what the app already produced at steady state with
+//      a full hop list (~max_hops/interval), so it never emits a burst larger
+//      than normal monitoring — no flood/scan signature, while still finding
+//      the route quickly because the limited budget is spent on the hops that
+//      haven't answered yet (which, for any TTL >= the destination's distance,
+//      reach the destination itself).
+//
+// kDestSettleSecs keeps hops on the fast desired-cadence briefly AFTER the
+// destination first answers, so its settling window clears in a fraction of a
+// second instead of kDiscoveryDropCount·interval. The first-probe stagger
+// (kSendStaggerSecs) still applies, so the very first round ramps rather than
+// firing simultaneously.
+constexpr double kDiscoveryInterval = 0.20; // s — desired retry cadence for UNANSWERED hops while discovering
+constexpr int    kDiscoveryTries    = 5;    // fast attempts an unanswered hop gets before it's treated as a non-responder and backed off to the steady interval (stops `*` hops hogging the paced budget)
+constexpr double kDestSettleSecs    = 1.0;  // s — keep fast cadence this long after the destination first answers
+constexpr double kMaxProbeRate      = 30.0; // probes/sec — GLOBAL hard cap on ICMP sends (<= the app's own all-hops steady rate; keeps traffic ping-like, never a flood)
+constexpr double kProbeBurst        = 4.0;  // max tokens — small burst allowance so sends stay a smooth stream, not spikes
 
 Session::Session(uint64_t id, std::string target, Settings settings)
     : id_(id), target_(std::move(target)), settings_(std::move(settings)) {
@@ -109,6 +152,11 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
     std::map<uint8_t, double> next_send;
     std::vector<NewPoint> buffer;
     double last_emit = now_secs();
+    double dest_found_at = 0.0;         // wall-clock of the FIRST reply from the destination (0 = not yet)
+    double tokens = kProbeBurst;        // global send-rate token bucket (see kMaxProbeRate)
+    double last_refill = now_secs();
+    std::map<uint8_t, int> tries;       // per-hop probe attempts (drives fast->steady backoff of non-responders)
+    uint8_t rr = 1;                     // round-robin cursor so the paced budget is shared fairly across unanswered hops
 
     auto ensure_hop = [&](uint8_t h) -> HopStats& {
         auto it = hops_.find(h);
@@ -125,15 +173,34 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
             settings_dirty_ = false;
         }
         if (rebuild) {
+            // Attempt to re-resolve and recreate the prober. If this transiently
+            // fails (DNS or prober), keep the session running (don't return) so
+            // the UI spinner and discovery state remain visible; retry shortly.
             resolve(); // family may have changed → re-pick dest/family
-            if (!dest_ || !family_) { on_update(snapshot(false, {})); return; }
-            prober = make_prober();
-            if (!prober->ok()) { error_ = prober->error(); on_update(snapshot(false, {})); return; }
-            pending.clear();
-            next_send.clear();
-            dest_hop_.reset();
-            max_hop_seen_ = 0;
-            hops_.clear();
+            if (!dest_ || !family_) {
+                // leave the previous state intact, surface a running snapshot
+                on_update(snapshot(true, {}));
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            } else {
+                prober = make_prober();
+                if (!prober->ok()) {
+                    error_ = prober->error();
+                    on_update(snapshot(true, {}));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                } else {
+                    // successful rebuild — reset discovery state and resume
+                    pending.clear();
+                    next_send.clear();
+                    dest_hop_.reset();
+                    max_hop_seen_ = 0;
+                    hops_.clear();
+                    dest_found_at = 0.0;       // discovery restarts from scratch
+                    tokens = kProbeBurst;
+                    last_refill = now_secs();
+                    tries.clear();
+                    rr = 1;
+                }
+            }
         }
 
         if (paused && paused->load()) {
@@ -150,31 +217,75 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
         uint8_t max_hop = dest_hop_ ? *dest_hop_ : s.max_hops;
         double now = now_secs();
 
-        // 1) send any probes that are due
+        // Global token-bucket pacer. Refill toward kMaxProbeRate (capped at a
+        // small burst) and charge one token per actual send below. This makes
+        // the aggregate ICMP send rate a smooth, constant stream that can NEVER
+        // exceed kMaxProbeRate — no matter how many hops are "due" — which is
+        // what keeps fast discovery from looking like an ICMP flood/scan to AV.
+        tokens = (std::min)(kProbeBurst, tokens + (now - last_refill) * kMaxProbeRate);
+        last_refill = now;
+
+        bool have_dest = dest_hop_.has_value();
+        // Brief settle window right after the destination first answers, so its
+        // kDiscoveryDropCount settling replies clear quickly instead of taking
+        // kDiscoveryDropCount·interval. Actual sends stay paced by the bucket.
+        bool settling = have_dest && (now - dest_found_at) < kDestSettleSecs;
+        bool discovering = !have_dest || settling;
+
+        // A hop is "answered" once any reply (echo or TTL-exceeded) has given it
+        // an address; those don't need fast re-probing to be found.
+        auto answered = [&](uint8_t ttl) -> bool {
+            auto it = hops_.find(ttl);
+            return it != hops_.end() && it->second.address().has_value();
+        };
+
+        // 1) send due probes, paced by the token bucket
         double soonest = now + 0.25;
-        for (uint8_t ttl = 1; ttl <= max_hop; ++ttl) {
+        bool due_but_paced_out = false;
+        auto try_send = [&](uint8_t ttl) {
             double& nx = next_send[ttl];
-            // Stagger each hop's FIRST send instead of firing all of them in
-            // the same instant. Sending to every hop simultaneously (up to
-            // `max_hops` packets within microseconds of each other) is
-            // exactly the "parallel burst" pattern that trips ICMP
-            // rate-limiting on routers (RFC 1812) — this is the same fix
-            // PingPlotter itself exposes as "Packet Send Delay" in
-            // Edit > Options > Engine, and mtr's inherently sequential,
-            // one-hop-at-a-time design avoids the burst altogether. Once
-            // staggered, each hop's own `interval` cadence naturally
-            // preserves that offset on every subsequent round, so this only
-            // needs to happen once, here.
+            // First-probe stagger (as before): ramp across hops instead of one
+            // simultaneous burst. Subsequent cadence is carried by `nx`.
             if (nx == 0.0) nx = now + (ttl - 1) * kSendStaggerSecs;
             if (now >= nx) {
-                uint16_t seq = next_seq();
-                if (prober->send(*dest_, ttl, icmp_id_, seq, s.payload_size))
-                    pending[seq] = Pending{ttl, now};
-                nx = now + interval;
+                if (tokens >= 1.0) {
+                    uint16_t seq = next_seq();
+                    if (prober->send(*dest_, ttl, icmp_id_, seq, s.payload_size))
+                        pending[seq] = Pending{ttl, now};
+                    tokens -= 1.0;
+                    ++tries[ttl];
+                    // Fast cadence only where it helps: an answered hop only
+                    // during the post-destination settle window; an unanswered
+                    // hop only for its first kDiscoveryTries attempts (after
+                    // that it's a non-responder — back off to the steady
+                    // interval so it stops consuming the paced budget). Every
+                    // other case uses the configured interval.
+                    bool fast = answered(ttl) ? settling
+                                              : (discovering && tries[ttl] < kDiscoveryTries);
+                    nx = now + (fast ? (std::min)(interval, kDiscoveryInterval) : interval);
+                } else {
+                    due_but_paced_out = true; // no token this round; retry once one refills
+                }
             }
             soonest = (std::min)(soonest, nx);
-            if (ttl == 255) break;
+        };
+        // Priority: hops we haven't heard from first (any TTL >= the
+        // destination's distance reaches the destination itself, so this is what
+        // finds the route) — visited ROUND-ROBIN so the shared, rate-capped
+        // budget can't be monopolised by a run of early non-responding hops and
+        // starve the ones nearer the destination. Answered hops get whatever
+        // budget remains, for their steady keepalive.
+        if (max_hop >= 1) {
+            for (uint8_t k = 0; k < max_hop; ++k) {
+                uint8_t ttl = static_cast<uint8_t>((rr - 1 + k) % max_hop + 1);
+                if (!answered(ttl)) try_send(ttl);
+            }
+            rr = static_cast<uint8_t>(rr % max_hop + 1);
         }
+        for (uint8_t ttl = 1; ttl <= max_hop; ++ttl) { if (answered(ttl)) try_send(ttl); if (ttl == 255) break; }
+        // If probes were due but the pacer held them, wake when the next token
+        // is ready rather than busy-spinning.
+        if (due_but_paced_out) soonest = (std::min)(soonest, now + 1.0 / kMaxProbeRate);
 
         // 2) read replies for a short slice (wakes immediately on arrival)
         double slice = (std::min)(soonest, last_emit + 0.25) - now;
@@ -207,8 +318,10 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
             hs.push(inc.at, rtt);
             buffer.push_back(NewPoint{hop, inc.at, rtt});
             if (hop > max_hop_seen_) max_hop_seen_ = hop;
-            if (inc.reply.kind == ReplyKind::EchoReply && inc.from == *dest_)
+            if (inc.reply.kind == ReplyKind::EchoReply && inc.from == *dest_) {
+                if (!dest_hop_) dest_found_at = inc.at; // first time we reach the destination
                 dest_hop_ = dest_hop_ ? (std::min)(*dest_hop_, hop) : hop;
+            }
             pending.erase(it);
         }
 
@@ -239,9 +352,12 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
         }
         for (auto& [h, hs] : hops_) hs.set_is_dest(dest_hop_ && h == *dest_hop_);
 
-        // 5) push a snapshot a few times a second
+        // 5) push a snapshot a few times a second.
+        // Hostname resolution can block for multiple seconds on reverse DNS
+        // lookups, which delays probe scheduling and causes the visible stats
+        // stream to stall. Keep the probe engine responsive by omitting
+        // hostname work from the tight loop.
         if (now - last_emit >= 0.25) {
-            resolve_some_hostnames();
             on_update(snapshot(true, std::move(buffer)));
             buffer.clear();
             last_emit = now;

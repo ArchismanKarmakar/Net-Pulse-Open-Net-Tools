@@ -201,7 +201,22 @@ export default function App() {
   }
   // Shared "which hop represents the destination" lookup, used by both the
   // targets-list health colour and its brief stats line.
-  const destHopOf = (t) => { const hops = t.hops || []; return hops.find((h) => h.is_dest) || (hops.length ? hops[hops.length - 1] : null) }
+  //
+  // STRICT: the destination is ONLY a hop the engine has actually confirmed as
+  // the endpoint (an echo-reply came back from the target IP → is_dest). It must
+  // NOT fall back to "the last hop currently in the list". During route
+  // discovery the last known hop is almost always a still-unanswered
+  // intermediate router — a `*` / 100%-loss frontier row (sent>0, recv=0).
+  // Treating that frontier row as the destination is exactly what made a
+  // still-discovering trace flash "unreachable": destHopOf() returned the `*`
+  // hop, isDiscovering() saw sent>0 so it thought discovery was over, and
+  // targetState() saw recv===0 and declared the whole target "down". A moment
+  // later the real endpoint replied, is_dest moved onto it, and the status
+  // snapped back to discovering → the flip-flop. With no fallback, an
+  // unconfirmed destination reads as "discovering" (correct) and can never be
+  // mistaken for "unreachable". This also matches the top status bar, which
+  // already uses the strict `is_dest` lookup (see `dest` below).
+  const destHopOf = (t) => (t.hops || []).find((h) => h.is_dest) || null
 
   const focus = FOCUS[focusIdx][1]
 
@@ -280,7 +295,14 @@ export default function App() {
   // DNS resolves and the first probes come back.
   const isDiscovering = (t) => {
     const d = destHopOf(t)
-    return !d || (d.sent === 0 && (d.recv ?? 0) === 0 && (d.loss ?? 0) === 0)
+    // No CONFIRMED destination yet → still discovering the route. (destHopOf is
+    // strict, so this is true for the whole "path is being traced, endpoint not
+    // yet reached" window — including when only a `*` frontier hop is visible.)
+    if (!d) return true
+    // As soon as the destination is confirmed, the route has been discovered.
+    // The list status should not remain in "discovering" just because the
+    // current focus window has not yet accumulated fresh stats.
+    return false
   }
   const targetState = (t) => {
     if (isDiscovering(t)) return 'discovering'
@@ -292,7 +314,7 @@ export default function App() {
     const lossHigh = d.sent > 0 && d.loss > alerts.loss
     const noReply = d.sent > 0 && d.recv === 0
     const minorLoss = d.loss > 0 && !lossHigh
-    const pathBad = hops.some((h) => !h.is_dest && h.sent > 0 && h.loss > alerts.loss)
+    const pathBad = hops.some((h) => !h.is_dest && h.sent > 0 && h.recv > 0 && h.loss > alerts.loss)
     if (noReply) return 'down'               // red — target unreachable
     if (lossHigh || latHigh) return 'bad'    // orange — target unhealthy
     if (pathBad) return 'warn'               // yellow — upstream path trouble
@@ -321,7 +343,7 @@ export default function App() {
   const pathLamp = (t) => {
     if (isDiscovering(t)) return 'discovering'
     const hops = t.hops || []
-    return hops.some((h) => !h.is_dest && h.sent > 0 && h.loss > alerts.loss) ? 'warn' : 'ok'
+    return hops.some((h) => !h.is_dest && h.sent > 0 && h.recv > 0 && h.loss > alerts.loss) ? 'warn' : 'ok'
   }
 
   useEffect(() => { if (sel && selHop === null) { const d = sel.hops.find((h) => h.is_dest); if (d) setSelHop(d.hop) } }, [sel, selHop])
@@ -530,7 +552,7 @@ export default function App() {
             <>
               <div className="statusbar">
                 <b>{sel.name}</b> → {sel.dest_ip || 'resolving…'} <span className="badge">{sel.family}</span> · {sel.hops.length} hops
-                {(sel.hops.length === 0 || (dest && dest.sent === 0)) && !sel.error && (
+                {isDiscovering(sel) && !sel.error && (
                   <span className="badge inline-flex items-center align-middle" title="Discovering the route: resolving the destination and probing each hop. Each hop's first few real replies are used only to establish its address/route and aren't shown as stats yet, so an unrepresentative first reading isn't displayed as if it were typical. Clears per-hop as soon as real data is available.">
                     <span className="spinner sm" style={{ marginRight: 5 }} />
                     {sel.dest_ip ? 'discovering route…' : `resolving ${sel.name}…`}

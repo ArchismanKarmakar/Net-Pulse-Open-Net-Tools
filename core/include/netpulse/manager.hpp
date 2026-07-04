@@ -101,7 +101,8 @@ struct WebTarget {
     Snapshot latest;
     bool has = false;
     std::map<uint8_t, SampleBuf> series;
-    std::map<uint8_t, int> discovery_count; // per-hop, see kDiscoveryDropCount below
+    std::map<uint8_t, int> discovery_count;            // per-hop, see kDiscoveryDropCount below
+    std::map<uint8_t, double> discovery_first_reply_at; // time of the first real reply for each hop
     ~WebTarget() {
         if (stop) stop->store(true);
         if (th.joinable()) th.join();
@@ -123,7 +124,12 @@ struct WebTarget {
 // see `t.latest.hops` below, populated regardless) and are not written into
 // the exposed stats/series; real numbers for that hop start from its own
 // (kDiscoveryDropCount+1)-th reply, whenever that happens to occur.
+// If the probe interval is long, waiting for kDiscoveryDropCount replies can
+// otherwise leave the UI without any stats for many seconds. In that case we
+// stop suppressing after a short grace window so the chart still begins
+// showing data promptly.
 constexpr int kDiscoveryDropCount = 3;
+constexpr double kDiscoveryDropMaxSecs = 5.0;
 
 struct Stat {
     double loss = 0;
@@ -228,8 +234,10 @@ public:
                     // reply-based gate, since it never replies at all).
                     if (np.rtt.has_value()) {
                         int& n = raw->discovery_count[np.hop];
+                        if (n == 0) raw->discovery_first_reply_at[np.hop] = np.ts;
                         ++n;
-                        if (n <= kDiscoveryDropCount) continue; // still settling this hop — don't expose yet
+                        double elapsed = np.ts - raw->discovery_first_reply_at[np.hop];
+                        if (n <= kDiscoveryDropCount && elapsed < kDiscoveryDropMaxSecs) continue; // still settling this hop — don't expose yet
                     }
                     auto& v = raw->series[np.hop];
                     if (v.empty() || v.back().first != np.ts) v.emplace_back(np.ts, np.rtt);

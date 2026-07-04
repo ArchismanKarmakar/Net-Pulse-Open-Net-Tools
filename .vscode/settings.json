@@ -1,0 +1,7 @@
+{
+    "python.analysis.extraPaths": [
+        "c:\\Users\\Archisman\\.vscode\\extensions\\ms-security.ms-sentinel-2.3.0\\python"
+    ],
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda"
+}

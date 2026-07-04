@@ -295,7 +295,12 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
         // (but hard-capped) so a genuinely slow-but-real hop isn't discarded,
         // while the multi-second ramp from ICMP rate-limit queue drainage is.
         double stale_ceiling = (std::max)(timeout * 2.0, 2.0); // seconds
+        // Optional runtime debug tracing: enable by setting NETPULSE_DEBUG=1
+        static bool debug_enabled = !!getenv("NETPULSE_DEBUG");
         for (const auto& inc : prober->drain(now + slice)) {
+            if (debug_enabled) {
+                fprintf(stderr, "[netpulse] reply seq=%u kind=%d from=%s\n", inc.reply.seq, int(inc.reply.kind), inc.from.c_str());
+            }
             if (inc.reply.id != icmp_id_) continue;
             auto it = pending.find(inc.reply.seq);
             if (it == pending.end()) continue;
@@ -313,14 +318,29 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
             // instead, exactly as ping/mtr/PingPlotter treat an over-timeout
             // reply.
             if (rtt > stale_ceiling * 1000.0) { pending.erase(it); continue; }
+            if (debug_enabled) {
+                fprintf(stderr, "[netpulse] matched pending seq=%u hop=%u rtt=%.1fms\n", inc.reply.seq, hop, rtt);
+            }
             HopStats& hs = ensure_hop(hop);
             hs.set_address(inc.from);
             hs.push(inc.at, rtt);
             buffer.push_back(NewPoint{hop, inc.at, rtt});
             if (hop > max_hop_seen_) max_hop_seen_ = hop;
-            if (inc.reply.kind == ReplyKind::EchoReply && inc.from == *dest_) {
+            if (inc.reply.kind == ReplyKind::EchoReply) {
+                // Treat any EchoReply as reaching the destination TTL. Some
+                // networks rewrite source addresses (NATs, load-balancers)
+                // so the reply may come from an address different from the
+                // original resolved `dest_`. Accept the EchoReply regardless
+                // of `inc.from` so the engine recognises the destination and
+                // advances discovery. If the reply's source differs from the
+                // resolved address, update the visible `dest_` so the UI
+                // reflects the actual responding IP.
                 if (!dest_hop_) dest_found_at = inc.at; // first time we reach the destination
                 dest_hop_ = dest_hop_ ? (std::min)(*dest_hop_, hop) : hop;
+                if (debug_enabled) fprintf(stderr, "[netpulse] set dest_hop=%u dest_ip=%s\n", (unsigned)*dest_hop_, inc.from.c_str());
+                if (dest_ && inc.from != *dest_) {
+                    dest_ = inc.from; // prefer the actual replying address for display
+                }
             }
             pending.erase(it);
         }

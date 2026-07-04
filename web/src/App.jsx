@@ -229,6 +229,35 @@ export default function App() {
     return null
   }
 
+  // The frontier hop is the last visible row in `t.hops`. If it has sent>0
+  // but recv===0, it's evidence the route terminates there but that hop is
+  // not replying — the UI should show the target as unreachable, not
+  // indefinitely 'discovering'.
+  const frontierHop = (t) => {
+    const hops = t.hops || []
+    if (!hops.length) return null
+    return hops[hops.length - 1]
+  }
+
+  // Track when a frontier first shows as non-responsive so we can wait a
+  // short grace period before declaring the target down. This reduces
+  // flapping when routes are still settling or the first retries are lost.
+  const frontierNoReplyAt = useRef({})
+  const frontierWithinGrace = (t) => {
+    const f = frontierHop(t)
+    if (!f || !(f.sent > 0 && f.recv === 0)) {
+      // clear any previous marker
+      if (t.id && frontierNoReplyAt.current[t.id]) delete frontierNoReplyAt.current[t.id]
+      return false
+    }
+    const now = Date.now() / 1000
+    const probe = (t.config && t.config.probe) ? Number(t.config.probe) : 1
+    const grace = Math.max(2.0, probe * 3) // at least 2s, or 3× the probe interval
+    if (!frontierNoReplyAt.current[t.id]) frontierNoReplyAt.current[t.id] = now
+    const elapsed = now - frontierNoReplyAt.current[t.id]
+    return elapsed < grace
+  }
+
   const focus = FOCUS[focusIdx][1]
 
   useEffect(() => {
@@ -306,20 +335,27 @@ export default function App() {
   // DNS resolves and the first probes come back.
   const isDiscovering = (t) => {
     const d = destHopOf(t)
-    // No CONFIRMED destination yet → still discovering the route. (destHopOf is
-    // strict, so this is true for the whole "path is being traced, endpoint not
-    // yet reached" window — including when only a `*` frontier hop is visible.)
-    if (!d) return true
-    // As soon as the destination is confirmed, the route has been discovered.
-    // The list status should not remain in "discovering" just because the
-    // current focus window has not yet accumulated fresh stats.
-    return false
+    if (d) return false
+    const f = frontierHop(t)
+    if (f && f.sent > 0 && f.recv === 0) {
+      // The last-hop frontier hasn't replied — treat as unreachable rather
+      // than continuing to show the spinner.
+      return false
+    }
+    return true
   }
   const targetState = (t) => {
     if (isDiscovering(t)) return 'discovering'
     const hops = t.hops || []
     const d = destHopOf(t)
-    if (!d) return 'discovering'
+    if (!d) {
+      // No explicit destination hop flagged — if the frontier shows a non-
+      // replying last hop, consider the target unreachable, but wait a
+      // short grace window for retries/settling before marking it down.
+      const f = frontierHop(t)
+      if (f && f.sent > 0 && f.recv === 0) return frontierWithinGrace(t) ? 'discovering' : 'down'
+      return 'discovering'
+    }
     const lat = d.med ?? d.avg
     const latHigh = lat != null && lat > alerts.ms
     const lossHigh = d.sent > 0 && d.loss > alerts.loss
@@ -341,7 +377,12 @@ export default function App() {
   // instead of folding both into a single ambiguous colour.
   const destLamp = (t) => {
     const d = destHopOf(t)
-    if (!d || isDiscovering(t)) return 'discovering'
+    if (isDiscovering(t)) return 'discovering'
+    if (!d) {
+      const f = frontierHop(t)
+      if (f && f.sent > 0 && f.recv === 0) return 'down'
+      return 'discovering'
+    }
     const lat = d.med ?? d.avg
     const latHigh = lat != null && lat > alerts.ms
     const lossHigh = d.sent > 0 && d.loss > alerts.loss

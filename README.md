@@ -1,5 +1,20 @@
 # NetPulse — Path Latency Studio
 
+> **Running the app:** NetPulse is an **Electron desktop app**. Run it from a
+> terminal, **not** from VS Code's C++ *Debug/Play* button.
+>
+> One-shot: **`./build-and-run.ps1`** (Windows) or **`./build-and-run.sh`**
+> (Linux/macOS) from the project root. For real ICMP probing, use an
+> **Administrator** terminal (Windows) or grant `cap_net_raw` (Linux).
+>
+> **The C++ CMake project is NOT the app.** It builds only the engine library
+> (`netpulse_core`) and its unit tests (`netpulse_tests`). If you press VS Code's
+> Debug button it will build and run `netpulse_tests.exe`, which prints
+> `ALL TESTS PASSED` and exits with code 0. A console test finishing and closing
+> its window in a flash is **success, not a crash** — that's the tests doing
+> their job. The actual app lives in `electron/` + `napi/` (below).
+
+
 A cross-platform **desktop** path-latency monitor (PingPlotter / mtr style):
 continuous per-hop ping + traceroute, IPv4 **and** IPv6, multiple targets, live
 config, per-hop ASN/BGP, alerts, exports, light & dark themes.

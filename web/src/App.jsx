@@ -374,10 +374,22 @@ export default function App() {
     for (const row of chartData) for (const k in row) if (k !== 'ts' && row[k] != null) vals.push(row[k])
     if (!vals.length || !clipOutliers) return { yDomain: [0, 'auto'], clippedSpikes: 0 }
     vals.sort((a, b) => a - b)
-    const p95 = vals[Math.floor(vals.length * 0.95)]
     const max = vals[vals.length - 1]
-    if (max <= p95 * 1.5 || max < 100) return { yDomain: [0, 'auto'], clippedSpikes: 0 }
-    const top = Math.max(Math.ceil(p95 * 1.25), 10)
+    // Median-based ratio test instead of a percentile INDEX (e.g. 95th
+    // percentile = vals[floor(len*0.95)]). With few samples — exactly the
+    // case right after adding a target, when a startup spike is most likely
+    // — that index lands on (or right next to) the last element, so the
+    // "95th percentile" degenerates to the max itself and the clip check
+    // (max <= p95*1.5) becomes trivially true, silently never firing. This
+    // is why the very screenshot prompting this fix showed an unclipped
+    // 16000ms-scale chart with no clip banner at all. The median stays a
+    // meaningful "typical value" at any sample count, so max/median gives a
+    // stable outlier ratio whether there are 6 points or 6,000.
+    const mid = Math.floor(vals.length / 2)
+    const median = vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2
+    const baseline = Math.max(median, 1) // avoid div-by-~0 when everything is sub-1ms
+    if (max <= baseline * 6 || max < 100) return { yDomain: [0, 'auto'], clippedSpikes: 0 }
+    const top = Math.max(Math.ceil(baseline * 3), 10)
     return { yDomain: [0, top], clippedSpikes: vals.filter((v) => v > top).length }
   }, [chartData, clipOutliers])
 

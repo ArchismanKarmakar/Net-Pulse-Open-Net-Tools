@@ -1,5 +1,6 @@
 #include "netpulse/transport.hpp"
 #include "netpulse/stats.hpp" // now_secs
+#include "netpulse/platform.hpp"
 
 #include <cstring>
 #include <chrono>
@@ -36,24 +37,16 @@ using socklen_t = int;
 
 namespace netpulse {
 
-#ifdef _WIN32
-namespace {
-struct WsaInit {
-    WsaInit() {
-        WSADATA d;
-        WSAStartup(MAKEWORD(2, 2), &d);
-        timeBeginPeriod(1); // 1ms timer resolution for accurate sleeps/timing
-    }
-    ~WsaInit() {
-        timeEndPeriod(1);
-        WSACleanup();
-    }
-};
-static WsaInit g_wsa;
-} // namespace
-#endif
+// NOTE: Winsock init used to be a namespace-scope static object right here.
+// That is unreliable in a static-lib build: a binary that links netpulse_core
+// but never calls anything in *this* .obj (e.g. a test that only calls
+// Session::resolve()) would never link this file in, so WSAStartup() would
+// never run. Initialization now happens via ensure_winsock_ready() (see
+// platform.hpp), called explicitly at the top of every function here that
+// touches a socket API — see platform.hpp for the full explanation.
 
 Prober::Prober(Family family, bool privileged, const std::string& source) : family_(family) {
+    ensure_winsock_ready();
     int domain = (family == Family::V4) ? AF_INET : AF_INET6;
     int type = privileged ? SOCK_RAW : SOCK_DGRAM;
     int proto = (family == Family::V4) ? static_cast<int>(IPPROTO_ICMP)
@@ -174,6 +167,7 @@ std::vector<Incoming> Prober::drain(double deadline_secs) {
 }
 
 std::vector<NetInterface> list_interfaces() {
+    ensure_winsock_ready();
     std::vector<NetInterface> out;
 #ifdef _WIN32
     ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;

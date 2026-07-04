@@ -69,6 +69,12 @@ async function createWindow() {
     },
   })
 
+  // The ONLY place this app ever touches a host:port. It is gated behind an
+  // opt-in env var (default `npm start` never sets it), and even here the URL
+  // serves UI ASSETS ONLY (HTML/JS/CSS from Vite's dev server, for hot-reload
+  // while developing the React UI) — never NetPulse data. preload.js still
+  // injects window.netpulse into this window exactly as it does for the
+  // production file:// build, so all probing data flows over IPC either way.
   const url = DEV ? 'http://127.0.0.1:5173' : `file://${path.join(distDir(), 'index.html')}`
   win.loadURL(url)
 

@@ -1,5 +1,6 @@
 #include "netpulse/session.hpp"
 #include "netpulse/transport.hpp"
+#include "netpulse/platform.hpp"
 
 #include <algorithm>
 #include <memory>
@@ -32,6 +33,7 @@ uint16_t Session::next_seq() {
 }
 
 void Session::resolve() {
+    ensure_winsock_ready(); // must run before any Winsock call (see platform.hpp)
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_DGRAM;

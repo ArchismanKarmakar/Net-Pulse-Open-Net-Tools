@@ -12,27 +12,29 @@ const FOCUS = [
 ]
 const SCALE_STEPS = [25, 50, 75, 100, 150, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000]
 
-// Transport shim: in the Electron native build, window.netpulse (the in-process
-// C++ N-API engine) is present, so /api/* calls are dispatched to it directly —
-// no localhost port, no HTTP. In the browser/dev build it falls back to fetch,
-// so the same React code runs unchanged in both modes.
+// Transport: ALL data flows through window.netpulse — the in-process C++
+// engine bridged over Electron IPC by preload.js. There is no HTTP fallback:
+// this app never opens a socket, a port, or a WebSocket for its own data path.
+// preload.js injects window.netpulse into every window this app creates
+// (whether the page is loaded from file:// in production or from the Vite dev
+// server during development), so a fallback was never actually reachable —
+// removing it makes that guarantee explicit instead of implicit.
 const api = async (path, opts) => {
   const np = (typeof window !== 'undefined') && window.netpulse
-  if (np && path.startsWith('/api/')) {
-    const [base, qs] = path.split('?')
-    const q = {}; new URLSearchParams(qs || '').forEach((v, k) => { q[k] = v })
-    switch (base) {
-      case '/api/state': return np.getState(q.focus && q.focus !== 'all' ? Number(q.focus) : undefined)
-      case '/api/interfaces': return np.listInterfaces()
-      case '/api/add': return { id: await np.addTarget({ target: q.target, family: q.family, probe: Number(q.probe), trace: Number(q.trace), timeout: Number(q.timeout), payload: Number(q.payload), maxhops: Number(q.maxhops), raw: q.raw !== '0', src: q.src || '' }) }
-      case '/api/update': { const o = {}; ['probe', 'timeout', 'payload', 'maxhops'].forEach((k) => { if (q[k] != null) o[k] = Number(q[k]) }); if (q.family) o.family = q.family; if (q.src != null) o.src = q.src; await np.updateTarget(Number(q.id), o); return { ok: true } }
-      case '/api/pause': await np.pauseTarget(Number(q.id), q.on !== '0'); return {}
-      case '/api/stop': await np.stopTarget(Number(q.id)); return {}
-      case '/api/remove': await np.removeTarget(Number(q.id)); return {}
-      default: break
-    }
+  if (!np) throw new Error('NetPulse native engine (window.netpulse) is not available — this UI must run inside the NetPulse Electron app.')
+  if (!path.startsWith('/api/')) throw new Error(`api(): unexpected path ${path}`)
+  const [base, qs] = path.split('?')
+  const q = {}; new URLSearchParams(qs || '').forEach((v, k) => { q[k] = v })
+  switch (base) {
+    case '/api/state': return np.getState(q.focus && q.focus !== 'all' ? Number(q.focus) : undefined)
+    case '/api/interfaces': return np.listInterfaces()
+    case '/api/add': return { id: await np.addTarget({ target: q.target, family: q.family, probe: Number(q.probe), trace: Number(q.trace), timeout: Number(q.timeout), payload: Number(q.payload), maxhops: Number(q.maxhops), raw: q.raw !== '0', src: q.src || '' }) }
+    case '/api/update': { const o = {}; ['probe', 'timeout', 'payload', 'maxhops'].forEach((k) => { if (q[k] != null) o[k] = Number(q[k]) }); if (q.family) o.family = q.family; if (q.src != null) o.src = q.src; await np.updateTarget(Number(q.id), o); return { ok: true } }
+    case '/api/pause': await np.pauseTarget(Number(q.id), q.on !== '0'); return {}
+    case '/api/stop': await np.stopTarget(Number(q.id)); return {}
+    case '/api/remove': await np.removeTarget(Number(q.id)); return {}
+    default: throw new Error(`api(): unknown endpoint ${base}`)
   }
-  return fetch(path, opts).then((r) => r.json())
 }
 const fmt = (v) => (v === null || v === undefined ? '—' : Number(v).toFixed(1))
 const timeFmt = (s) => new Date(s * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
@@ -259,7 +261,7 @@ export default function App() {
     const r = await api(`/api/add?${q}`, { method: 'POST' })
     setForm({ ...form, target: '' }); if (r.id) { setSelId(r.id); setSelHop(null) }
   }
-  const ctrl = (id, ep, extra = '') => fetch(`/api/${ep}?id=${id}${extra}`, { method: 'POST' })
+  const ctrl = (id, ep, extra = '') => api(`/api/${ep}?id=${id}${extra}`, { method: 'POST' })
   const openDetail = (ip) => {
     if (!bgp.isPublicIp(ip)) { setDetail({ ip, private: true, loading: false }); return }
     setDetail({ ip, loading: true })

@@ -10,22 +10,29 @@
 :root {
   --bg:#0a0d12; --panel:#11151c; --panel2:#161b24; --input-bg:#0d1117;
   --border:#1e2530; --border2:#2a3340; --btn-bg:#1a212c; --btn-hover:#232c3a;
-  --text:#e4e9f1; --muted:#8b96a5; --faint:#5b6675; --sel:#152029;
+  --text:#e4e9f1; --muted:#98a3b3; --faint:#6b7686; --sel:#152029;
   --accent:#22d3ee; --accent2:#38bdf8;
   --good:#34d399; --good-soft:#6ee7b7;
   --warn:#f59e0b; --warn-soft:#fbbf24;
   --bad:#fb923c; --danger:#f87171;
-  --grid:#1a212c; --axis:#5b6675;
+  --grid:#1a212c; --axis:#6b7686;
+  /* elevation: subtle depth instead of a flat single-tone panel wash */
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.35);
+  --shadow-md: 0 4px 16px -4px rgba(0,0,0,.45), 0 1px 3px rgba(0,0,0,.3);
+  --shadow-inset: inset 0 1px 0 rgba(255,255,255,.03);
 }
 :root[data-theme=light] {
-  --bg:#f6f8fb; --panel:#ffffff; --panel2:#eef2f7; --input-bg:#ffffff;
+  --bg:#f4f6f9; --panel:#ffffff; --panel2:#eef2f7; --input-bg:#ffffff;
   --border:#dde3ec; --border2:#c7d0dd; --btn-bg:#eef2f7; --btn-hover:#e2e8f2;
-  --text:#161c26; --muted:#5b6674; --faint:#7c8798; --sel:#e7f6fa;
+  --text:#161c26; --muted:#4b5768; --faint:#6e7a8c; --sel:#e7f6fa;
   --accent:#0891b2; --accent2:#0e7490;
   --good:#059669; --good-soft:#10b981;
   --warn:#b45309; --warn-soft:#d97706;
   --bad:#c2410c; --danger:#dc2626;
-  --grid:#e7ebf1; --axis:#8a96a6;
+  --grid:#e7ebf1; --axis:#7c8798;
+  --shadow-sm: 0 1px 2px rgba(30,41,59,.06);
+  --shadow-md: 0 8px 24px -8px rgba(30,41,59,.14), 0 1px 3px rgba(30,41,59,.08);
+  --shadow-inset: inset 0 1px 0 rgba(255,255,255,.6);
 }
 
 @layer base {
@@ -35,12 +42,18 @@
   html, body, #root { margin: 0; height: 100%; }
   body { @apply bg-bg text-ink antialiased; font: 14px/1.45 theme('fontFamily.sans'); }
   h1 { @apply m-0 text-[17px] font-semibold tracking-tight; }
-  button { @apply bg-btnbg border border-border2 text-ink rounded-md px-2.5 py-1.5 cursor-pointer transition-colors; }
-  button:hover { @apply bg-btnhover; }
+  button { @apply bg-btnbg border border-border2 text-ink rounded-lg px-2.5 py-1.5 cursor-pointer transition-all duration-150; }
+  button:hover { @apply bg-btnhover; box-shadow: var(--shadow-sm); }
+  button:active { transform: translateY(0.5px); }
   button:focus-visible, select:focus-visible, input:focus-visible { @apply outline-none ring-2 ring-accent; }
-  input[type=text], input[type=number], select {
-    @apply bg-inputbg border border-border2 text-ink rounded-md px-2 py-1.5 text-[13px];
+  /* Broad selector (not just [type=text]) so an input that's missing an
+     explicit `type` attribute is never left unstyled — this is exactly what
+     broke the target search box: no `type` meant it fell through every rule
+     scoped to input[type=...] and rendered as a raw, unstyled native input. */
+  input:not([type=checkbox]), select {
+    @apply bg-inputbg border border-border2 text-ink rounded-lg px-2 py-1.5 text-[13px] transition-colors;
   }
+  input::placeholder { color: var(--faint); opacity: 1; }
   table { @apply w-full border-collapse text-[13px]; }
   th, td { @apply text-left px-2.5 py-[5px] border-b border-border whitespace-nowrap; }
   th { @apply sticky top-0 bg-panel2 text-muted font-medium text-[11px] uppercase tracking-wide; }
@@ -48,8 +61,8 @@
 
 @layer components {
   /* ---- app shell ---- */
-  .app { @apply flex flex-col h-screen; }
-  header { @apply bg-panel border-b border-border px-3.5 py-2.5; }
+  .app { @apply flex flex-col h-screen; background-image: radial-gradient(1200px 600px at 15% -10%, color-mix(in srgb, var(--accent) 5%, transparent), transparent 60%); }
+  header { @apply bg-panel border-b border-border px-3.5 py-2.5; box-shadow: var(--shadow-sm); position: relative; z-index: 20; }
   .body { @apply flex-1 flex min-h-0; }
   main { @apply flex-1 flex flex-col min-w-0 p-2.5 gap-2.5; }
   .empty { @apply m-auto text-faint text-sm; }
@@ -67,12 +80,12 @@
   .themebtn { @apply bg-transparent border-none text-base px-1 ml-2; }
 
   /* ---- targets sidebar ---- */
-  aside { @apply w-[230px] border-r border-border p-2.5 flex flex-col gap-2; }
+  aside { @apply w-[230px] border-r border-border p-2.5 flex flex-col gap-2; background: var(--panel); }
   aside h3 { @apply m-0 text-[11px] text-muted uppercase tracking-wider; }
   aside ul { @apply list-none m-0 p-0 flex-1 overflow-auto flex flex-col gap-1; }
-  aside li { @apply px-2 py-1.5 rounded-md cursor-pointer flex flex-col transition-colors; }
-  aside li:hover { @apply bg-panel2; }
-  aside li.sel { @apply bg-sel outline outline-1 outline-border2; }
+  aside li { @apply px-2.5 py-2 rounded-lg cursor-pointer flex flex-col transition-all duration-150; }
+  aside li:hover { @apply bg-panel2; box-shadow: var(--shadow-sm); transform: translateX(1px); }
+  aside li.sel { @apply bg-sel outline outline-1 outline-border2; box-shadow: var(--shadow-sm); }
   aside li small { @apply text-faint text-[11px]; }
   aside li.s-okloss { background: color-mix(in srgb, var(--good-soft) 12%, var(--panel)); }
   aside li.s-warn   { background: color-mix(in srgb, var(--warn-soft) 15%, var(--panel)); }
@@ -107,27 +120,27 @@
   .hopdot.st-silent { background: var(--faint); opacity: .45; } /* no ICMP reply — normal, not a fault */
 
   /* ---- status bar / config strip / edit panel ---- */
-  .statusbar { @apply flex items-center gap-2.5 px-2 py-1.5 bg-panel border border-border rounded-lg; }
+  .statusbar { @apply flex items-center gap-2.5 px-2.5 py-2 bg-panel border border-border rounded-xl; box-shadow: var(--shadow-sm), var(--shadow-inset); }
   .statusbar .spacer { @apply flex-1; }
   .statusbar .err { color: var(--bad); @apply text-[13px]; }
   .rtt { @apply text-muted text-xs mr-1.5; }
   .rtt b { @apply text-ink text-[15px]; }
   .rttsub { @apply text-faint text-[11px]; }
-  .badge { @apply px-1.5 py-px rounded text-[11px] mx-0.5; background: color-mix(in srgb, var(--accent) 16%, var(--panel)); color: var(--accent); }
+  .badge { @apply px-2 py-0.5 rounded-md text-[11px] mx-0.5 font-medium; background: color-mix(in srgb, var(--accent) 16%, var(--panel)); color: var(--accent); }
 
-  .cfgstrip { @apply flex items-center gap-3.5 px-3 py-1.5 mt-1.5 bg-panel border border-border rounded-lg text-xs text-muted flex-wrap; }
+  .cfgstrip { @apply flex items-center gap-3.5 px-3 py-2 mt-1.5 bg-panel border border-border rounded-xl text-xs text-muted flex-wrap; box-shadow: var(--shadow-sm), var(--shadow-inset); }
   .cfgstrip .cfglabel { @apply font-bold tracking-wider text-faint text-[10px]; }
   .cfgstrip b { @apply text-ink font-semibold; }
   .cfgstrip button { @apply text-xs px-2.5 py-1; }
 
-  .editpanel { @apply flex items-end gap-3 px-3 py-2.5 mt-1.5 bg-panel border border-border2 rounded-lg flex-wrap; }
+  .editpanel { @apply flex items-end gap-3 px-3 py-3 mt-1.5 bg-panel border border-border2 rounded-xl flex-wrap; box-shadow: var(--shadow-md); }
   .editpanel label { @apply flex flex-col gap-1 text-[11px] text-muted; }
   .editpanel input, .editpanel select { @apply w-[120px]; }
   .editpanel .apply { @apply self-end px-3.5 py-1.5 rounded-md font-semibold border-none cursor-pointer; }
 
   /* ---- table ---- */
-  .tablewrap { @apply max-h-[38%] overflow-auto border border-border rounded-lg; }
-  tbody tr { @apply cursor-pointer; }
+  .tablewrap { @apply max-h-[38%] overflow-auto border border-border rounded-xl; box-shadow: var(--shadow-sm); }
+  tbody tr { @apply cursor-pointer transition-colors duration-100; }
   tbody tr:hover { @apply bg-panel2; }
   tr.selrow { background: var(--sel); }
   td.loss, i.loss { color: var(--danger); }
@@ -148,7 +161,7 @@
   .legend .ramp { @apply w-[90px] h-2 rounded-md inline-block; background: linear-gradient(90deg, var(--good), var(--warn), var(--danger)); }
 
   /* ---- chart: oscilloscope-style dot-grid background (signature element) ---- */
-  .chart { @apply flex-1 min-h-[200px] border border-border rounded-lg p-1.5 bg-dotgrid bg-dotgrid; background-color: var(--bg); }
+  .chart { @apply flex-1 min-h-[200px] border border-border rounded-xl p-2 bg-dotgrid bg-dotgrid; background-color: var(--bg); box-shadow: var(--shadow-sm), var(--shadow-inset); }
 
   /* ---- loading / tracing state ---- */
   .loading { @apply flex-1 flex flex-col items-center justify-center gap-3.5 text-muted; }
@@ -158,7 +171,7 @@
   .spinner.sm { @apply w-4 h-4 border-2; }
 
   /* ---- BGP / routing drawer ---- */
-  .drawer { @apply w-80 border-l border-border p-3 overflow-y-auto; background: var(--panel); }
+  .drawer { @apply w-80 border-l border-border p-3.5 overflow-y-auto; background: var(--panel); box-shadow: -8px 0 24px -8px rgba(0,0,0,.25); }
   .drawer-head { @apply flex justify-between items-center mb-2.5; }
   .drawer-head b { @apply font-mono text-sm; }
   .drawer-head .x { @apply bg-transparent border-none text-muted text-base px-1; }

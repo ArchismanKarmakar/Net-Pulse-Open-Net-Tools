@@ -371,7 +371,7 @@ export default function App() {
           <button className="themebtn" title="Toggle light / dark" onClick={() => setTheme((t) => t === 'light' ? 'dark' : 'light')}>{theme === 'light' ? '🌙' : '☀'}</button>
         </h1>
         <div className="controls">
-          <input className="target" placeholder="host or IP (8.8.8.8, 2001:4860:4860::8888, example.com)"
+          <input type="text" className="target" placeholder="host or IP (8.8.8.8, 2001:4860:4860::8888, example.com)"
             value={form.target} onChange={(e) => setForm({ ...form, target: e.target.value })}
             onKeyDown={(e) => e.key === 'Enter' && addTarget()} />
           <button className="primary" onClick={addTarget}>＋ Add</button>

@@ -216,7 +216,18 @@ export default function App() {
   // unconfirmed destination reads as "discovering" (correct) and can never be
   // mistaken for "unreachable". This also matches the top status bar, which
   // already uses the strict `is_dest` lookup (see `dest` below).
-  const destHopOf = (t) => (t.hops || []).find((h) => h.is_dest) || null
+  const destHopOf = (t) => {
+    const hops = t.hops || []
+    const byFlag = hops.find((h) => h.is_dest)
+    if (byFlag) return byFlag
+    // Fallback: if the engine reported a `dest_ip`, try to locate the hop
+    // with that address. This handles cases where the engine's per-hop
+    // `is_dest` flag may be missing briefly while the route is actually
+    // discovered (avoids the UI sticking in "discovering"). It's conservative
+    // because it still requires an explicit matching hop address.
+    if (t.dest_ip) return hops.find((h) => h.address === t.dest_ip) || null
+    return null
+  }
 
   const focus = FOCUS[focusIdx][1]
 
@@ -508,9 +519,25 @@ export default function App() {
               return (
                 <li key={t.id} className={(sel && t.id === sel.id ? 'sel ' : '') + 's-' + st} onClick={() => { setSelId(t.id); setSelHop(null) }}>
                   <div className="flex items-center">
-                    <span className="signal" title={`Target: ${destLamp(t)} · Path: ${pathLamp(t)}`}>
-                      <span className={'lamp st-' + destLamp(t)} />
-                      <span className={'lamp st-' + pathLamp(t)} />
+                    <span className="signal">
+                      <span
+                        className={'lamp st-' + destLamp(t)}
+                        title={(() => {
+                          const s = destLamp(t)
+                          const m = { discovering: 'Route discovery in progress', ok: 'Destination healthy', okloss: 'Destination: occasional loss', warn: 'Destination: elevated latency/loss', bad: 'Destination: high latency/loss', down: 'Destination unreachable' }
+                          return `Target: ${m[s] || s}`
+                        })()}
+                        aria-label={`target-${destLamp(t)}`}
+                      />
+                      <span
+                        className={'lamp st-' + pathLamp(t)}
+                        title={(() => {
+                          const s = pathLamp(t)
+                          const m = { discovering: 'Route discovery in progress', ok: 'Path healthy', warn: 'Upstream path: packet loss/latency', okloss: 'Upstream: light loss', bad: 'Upstream: high latency/loss', down: 'Upstream: unreachable' }
+                          return `Path: ${m[s] || s}`
+                        })()}
+                        aria-label={`path-${pathLamp(t)}`}
+                      />
                     </span>
                     <span className="truncate">{t.name}</span>
                     {STATE_LABEL[st] && <span className={'statelabel st-' + st}>{STATE_LABEL[st]}</span>}

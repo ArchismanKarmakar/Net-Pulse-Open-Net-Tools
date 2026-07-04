@@ -93,15 +93,13 @@
   aside { @apply w-[230px] border-r border-border p-2.5 flex flex-col gap-2; background: var(--panel); }
   aside h3 { @apply m-0 text-[11px] text-muted uppercase tracking-wider; }
   aside ul { @apply list-none m-0 p-0 flex-1 overflow-auto flex flex-col gap-1; }
-  aside li { @apply px-2.5 py-2 rounded-lg cursor-pointer flex flex-col; }
+  aside li { @apply px-2.5 py-2 rounded-lg cursor-pointer flex flex-col; position: relative; }
   aside li:hover { @apply bg-panel2; }
   aside li.sel { @apply bg-sel outline outline-1 outline-border2; box-shadow: var(--shadow-sm); }
   aside li small { @apply text-faint text-[11px]; }
-  aside li.s-discovering { background: color-mix(in srgb, var(--accent) 12%, var(--panel)); }
-  aside li.s-okloss { background: color-mix(in srgb, var(--good-soft) 12%, var(--panel)); }
-  aside li.s-warn   { background: color-mix(in srgb, var(--warn-soft) 15%, var(--panel)); }
-  aside li.s-bad    { background: color-mix(in srgb, var(--bad) 14%, var(--panel)); }
-  aside li.s-down   { background: color-mix(in srgb, var(--danger) 15%, var(--panel)); }
+    /* Use the two-lamp `signal` instead of tinting the card. */
+
+    /* Keep the selected card visually distinct (outline) */
   .row { @apply flex gap-1.5; }
   .row button { @apply flex-1; }
 
@@ -138,6 +136,7 @@
   .hopdot.st-minor  { background: var(--good-soft); }
   .hopdot.st-loss   { background: var(--warn); }
   .hopdot.st-warn   { background: var(--warn-soft); }
+  /* (removed left accent; lamps communicate status) */
   .hopdot.st-bad    { background: var(--bad); box-shadow: theme('boxShadow.led'); color: var(--bad); }
   .hopdot.st-down   { background: var(--danger); box-shadow: theme('boxShadow.led'); color: var(--danger); }
   .hopdot.st-silent { background: var(--faint); opacity: .45; } /* no ICMP reply — normal, not a fault */

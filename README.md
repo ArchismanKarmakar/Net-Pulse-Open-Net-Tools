@@ -1,29 +1,5 @@
 # NetPulse — Path Latency Studio
 
-> **Running the app:** NetPulse is an **Electron desktop app**. Run it from a
-> terminal, **not** from VS Code's C++ *Debug/Play* button.
->
-> One-shot: **`./build-and-run.ps1`** (Windows) or **`./build-and-run.sh`**
-> (Linux/macOS) from the project root. For real ICMP probing, use an
-> **Administrator** terminal (Windows) or grant `cap_net_raw` (Linux).
->
-> **In VS Code:** open the Run and Debug panel (Ctrl+Shift+D) and pick
-> **"NetPulse: Launch app (Electron)"** from the dropdown, then press ▶. This
-> builds everything and launches the real app. Do **not** use the default C++
-> "Debug"/▶ button in the status bar — CMake Tools auto-selects
-> `netpulse_tests` as its target (the only executable this CMake project
-> builds), so that button runs the **unit tests**, not the app. If you see it
-> print `ALL TESTS PASSED` and exit with code `0`, that is a passing test
-> suite, not a crash — exit code 0 means success on every OS.
->
-> **The C++ CMake project is NOT the app.** It builds only the engine library
-> (`netpulse_core`) and its unit tests (`netpulse_tests`). If you press VS Code's
-> Debug button it will build and run `netpulse_tests.exe`, which prints
-> `ALL TESTS PASSED` and exits with code 0. A console test finishing and closing
-> its window in a flash is **success, not a crash** — that's the tests doing
-> their job. The actual app lives in `electron/` + `napi/` (below).
-
-
 A cross-platform **desktop** path-latency monitor (PingPlotter / mtr style):
 continuous per-hop ping + traceroute, IPv4 **and** IPv6, multiple targets, live
 config, per-hop ASN/BGP, alerts, exports, light & dark themes.
@@ -184,22 +160,8 @@ Bundle `web/dist`, the Electron files, and the **Electron-ABI** addon
   <https://snyk.io/blog/nodejs-add-on-extensions/> (validate at the boundary,
   no untrusted input to native parsing, keep the C++ surface small).
 
-## Styling
+## License / attribution
 
-The UI is built with **Tailwind CSS**, compiled at build time in `web/` via
-PostCSS (`npm run build`). This has **zero effect on packaging**: the output
-is one static `.css` file in `web/dist`, exactly like the hand-written CSS it
-replaced — Tailwind never ships in the Electron bundle, only its compiled
-output does. Theme colors (light/dark) are still driven by CSS variables in
-`src/styles.css`, with Tailwind utilities reading from them, so the existing
-`data-theme` toggle keeps working unchanged. No web fonts are bundled or
-fetched — the UI uses the OS's system font stack, which keeps licensing and
-the CSP (`connect-src 'self' https:`) simple.
-
-## License
-
-MIT — see [`LICENSE`](LICENSE). Third-party components and their licenses are
-listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
-
-"PingPlotter" and "mtr" are referenced only for behavioral comparison and are
-trademarks of their respective owners; NetPulse is an independent project.
+Independent project; "PingPlotter" and "mtr" are referenced only for comparison
+and are trademarks of their respective owners. DejaVu fonts (if bundled) are
+under their permissive license.

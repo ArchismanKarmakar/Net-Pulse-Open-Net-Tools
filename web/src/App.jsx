@@ -12,29 +12,27 @@ const FOCUS = [
 ]
 const SCALE_STEPS = [25, 50, 75, 100, 150, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000]
 
-// Transport: ALL data flows through window.netpulse — the in-process C++
-// engine bridged over Electron IPC by preload.js. There is no HTTP fallback:
-// this app never opens a socket, a port, or a WebSocket for its own data path.
-// preload.js injects window.netpulse into every window this app creates
-// (whether the page is loaded from file:// in production or from the Vite dev
-// server during development), so a fallback was never actually reachable —
-// removing it makes that guarantee explicit instead of implicit.
+// Transport shim: in the Electron native build, window.netpulse (the in-process
+// C++ N-API engine) is present, so /api/* calls are dispatched to it directly —
+// no localhost port, no HTTP. In the browser/dev build it falls back to fetch,
+// so the same React code runs unchanged in both modes.
 const api = async (path, opts) => {
   const np = (typeof window !== 'undefined') && window.netpulse
-  if (!np) throw new Error('NetPulse native engine (window.netpulse) is not available — this UI must run inside the NetPulse Electron app.')
-  if (!path.startsWith('/api/')) throw new Error(`api(): unexpected path ${path}`)
-  const [base, qs] = path.split('?')
-  const q = {}; new URLSearchParams(qs || '').forEach((v, k) => { q[k] = v })
-  switch (base) {
-    case '/api/state': return np.getState(q.focus && q.focus !== 'all' ? Number(q.focus) : undefined)
-    case '/api/interfaces': return np.listInterfaces()
-    case '/api/add': return { id: await np.addTarget({ target: q.target, family: q.family, probe: Number(q.probe), trace: Number(q.trace), timeout: Number(q.timeout), payload: Number(q.payload), maxhops: Number(q.maxhops), raw: q.raw !== '0', src: q.src || '' }) }
-    case '/api/update': { const o = {}; ['probe', 'timeout', 'payload', 'maxhops'].forEach((k) => { if (q[k] != null) o[k] = Number(q[k]) }); if (q.family) o.family = q.family; if (q.src != null) o.src = q.src; await np.updateTarget(Number(q.id), o); return { ok: true } }
-    case '/api/pause': await np.pauseTarget(Number(q.id), q.on !== '0'); return {}
-    case '/api/stop': await np.stopTarget(Number(q.id)); return {}
-    case '/api/remove': await np.removeTarget(Number(q.id)); return {}
-    default: throw new Error(`api(): unknown endpoint ${base}`)
+  if (np && path.startsWith('/api/')) {
+    const [base, qs] = path.split('?')
+    const q = {}; new URLSearchParams(qs || '').forEach((v, k) => { q[k] = v })
+    switch (base) {
+      case '/api/state': return np.getState(q.focus && q.focus !== 'all' ? Number(q.focus) : undefined)
+      case '/api/interfaces': return np.listInterfaces()
+      case '/api/add': return { id: await np.addTarget({ target: q.target, family: q.family, probe: Number(q.probe), trace: Number(q.trace), timeout: Number(q.timeout), payload: Number(q.payload), maxhops: Number(q.maxhops), raw: q.raw !== '0', src: q.src || '' }) }
+      case '/api/update': { const o = {}; ['probe', 'timeout', 'payload', 'maxhops'].forEach((k) => { if (q[k] != null) o[k] = Number(q[k]) }); if (q.family) o.family = q.family; if (q.src != null) o.src = q.src; await np.updateTarget(Number(q.id), o); return { ok: true } }
+      case '/api/pause': await np.pauseTarget(Number(q.id), q.on !== '0'); return {}
+      case '/api/stop': await np.stopTarget(Number(q.id)); return {}
+      case '/api/remove': await np.removeTarget(Number(q.id)); return {}
+      default: break
+    }
   }
+  return fetch(path, opts).then((r) => r.json())
 }
 const fmt = (v) => (v === null || v === undefined ? '—' : Number(v).toFixed(1))
 const timeFmt = (s) => new Date(s * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
@@ -170,66 +168,14 @@ export default function App() {
   const [editForm, setEditForm] = useState(null)
   const [theme, setTheme] = useState(() => { try { return localStorage.getItem('np-theme') || 'dark' } catch { return 'dark' } })
   const chartRef = useRef(null)
-
-  // ---- resizable panels (sidebar width, table/chart split) ----
-  const [sidebarWidth, setSidebarWidth] = useState(() => { const v = Number(localStorage.getItem('np-sidebar-w')); return v >= 230 ? v : 300 })
-  const [tablePct, setTablePct] = useState(() => { const v = Number(localStorage.getItem('np-table-pct')); return v >= 15 && v <= 70 ? v : 38 })
-  const dragRef = useRef(null)
-  const onDrag = (e) => {
-    const d = dragRef.current; if (!d) return
-    if (d.kind === 'sidebar') {
-      setSidebarWidth(Math.min(520, Math.max(230, d.startW + (e.clientX - d.startX))))
-    } else {
-      const total = d.box ? d.box.clientHeight : 600
-      setTablePct(Math.min(70, Math.max(15, d.startPct + ((e.clientY - d.startY) / total) * 100)))
-    }
-  }
-  const endDrag = () => {
-    dragRef.current = null
-    document.body.style.cursor = ''
-    localStorage.setItem('np-sidebar-w', String(sidebarWidth))
-    localStorage.setItem('np-table-pct', String(tablePct))
-    window.removeEventListener('mousemove', onDrag)
-    window.removeEventListener('mouseup', endDrag)
-  }
-  const startDrag = (kind) => (e) => {
-    e.preventDefault()
-    dragRef.current = { kind, startX: e.clientX, startY: e.clientY, startW: sidebarWidth, startPct: tablePct, box: e.currentTarget.closest('main') }
-    document.body.style.cursor = kind === 'sidebar' ? 'col-resize' : 'row-resize'
-    window.addEventListener('mousemove', onDrag)
-    window.addEventListener('mouseup', endDrag)
-  }
-  // Shared "which hop represents the destination" lookup, used by both the
-  // targets-list health colour and its brief stats line.
-  const destHopOf = (t) => { const hops = t.hops || []; return hops.find((h) => h.is_dest) || (hops.length ? hops[hops.length - 1] : null) }
-
   const focus = FOCUS[focusIdx][1]
 
   useEffect(() => {
-    // Flipping data-theme recomputes every CSS-variable-driven colour at once;
-    // if elements are mid-transition when that happens, dozens of them (table
-    // rows, dots, buttons) animate simultaneously and the switch visibly janks.
-    // Fix: suspend all transitions for one frame, apply the theme, then
-    // restore transitions — the swap becomes instant instead of animated.
-    const root = document.documentElement
-    root.classList.add('theme-switching')
-    root.dataset.theme = theme
+    document.documentElement.dataset.theme = theme
     try { localStorage.setItem('np-theme', theme) } catch {}
-    const id = requestAnimationFrame(() => requestAnimationFrame(() => root.classList.remove('theme-switching')))
-    return () => cancelAnimationFrame(id)
   }, [theme])
 
   useEffect(() => { api('/api/interfaces').then((j) => setInterfaces(Array.isArray(j) ? j : [])).catch(() => {}) }, [])
-
-  // Shared fetch, used by both the periodic poller and addTarget() below —
-  // addTarget calls this directly right after adding, instead of waiting up
-  // to 600ms for the next scheduled tick. Without that, there was a window
-  // where selId already pointed at the brand-new target but `targets` (still
-  // holding the pre-add poll response) didn't contain it yet; `sel` falls
-  // back to `targets[0]` whenever the id isn't found, so the panel kept
-  // showing the FIRST target instead of the one just added — worse the more
-  // targets you already had, since the odds of catching that gap go up.
-  const refreshState = async () => { try { const s = await api(`/api/state?focus=${focus}`); setState(s); return s } catch { return null } }
 
   useEffect(() => {
     let alive = true
@@ -274,19 +220,10 @@ export default function App() {
   //   green (ok) · light green (okloss, occasional loss) · yellow (warn, a middle
   //   hop is lossy/unreachable) · orange (bad, target loss + high latency) ·
   //   red (down, target unreachable)
-  // A target that hasn't produced any destination data yet is DISCOVERING —
-  // it must not read as green "healthy" (misleading) nor as red "down" (it
-  // isn't failing, it just started). This is the state shown in the list while
-  // DNS resolves and the first probes come back.
-  const isDiscovering = (t) => {
-    const d = destHopOf(t)
-    return !d || (d.sent === 0 && (d.recv ?? 0) === 0 && (d.loss ?? 0) === 0)
-  }
   const targetState = (t) => {
-    if (isDiscovering(t)) return 'discovering'
     const hops = t.hops || []
-    const d = destHopOf(t)
-    if (!d) return 'discovering'
+    const d = hops.find((h) => h.is_dest) || (hops.length ? hops[hops.length - 1] : null)
+    if (!d) return 'ok'
     const lat = d.med ?? d.avg
     const latHigh = lat != null && lat > alerts.ms
     const lossHigh = d.sent > 0 && d.loss > alerts.loss
@@ -299,30 +236,7 @@ export default function App() {
     if (minorLoss) return 'okloss'           // light green — occasional loss
     return 'ok'
   }
-  const STATE_LABEL = { discovering: 'discovering', ok: 'ok', okloss: 'minor loss', warn: 'path', bad: 'high latency/loss', down: 'unreachable' }
-
-  // Two-lamp signal, in the spirit of German railway signal heads (Hauptsignal):
-  // meaning comes from reading TWO independently-lit lamps together, not one
-  // blended colour. Left lamp = the target itself; right lamp = the path
-  // leading to it. This tells you at a glance which of the two is the problem
-  // instead of folding both into a single ambiguous colour.
-  const destLamp = (t) => {
-    const d = destHopOf(t)
-    if (!d || isDiscovering(t)) return 'discovering'
-    const lat = d.med ?? d.avg
-    const latHigh = lat != null && lat > alerts.ms
-    const lossHigh = d.sent > 0 && d.loss > alerts.loss
-    const noReply = d.sent > 0 && d.recv === 0
-    if (noReply) return 'down'
-    if (lossHigh || latHigh) return 'bad'
-    if (d.loss > 0) return 'okloss'
-    return 'ok'
-  }
-  const pathLamp = (t) => {
-    if (isDiscovering(t)) return 'discovering'
-    const hops = t.hops || []
-    return hops.some((h) => !h.is_dest && h.sent > 0 && h.loss > alerts.loss) ? 'warn' : 'ok'
-  }
+  const STATE_LABEL = { ok: 'ok', okloss: 'minor loss', warn: 'path', bad: 'high latency/loss', down: 'unreachable' }
 
   useEffect(() => { if (sel && selHop === null) { const d = sel.hops.find((h) => h.is_dest); if (d) setSelHop(d.hop) } }, [sel, selHop])
 
@@ -343,13 +257,9 @@ export default function App() {
     const q = new URLSearchParams({ target: form.target.trim(), family: form.family, probe: form.probe, trace: form.trace, timeout: form.timeout, payload: form.payload, maxhops: form.maxhops, raw: form.raw ? '1' : '0' })
     if (iface) q.set('src', iface)
     const r = await api(`/api/add?${q}`, { method: 'POST' })
-    setForm({ ...form, target: '' })
-    if (r.id) {
-      await refreshState() // ensure `targets` contains the new one before selecting it
-      setSelId(r.id); setSelHop(null)
-    }
+    setForm({ ...form, target: '' }); if (r.id) { setSelId(r.id); setSelHop(null) }
   }
-  const ctrl = (id, ep, extra = '') => api(`/api/${ep}?id=${id}${extra}`, { method: 'POST' })
+  const ctrl = (id, ep, extra = '') => fetch(`/api/${ep}?id=${id}${extra}`, { method: 'POST' })
   const openDetail = (ip) => {
     if (!bgp.isPublicIp(ip)) { setDetail({ ip, private: true, loading: false }); return }
     setDetail({ ip, loading: true })
@@ -371,38 +281,6 @@ export default function App() {
     }
     return [...byTs.values()].sort((a, b) => a.ts - b.ts)
   }, [sel, shownHops])
-
-  // Outlier-aware Y-axis: a single rate-limited/queued ICMP reply can read
-  // thousands of ms and, left unchecked, flattens the whole normal-latency
-  // band into a line along the bottom (exactly what happened in the 16000ms-
-  // scale screenshot). Default: clip the axis to just above the 95th
-  // percentile so the everyday ~ms band stays readable; real spikes still
-  // draw, they just run off the top of the chart. Togglable per target.
-  const [clipOutliers, setClipOutliers] = useState(true)
-  const { yDomain, clippedSpikes } = useMemo(() => {
-    const vals = []
-    for (const row of chartData) for (const k in row) if (k !== 'ts' && row[k] != null) vals.push(row[k])
-    if (!vals.length || !clipOutliers) return { yDomain: [0, 'auto'], clippedSpikes: 0 }
-    vals.sort((a, b) => a - b)
-    const max = vals[vals.length - 1]
-    // Median-based ratio test instead of a percentile INDEX (e.g. 95th
-    // percentile = vals[floor(len*0.95)]). With few samples — exactly the
-    // case right after adding a target, when a startup spike is most likely
-    // — that index lands on (or right next to) the last element, so the
-    // "95th percentile" degenerates to the max itself and the clip check
-    // (max <= p95*1.5) becomes trivially true, silently never firing. This
-    // is why the very screenshot prompting this fix showed an unclipped
-    // 16000ms-scale chart with no clip banner at all. The median stays a
-    // meaningful "typical value" at any sample count, so max/median gives a
-    // stable outlier ratio whether there are 6 points or 6,000.
-    const mid = Math.floor(vals.length / 2)
-    const median = vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2
-    const baseline = Math.max(median, 1) // avoid div-by-~0 when everything is sub-1ms
-    if (max <= baseline * 6 || max < 100) return { yDomain: [0, 'auto'], clippedSpikes: 0 }
-    const top = Math.max(Math.ceil(baseline * 3), 10)
-    return { yDomain: [0, top], clippedSpikes: vals.filter((v) => v > top).length }
-  }, [chartData, clipOutliers])
-
 
   const exportPng = () => {
     const svg = chartRef.current?.querySelector('svg'); if (!svg) return
@@ -438,7 +316,7 @@ export default function App() {
           <button className="themebtn" title="Toggle light / dark" onClick={() => setTheme((t) => t === 'light' ? 'dark' : 'light')}>{theme === 'light' ? '🌙' : '☀'}</button>
         </h1>
         <div className="controls">
-          <input type="text" className="target" placeholder="host or IP (8.8.8.8, 2001:4860:4860::8888, example.com)"
+          <input className="target" placeholder="host or IP (8.8.8.8, 2001:4860:4860::8888, example.com)"
             value={form.target} onChange={(e) => setForm({ ...form, target: e.target.value })}
             onKeyDown={(e) => e.key === 'Enter' && addTarget()} />
           <button className="primary" onClick={addTarget}>＋ Add</button>
@@ -472,38 +350,20 @@ export default function App() {
           <span className="divider" />
           <label className="cb"><input type="checkbox" checked={view.trend} onChange={(e) => setView({ ...view, trend: e.target.checked })} />Trend</label>
           <label className="cb"><input type="checkbox" checked={view.latency} onChange={(e) => setView({ ...view, latency: e.target.checked })} />Latency graph</label>
-          <label className="cb"><input type="checkbox" checked={clipOutliers} onChange={(e) => setClipOutliers(e.target.checked)} title="Keep the everyday latency band readable when a rate-limited hop spikes to thousands of ms" />Clip spikes</label>
         </div>
       </header>
 
       <div className="body">
-        <aside style={{ width: sidebarWidth }} className="shrink-0 relative">
+        <aside>
           <h3>Targets</h3>
           <ul>
             {targets.map((t) => {
               const st = targetState(t)
-              const d = destHopOf(t)
               return (
                 <li key={t.id} className={(sel && t.id === sel.id ? 'sel ' : '') + 's-' + st} onClick={() => { setSelId(t.id); setSelHop(null) }}>
-                  <div className="flex items-center">
-                    <span className="signal" title={`Target: ${destLamp(t)} · Path: ${pathLamp(t)}`}>
-                      <span className={'lamp st-' + destLamp(t)} />
-                      <span className={'lamp st-' + pathLamp(t)} />
-                    </span>
-                    <span className="truncate">{t.name}</span>
-                    {STATE_LABEL[st] && <span className={'statelabel st-' + st}>{STATE_LABEL[st]}</span>}
-                  </div>
+                  <span className={'dot st-' + st} /> {t.name}
+                  {STATE_LABEL[st] && <span className={'statelabel st-' + st}>{STATE_LABEL[st]}</span>}
                   <small>{t.dest_ip} {t.family}{t.paused ? ' · paused' : ''}</small>
-                  {d && (
-                    <div className="grid grid-cols-3 gap-x-2.5 gap-y-0.5 mt-1.5 pt-1.5 border-t border-border text-[10px] font-mono text-muted">
-                      <span>min <b className="text-ink">{fmt(d.min)}</b></span>
-                      <span>avg <b className="text-ink">{fmt(d.avg)}</b></span>
-                      <span>med <b className="text-ink">{fmt(d.med)}</b></span>
-                      <span>max <b className="text-ink">{fmt(d.max)}</b></span>
-                      <span>jit <b className="text-ink">{fmt(d.jitter)}</b></span>
-                      <span>pl <b className={d.loss > 0 ? '' : 'text-ink'} style={d.loss > 0 ? { color: 'var(--bad)' } : undefined}>{d.loss.toFixed(0)}%</b></span>
-                    </div>
-                  )}
                 </li>
               )
             })}
@@ -517,25 +377,13 @@ export default function App() {
           )}
           <button onClick={() => exportTargets(false)}>Export targets CSV</button>
           <button onClick={() => exportTargets(true)}>Export targets JSON</button>
-          <div
-            onMouseDown={startDrag('sidebar')}
-            title="Drag to resize"
-            className="resize-handle-x absolute top-0 right-0 h-full w-1.5"
-          />
         </aside>
-
 
         <main>
           {!sel ? <div className="empty">Add a target to begin.</div> : (
             <>
               <div className="statusbar">
-                <b>{sel.name}</b> → {sel.dest_ip || 'resolving…'} <span className="badge">{sel.family}</span> · {sel.hops.length} hops
-                {(sel.hops.length === 0 || (dest && dest.sent === 0)) && !sel.error && (
-                  <span className="badge inline-flex items-center align-middle" title="Discovering the route: resolving the destination and probing each hop. Each hop's first few real replies are used only to establish its address/route and aren't shown as stats yet, so an unrepresentative first reading isn't displayed as if it were typical. Clears per-hop as soon as real data is available.">
-                    <span className="spinner sm" style={{ marginRight: 5 }} />
-                    {sel.dest_ip ? 'discovering route…' : `resolving ${sel.name}…`}
-                  </span>
-                )}
+                <b>{sel.name}</b> → {sel.dest_ip || 'unresolved'} <span className="badge">{sel.family}</span> · {sel.hops.length} hops
                 {(() => { const p = sel.hops.filter((h) => ['loss', 'warn', 'bad', 'down'].includes(hopStatus(h))); return p.length > 0 && <span className="err"> ⚠ {p.length} hop{p.length > 1 ? 's' : ''} with loss/latency</span> })()}
                 {sel.error && <span className="err"> ⚠ {sel.error}</span>}
                 <div className="spacer" />
@@ -547,13 +395,10 @@ export default function App() {
               {sel.config && (
                 <div className="cfgstrip">
                   <span className="cfglabel">CONFIG</span>
-                  <span className="divider" />
                   <span>probe <b>{sel.config.probe}s</b></span>
                   <span>timeout <b>{sel.config.timeout === 0 ? 'auto' : sel.config.timeout + 's'}</b></span>
-                  <span className="divider" />
                   <span>payload <b>{sel.config.payload}B</b></span>
                   <span>max hops <b>{sel.config.maxhops}</b></span>
-                  <span className="divider" />
                   <span>family <b>{sel.config.family}</b></span>
                   <span>iface <b>{sel.config.src || 'auto'}</b></span>
                   <span>mode <b>{sel.config.raw ? 'raw' : 'dgram'}</b></span>
@@ -585,17 +430,19 @@ export default function App() {
                 </div>
               )}
 
-              {sel.error ? (
+              {sel.hops.length === 0 && !sel.error ? (
                 <div className="loading">
-                  <div className="loading-text" style={{ color: 'var(--danger)' }}>⚠ {sel.error}</div>
+                  <div className="spinner" />
+                  <div className="loading-text">{sel.dest_ip ? `Tracing route to ${sel.dest_ip}…` : `Resolving ${sel.name}…`}</div>
+                  <div className="loading-sub">first samples appear in a couple of seconds</div>
                 </div>
               ) : (
                 <>
-                  <div className="tablewrap" style={{ maxHeight: `${tablePct}%` }}>
+                  <div className="tablewrap">
                     <table>
                       <thead><tr>
                         <th>Hop</th><th>PL%</th><th>IP</th><th>Host</th><th>ASN</th><th>Network</th>
-                        <th>Sent</th><th>Recv</th><th>Loss%</th><th>Cur</th><th title="Median — stays stable through a single spike, unlike Avg/Max">Med</th><th>Avg</th><th>Min</th><th>Max</th><th>Jitter</th>
+                        <th>Sent</th><th>Recv</th><th>Loss%</th><th>Cur</th><th>Avg</th><th>Min</th><th>Max</th><th>Jitter</th>
                         {view.trend && <th>Trend</th>}
                         {view.latency && <th className="lathead"><span>Latency Graph</span><span className="scalemax">{scaleMax} ms</span></th>}
                       </tr></thead>
@@ -620,7 +467,7 @@ export default function App() {
                               <td className={h.recv < h.sent ? 'loss' : ''}>{h.recv}</td>
                               <td className={h.loss > 0 ? 'loss' : ''}>{h.loss.toFixed(1)}%</td>
                               <td style={{ color: latColor(h.cur, alerts.ms), fontWeight: 600 }}>{h.cur == null ? '*' : fmt(h.cur)}</td>
-                              <td className="font-semibold">{fmt(h.med)}</td><td>{fmt(h.avg)}</td><td>{fmt(h.min)}</td><td>{fmt(h.max)}</td><td>{fmt(h.jitter)}</td>
+                              <td>{fmt(h.avg)}</td><td>{fmt(h.min)}</td><td>{fmt(h.max)}</td><td>{fmt(h.jitter)}</td>
                               {view.trend && <td><Sparkline points={sel.series[String(h.hop)] || []} color={hopColor(i, h.hop === selHop)} /></td>}
                               {view.latency && <td className="latcell"><LatencyGraph h={h} prevAvg={prevAvg} nextAvg={nextAvg} scaleMax={scaleMax} alertMs={alerts.ms} /></td>}
                             </tr>
@@ -630,20 +477,12 @@ export default function App() {
                     </table>
                   </div>
 
-                  <div onMouseDown={startDrag('table')} title="Drag to resize" className="resize-handle-y -my-1.5" />
-
-                  {clippedSpikes > 0 && (
-                    <div className="text-xs text-faint px-1 -mb-1">
-                      ⓘ {clippedSpikes} sample{clippedSpikes > 1 ? 's' : ''} above {yDomain[1]} ms run off the top of the chart so the normal range stays readable —
-                      <button className="ml-1.5 px-1.5 py-0 text-xs" onClick={() => setClipOutliers(false)}>show full range</button>
-                    </div>
-                  )}
                   <div className="chart" ref={chartRef}>
                     <ResponsiveContainer width="100%" height="100%">
                       <LineChart data={chartData} margin={{ top: 10, right: 20, bottom: 4, left: 0 }}>
                         <CartesianGrid stroke="var(--grid)" />
                         <XAxis dataKey="ts" type="number" domain={["dataMin","dataMax"]} tickFormatter={timeFmt} stroke="var(--axis)" tick={{ fill: "var(--axis)" }} fontSize={12} />
-                        <YAxis stroke="var(--axis)" tick={{ fill: "var(--axis)" }} fontSize={12} domain={yDomain} allowDataOverflow label={{ value: "ms", angle: -90, position: "insideLeft", fill: "var(--axis)" }} />
+                        <YAxis stroke="var(--axis)" tick={{ fill: "var(--axis)" }} fontSize={12} label={{ value: "ms", angle: -90, position: "insideLeft", fill: "var(--axis)" }} />
                         <Tooltip labelFormatter={timeFmt} contentStyle={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 6, color: "var(--text)" }} labelStyle={{ color: "var(--muted)" }} itemStyle={{ color: "var(--text)" }} />
                         <Legend />
                         {shownHops.map((h, i) => (

@@ -10,7 +10,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
-#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -21,51 +20,7 @@
 #include <tuple>
 #include <vector>
 
-#if defined(_WIN32)
-#  ifndef NOMINMAX
-#    define NOMINMAX
-#  endif
-#  include <windows.h>
-#elif defined(__linux__)
-#  include <sys/resource.h>
-#endif
-
 namespace netpulse {
-
-// Samples are appended in increasing-timestamp order (see WebTarget series
-// push logic), so finding "the first sample at or after `cutoff`" is a binary
-// search, not a linear scan. compute_stat() and the chart downsampler below
-// both used to `for (auto& s : pts) if (s.first < cutoff) continue;` — a scan
-// of the ENTIRE historical buffer on every single poll (every ~600ms),
-// regardless of how much history had piled up. That cost grows without bound
-// as a session runs and as more targets/hops accumulate — which is exactly
-// why the app got progressively laggier over time instead of staying flat
-// like PingPlotter. Jumping straight to `cutoff` via lower_bound turns that
-// into O(log N + only the in-window samples), independent of total history.
-// std::deque (not vector) gives the SAME O(log N) random-access binary search
-// but O(1) pop_front for trimming old samples — see SampleBuf below for why
-// that distinction matters for anything left running 24/7.
-using SampleBuf = std::deque<Sample>;
-
-inline SampleBuf::const_iterator focus_begin(const SampleBuf& pts, std::optional<double> cutoff) {
-    if (!cutoff) return pts.begin();
-    return std::lower_bound(pts.begin(), pts.end(), *cutoff,
-                             [](const Sample& s, double c) { return s.first < c; });
-}
-
-// How many raw samples per hop to retain, given the probe rate. Sized to
-// comfortably cover the longest focus window the UI offers (24h), not a flat
-// one-size-fits-all number: a slow-probing target (e.g. one sample every 10s)
-// needs far fewer than a fast one (e.g. 10/s) to cover the same 24h, so this
-// scales storage to what's actually needed instead of over-provisioning
-// every target for the fastest case. Clamped to a sane floor/ceiling so a
-// misconfigured probe interval can't starve retention or blow up memory.
-inline size_t sample_cap_for(double probe_interval) {
-    constexpr double kMaxFocusSecs = 86400.0; // "Last 24 hours", the longest UI option
-    double interval = probe_interval > 0.01 ? probe_interval : 1.0;
-    double needed = (kMaxFocusSecs / interval) * 1.1; // +10% headroom
-    return static_cast<size_t>(std::clamp(needed, 2000.0, 100000.0));
-}
 
 inline std::string esc(const std::string& s) {
     std::string o;
@@ -100,30 +55,12 @@ struct WebTarget {
     std::mutex mtx;
     Snapshot latest;
     bool has = false;
-    std::map<uint8_t, SampleBuf> series;
-    std::map<uint8_t, int> discovery_count; // per-hop, see kDiscoveryDropCount below
+    std::map<uint8_t, std::vector<Sample>> series;
     ~WebTarget() {
         if (stop) stop->store(true);
         if (th.joinable()) th.join();
     }
 };
-
-// A hop's very first replies right after it's discovered can be genuinely
-// unrepresentative (first-hit route/ARP/conntrack setup, or the tail of
-// whatever briefly rate-limited the burst that found it) rather than steady
-// -state behavior — this is what produced a hop showing SENT=1 with that one
-// sample already at 15000+ms. A single global "wait N seconds since the
-// target was added" timer can't fix this correctly, because hops are
-// discovered at different real times: an early hop might have a dozen clean
-// samples by the time a slow/lossy hop gets its very first reply, so a
-// target-wide timer either cuts off too early for late hops or unnecessarily
-// delays early ones. Instead, this is gated PER HOP, by how many raw replies
-// THAT hop has actually received: its first kDiscoveryDropCount replies are
-// used only to establish its address/route (already visible immediately —
-// see `t.latest.hops` below, populated regardless) and are not written into
-// the exposed stats/series; real numbers for that hop start from its own
-// (kDiscoveryDropCount+1)-th reply, whenever that happens to occur.
-constexpr int kDiscoveryDropCount = 3;
 
 struct Stat {
     double loss = 0;
@@ -133,14 +70,14 @@ struct Stat {
     size_t sent = 0, recv = 0;
 };
 
-inline Stat compute_stat(const SampleBuf& pts, std::optional<double> focus) {
+inline Stat compute_stat(const std::vector<Sample>& pts, std::optional<double> focus) {
     std::optional<double> cutoff;
     if (focus) cutoff = now_secs() - *focus;
     Stat s;
     std::vector<double> rtts;
     std::optional<double> cur;
-    for (auto it = focus_begin(pts, cutoff); it != pts.end(); ++it) {
-        const auto& [ts, rtt] = *it;
+    for (const auto& [ts, rtt] : pts) {
+        if (cutoff && ts < *cutoff) continue;
         ++s.sent;
         cur = rtt;
         if (rtt) rtts.push_back(*rtt);
@@ -154,23 +91,10 @@ inline Stat compute_stat(const SampleBuf& pts, std::optional<double> focus) {
         double avg = sum / rtts.size(), var = 0;
         for (double r : rtts) var += (r - avg) * (r - avg);
         var /= rtts.size();
-        s.min = mn; s.max = mx; s.avg = avg; s.std = std::sqrt(var);
-        // Jitter as the MEDIAN (not mean) of successive absolute differences.
-        // With a mean, a single huge outlier contributes two enormous jumps
-        // (up, then back down) that get averaged over the WHOLE focus window,
-        // so reported jitter stays inflated for as long as that one sample
-        // remains in view — exactly the "takes forever to come back down"
-        // complaint. The median of the same jump sequence is unmoved by one
-        // or two extreme jumps as long as most recent samples are normal, so
-        // it reflects current network behavior almost immediately instead of
-        // the historical worst moment in the window.
-        std::vector<double> diffs;
-        for (size_t i = 1; i < rtts.size(); ++i) diffs.push_back(std::abs(rtts[i] - rtts[i - 1]));
-        if (!diffs.empty()) {
-            std::sort(diffs.begin(), diffs.end());
-            size_t dm = diffs.size() / 2;
-            s.jitter = (diffs.size() % 2) ? diffs[dm] : (diffs[dm - 1] + diffs[dm]) / 2.0;
-        }
+        double jit = 0;
+        for (size_t i = 1; i < rtts.size(); ++i) jit += std::abs(rtts[i] - rtts[i - 1]);
+        if (rtts.size() > 1) jit /= (rtts.size() - 1);
+        s.min = mn; s.max = mx; s.avg = avg; s.std = std::sqrt(var); s.jitter = jit;
         std::vector<double> sorted = rtts;
         std::sort(sorted.begin(), sorted.end());
         size_t m = sorted.size() / 2;
@@ -194,46 +118,12 @@ public:
         auto sess = std::make_shared<Session>(id, name, st);
         t->session = sess;
         t->th = std::thread([raw, sess, stop, paused]() {
-            // Timing accuracy in this loop depends on the thread actually
-            // getting scheduled promptly when a reply arrives — if the OS
-            // delays it (e.g. while the Electron main/UI thread is busy), the
-            // packet still arrived on time, but we don't read+timestamp it
-            // until we resume, so the reported RTT is inflated by however
-            // long we were descheduled. Mildly favoring this thread reduces
-            // (does not eliminate) that risk; a follow-up using kernel-level
-            // receive timestamps (SO_TIMESTAMP / SCM_TIMESTAMPING) would
-            // close the gap completely, independent of scheduling.
-#if defined(_WIN32)
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
-#elif defined(__linux__)
-            ::setpriority(PRIO_PROCESS, 0, -5); // best-effort; ignored without CAP_SYS_NICE
-#endif
-            sess->run(stop, paused, [raw, sess](const Snapshot& snap) {
+            sess->run(stop, paused, [raw](const Snapshot& snap) {
                 std::lock_guard<std::mutex> lk(raw->mtx);
-                // Right-sized for this target's own probe rate (see
-                // sample_cap_for) rather than one flat number for everyone,
-                // and trimmed with pop_front — O(1) on a deque, unlike the
-                // O(n) vector::erase(begin()) this used to do on EVERY sample
-                // once a hop's history filled up. That one-line difference is
-                // exactly what made a target left running 24/7 get steadily
-                // slower forever after ~55 hours: every single new probe
-                // reply was shifting up to 200,000 elements to make room.
-                size_t cap = sample_cap_for(sess->settings_snapshot().probe_interval);
                 for (const auto& np : snap.new_points) {
-                    // Only REAL replies count toward a hop's discovery budget
-                    // and get gated — loss/timeout entries always record
-                    // immediately, so a genuinely unreachable hop still shows
-                    // its 100%-loss status right away instead of looking
-                    // blank while "discovering" (it will never clear a
-                    // reply-based gate, since it never replies at all).
-                    if (np.rtt.has_value()) {
-                        int& n = raw->discovery_count[np.hop];
-                        ++n;
-                        if (n <= kDiscoveryDropCount) continue; // still settling this hop — don't expose yet
-                    }
                     auto& v = raw->series[np.hop];
                     if (v.empty() || v.back().first != np.ts) v.emplace_back(np.ts, np.rtt);
-                    while (v.size() > cap) v.pop_front();
+                    if (v.size() > 200000) v.erase(v.begin());
                 }
                 raw->latest = snap;
                 raw->has = true;
@@ -307,8 +197,8 @@ public:
             double cutoff = focus ? now_secs() - *focus : 0;
             for (size_t h = 0; h < t.latest.hops.size(); ++h) {
                 const auto& hop = t.latest.hops[h];
-                static const SampleBuf kEmpty;
-                const SampleBuf& pts = t.series.count(hop.hop) ? t.series[hop.hop] : kEmpty;
+                const std::vector<Sample>& pts =
+                    t.series.count(hop.hop) ? t.series[hop.hop] : std::vector<Sample>{};
                 Stat s = compute_stat(pts, focus);
                 o << "{\"hop\":" << int(hop.hop)
                   << ",\"address\":\"" << esc(hop.address ? *hop.address : "*") << "\""
@@ -340,9 +230,8 @@ public:
                 if (width <= 0) width = 1.0;
                 // bucket -> (representative ts, max rtt or none, sawLoss)
                 std::map<long long, std::tuple<double, std::optional<double>, bool>> buckets;
-                for (auto it = focus_begin(pts, focus ? std::optional<double>(cutoff) : std::nullopt);
-                     it != pts.end(); ++it) {
-                    const auto& [ts, rtt] = *it;
+                for (auto& [ts, rtt] : pts) {
+                    if (focus && ts < cutoff) continue;
                     long long b = static_cast<long long>(ts / width);
                     auto bit = buckets.find(b);
                     if (bit == buckets.end()) {

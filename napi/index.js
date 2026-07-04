@@ -11,9 +11,6 @@ module.exports = {
   stopTarget: (id) => addon.stopTarget(id),
   removeTarget: (id) => addon.removeTarget(id),
   listInterfaces: () => addon.listInterfaces(),
-  // getState(focusSeconds?) -> Promise<parsed object>, identical shape to the
-  // old /api/state. The native call runs on N-API's worker thread pool (see
-  // napi.cpp GetStateWorker), so it never blocks Electron's main thread.
-  getState: (focus) => addon.getState(typeof focus === 'number' ? focus : undefined).then((s) => JSON.parse(s)),
+  getState: (focus) => JSON.parse(addon.getState(typeof focus === 'number' ? focus : undefined)),
   getStateJSON: (focus) => addon.getState(typeof focus === 'number' ? focus : undefined),
 }

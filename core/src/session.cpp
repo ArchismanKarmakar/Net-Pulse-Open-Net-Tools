@@ -179,12 +179,29 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
         // 2) read replies for a short slice (wakes immediately on arrival)
         double slice = (std::min)(soonest, last_emit + 0.25) - now;
         if (slice < 0.005) slice = 0.005;
+        // Ceiling above which a reply is treated as a stale queue artifact
+        // rather than a real measurement. Kept a bit above the loss `timeout`
+        // (but hard-capped) so a genuinely slow-but-real hop isn't discarded,
+        // while the multi-second ramp from ICMP rate-limit queue drainage is.
+        double stale_ceiling = (std::max)(timeout * 2.0, 2.0); // seconds
         for (const auto& inc : prober->drain(now + slice)) {
             if (inc.reply.id != icmp_id_) continue;
             auto it = pending.find(inc.reply.seq);
             if (it == pending.end()) continue;
             uint8_t hop = it->second.hop;
             double rtt = (inc.at - it->second.sent_at) * 1000.0;
+            // Reject replies that come back far LATER than expected. This is
+            // the fix for the startup latency "ramp": when an edge briefly
+            // rate-limits/queues ICMP, replies can arrive many seconds after
+            // they were sent. Matching them as valid makes rtt =
+            // (now - sent_at) report that whole queue delay (2s, 5s, …) as if
+            // it were real latency — and since probes keep going out every
+            // interval, each late reply reports an ever-larger gap, producing
+            // the clean linear ramp seen in the graph. A reply this stale is
+            // not a valid measurement; its probe is counted as loss in step 3
+            // instead, exactly as ping/mtr/PingPlotter treat an over-timeout
+            // reply.
+            if (rtt > stale_ceiling * 1000.0) { pending.erase(it); continue; }
             HopStats& hs = ensure_hop(hop);
             hs.set_address(inc.from);
             hs.push(inc.at, rtt);

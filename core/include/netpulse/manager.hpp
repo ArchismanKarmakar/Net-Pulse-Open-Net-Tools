@@ -101,26 +101,29 @@ struct WebTarget {
     Snapshot latest;
     bool has = false;
     std::map<uint8_t, SampleBuf> series;
-    double added_at = 0; // for the warm-up window — see kWarmupSecs below
+    std::map<uint8_t, int> discovery_count; // per-hop, see kDiscoveryDropCount below
     ~WebTarget() {
         if (stop) stop->store(true);
         if (th.joinable()) th.join();
     }
 };
 
-// A freshly-added target immediately probes every hop continuously and at
-// full rate — a much heavier, more sustained burst of ICMP than a one-shot
-// `tracert` ever generates. Some routers/edges rate-limit ICMP generation
-// (RFC 1812) and can visibly throttle or queue replies for the first several
-// seconds of that burst before settling, producing exactly the "big ramp
-// right after adding a target" pattern. That's an external network behavior,
-// not something NetPulse can prevent outright — but we don't have to show it:
-// samples from the first kWarmupSecs after a target is added are still
-// probed (so hop/route discovery isn't delayed) but are excluded from the
-// exposed stats and chart series, so the UI only ever shows data from once
-// things have settled. This does NOT suppress a similar rate-limit event if
-// it recurs LATER in a long-running session — only the one at start.
-constexpr double kWarmupSecs = 10.0;
+// A hop's very first replies right after it's discovered can be genuinely
+// unrepresentative (first-hit route/ARP/conntrack setup, or the tail of
+// whatever briefly rate-limited the burst that found it) rather than steady
+// -state behavior — this is what produced a hop showing SENT=1 with that one
+// sample already at 15000+ms. A single global "wait N seconds since the
+// target was added" timer can't fix this correctly, because hops are
+// discovered at different real times: an early hop might have a dozen clean
+// samples by the time a slow/lossy hop gets its very first reply, so a
+// target-wide timer either cuts off too early for late hops or unnecessarily
+// delays early ones. Instead, this is gated PER HOP, by how many raw replies
+// THAT hop has actually received: its first kDiscoveryDropCount replies are
+// used only to establish its address/route (already visible immediately —
+// see `t.latest.hops` below, populated regardless) and are not written into
+// the exposed stats/series; real numbers for that hop start from its own
+// (kDiscoveryDropCount+1)-th reply, whenever that happens to occur.
+constexpr int kDiscoveryDropCount = 3;
 
 struct Stat {
     double loss = 0;
@@ -182,7 +185,6 @@ public:
         auto t = std::make_unique<WebTarget>();
         t->id = nextId_++;
         t->name = name;
-        t->added_at = now_secs();
         t->stop = std::make_unique<std::atomic<bool>>(false);
         t->paused = std::make_unique<std::atomic<bool>>(false);
         WebTarget* raw = t.get();
@@ -217,9 +219,18 @@ public:
                 // slower forever after ~55 hours: every single new probe
                 // reply was shifting up to 200,000 elements to make room.
                 size_t cap = sample_cap_for(sess->settings_snapshot().probe_interval);
-                bool warming_up = (now_secs() - raw->added_at) < kWarmupSecs;
                 for (const auto& np : snap.new_points) {
-                    if (warming_up) continue; // don't expose warm-up-period samples to stats/chart
+                    // Only REAL replies count toward a hop's discovery budget
+                    // and get gated — loss/timeout entries always record
+                    // immediately, so a genuinely unreachable hop still shows
+                    // its 100%-loss status right away instead of looking
+                    // blank while "discovering" (it will never clear a
+                    // reply-based gate, since it never replies at all).
+                    if (np.rtt.has_value()) {
+                        int& n = raw->discovery_count[np.hop];
+                        ++n;
+                        if (n <= kDiscoveryDropCount) continue; // still settling this hop — don't expose yet
+                    }
                     auto& v = raw->series[np.hop];
                     if (v.empty() || v.back().first != np.ts) v.emplace_back(np.ts, np.rtt);
                     while (v.size() > cap) v.pop_front();
@@ -277,10 +288,6 @@ public:
             std::lock_guard<std::mutex> tl(t.mtx);
             o << "{\"id\":" << t.id << ",\"name\":\"" << esc(t.name) << "\",";
             o << "\"paused\":" << ((t.paused && t.paused->load()) ? "true" : "false") << ",";
-            {
-                double remaining = kWarmupSecs - (now_secs() - t.added_at);
-                o << "\"warmup_remaining\":" << (remaining > 0 ? remaining : 0.0) << ",";
-            }
             o << "\"dest_ip\":\"" << esc(t.latest.dest_ip ? *t.latest.dest_ip : "") << "\",";
             o << "\"family\":\"" << (t.latest.family ? (*t.latest.family == Family::V4 ? "IPv4" : "IPv6") : "") << "\",";
             o << "\"error\":\"" << esc(t.latest.error ? *t.latest.error : "") << "\",";

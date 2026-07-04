@@ -520,10 +520,10 @@ export default function App() {
             <>
               <div className="statusbar">
                 <b>{sel.name}</b> → {sel.dest_ip || 'unresolved'} <span className="badge">{sel.family}</span> · {sel.hops.length} hops
-                {sel.warmup_remaining > 0 && (
-                  <span className="badge inline-flex items-center align-middle" title="Newly-added targets probe every hop continuously right away, which can briefly trip ICMP rate-limiting on routers/edges and show an artificial spike. We wait a moment and let it settle before showing stats/graph.">
+                {dest && dest.sent === 0 && (
+                  <span className="badge inline-flex items-center align-middle" title="Each hop's first few real replies are used only to establish its route/address and aren't shown as stats yet — this avoids a hop's very first reading (which can be an unrepresentative one-off) being displayed as if it were typical. This clears per-hop, as soon as real data is available, not on a fixed timer.">
                     <span className="spinner sm" style={{ marginRight: 5 }} />
-                    settling… {Math.ceil(sel.warmup_remaining)}s
+                    discovering route…
                   </span>
                 )}
                 {(() => { const p = sel.hops.filter((h) => ['loss', 'warn', 'bad', 'down'].includes(hopStatus(h))); return p.length > 0 && <span className="err"> ⚠ {p.length} hop{p.length > 1 ? 's' : ''} with loss/latency</span> })()}

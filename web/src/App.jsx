@@ -370,33 +370,128 @@ export default function App() {
   }
   const STATE_LABEL = { discovering: 'discovering', ok: 'ok', okloss: 'minor loss', warn: 'path', bad: 'high latency/loss', down: 'unreachable' }
 
-  // Two-lamp signal, in the spirit of German railway signal heads (Hauptsignal):
-  // meaning comes from reading TWO independently-lit lamps together, not one
-  // blended colour. Left lamp = the target itself; right lamp = the path
-  // leading to it. This tells you at a glance which of the two is the problem
-  // instead of folding both into a single ambiguous colour.
+  // ============================================================================
+  // TWO-LAMP SIGNAL — implements the meanings in the project's lamp diagram.
+  // Left lamp = TARGET (the destination's own health). Right lamp = PATH (the
+  // route/intermediate hops leading to it). Meaning comes from reading both
+  // together, German-Hauptsignal style, rather than one blended colour.
+  //
+  // Lamp states and the colours they map to (see .lamp.st-* in styles.css):
+  //   ok         → green        st-ok
+  //   settling   → lime (pulse) st-settling   (target reachable but latency just
+  //                                            shifted / route changed recently;
+  //                                            shown until it stabilises — timer)
+  //   warn       → yellow       st-warn
+  //   bad        → orange       st-bad
+  //   down       → red          st-down
+  //   discovering→ cyan (pulse) st-discovering
+  //
+  // Thresholds below come straight from the diagram. They intentionally do NOT
+  // reuse the single `alerts.ms/alerts.loss` pair, because the diagram defines a
+  // graduated scale (70 → 100 → 150 ms, 5% → 10% → 20% loss) that one pair can't
+  // express. `alerts` still drives the separate table highlighting / "N hops
+  // with loss/latency" banner, which is unchanged.
+  const LAMP = {
+    // target latency ladder (ms), from the diagram
+    latWarn: 70, latBad: 100, latDown: 150,
+    // target loss ladder (%), from the diagram
+    lossWarn: 5, lossBad: 10, lossDown: 20,
+    // "latency fluctuating" — jitter ladder (ms). The diagram calls out
+    // fluctuation of 50+ms as a red-level condition on the target.
+    jitBad: 50,
+    // how long to keep showing the lime "settling" lamp after the destination's
+    // address (route) changes or its latency baseline shifts, before trusting
+    // the new steady state.
+    settleSecs: 8,
+  }
+
+  // Detect a recent route/baseline change for the lime "settling" target lamp.
+  // We remember each target's last confirmed destination address + median RTT;
+  // when either shifts materially we start (or restart) a settle timer, and the
+  // target lamp reads lime until it elapses — matching the diagram's note:
+  // "1.1.1.1 was 25ms but suddenly switched to a different path / the hop
+  //  revealed a different IP / load-balancer changed, ping changed to 40ms —
+  //  show this until stable (use timer)".
+  const routeSettle = useRef({}) // id -> { addr, med, until }
+  const targetSettling = (t, d) => {
+    if (!d || d.med == null) return false
+    const rec = routeSettle.current[t.id]
+    const now = Date.now() / 1000
+    const addr = d.address || ''
+    if (!rec) { routeSettle.current[t.id] = { addr, med: d.med, until: 0 }; return false }
+    const addrChanged = rec.addr && addr && rec.addr !== addr
+    const medShifted = rec.med != null && Math.abs(d.med - rec.med) >= Math.max(10, rec.med * 0.5)
+    if (addrChanged || medShifted) {
+      routeSettle.current[t.id] = { addr, med: d.med, until: now + LAMP.settleSecs }
+      return true
+    }
+    // keep the baseline fresh but don't reset the timer for tiny drift
+    rec.addr = addr
+    if (now < rec.until) return true
+    rec.med = d.med // adopt the new steady baseline once settled
+    return false
+  }
+
+  // TARGET lamp — health of the destination itself.
   const destLamp = (t) => {
-    const d = destHopOf(t)
     if (isDiscovering(t)) return 'discovering'
+    const d = destHopOf(t)
     if (!d) {
       const f = frontierHop(t)
-      if (f && f.sent > 0 && f.recv === 0) return 'down'
+      if (f && f.sent > 0 && f.recv === 0) return frontierWithinGrace(t) ? 'discovering' : 'down'
       return 'discovering'
     }
-    const lat = d.med ?? d.avg
-    const latHigh = lat != null && lat > alerts.ms
-    const lossHigh = d.sent > 0 && d.loss > alerts.loss
-    const noReply = d.sent > 0 && d.recv === 0
-    if (noReply) return 'down'
-    if (lossHigh || latHigh) return 'bad'
-    if (d.loss > 0) return 'okloss'
+    // hard down: destination not answering at all
+    if (d.sent > 0 && d.recv === 0) return 'down'
+    const loss = d.loss ?? 0
+    const lat = d.med ?? d.avg ?? 0
+    const jit = d.jitter ?? 0
+    // red / down: heavy loss, very high latency, or large latency fluctuation
+    if (loss > LAMP.lossDown || lat >= LAMP.latDown || jit >= LAMP.jitBad) return 'down'
+    // orange / bad: notable loss or high latency
+    if (loss > LAMP.lossBad || lat >= LAMP.latBad) return 'bad'
+    // yellow / warn: minor loss or elevated latency
+    if (loss > LAMP.lossWarn || lat >= LAMP.latWarn) return 'warn'
+    // lime / settling: healthy, but route/latency changed recently → show until stable
+    if (targetSettling(t, d)) return 'settling'
     return 'ok'
   }
+
+  // PATH lamp — health of the route (intermediate hops) to the destination.
   const pathLamp = (t) => {
     if (isDiscovering(t)) return 'discovering'
     const hops = t.hops || []
-    return hops.some((h) => !h.is_dest && h.sent > 0 && h.recv > 0 && h.loss > alerts.loss) ? 'warn' : 'ok'
+    const d = destHopOf(t)
+    // Only consider hops BEFORE the destination as "path".
+    const destHopNo = d ? d.hop : (hops.length ? hops[hops.length - 1].hop : 0)
+    const inter = hops.filter((h) => !h.is_dest && h.hop < destHopNo)
+
+    // red: no route to the destination at all — the destination isn't reachable
+    // and there's no confirmed path carrying packets to it.
+    if (!d || (d.sent > 0 && d.recv === 0)) {
+      // if literally nothing on the path is replying either, the path is down
+      const anyReply = inter.some((h) => h.recv > 0) || (hops[0] && hops[0].recv > 0)
+      if (!anyReply) return 'down'
+      // packets are routing toward the target pool but the target/some router is
+      // dropping them → orange (diagram: "routing via BGP but target or some
+      // intermediate router dropping packets").
+      return 'bad'
+    }
+
+    // With a reachable destination, grade the intermediate path.
+    // A hop that answered (recv>0) but shows real loss = genuine path drop.
+    const lossyReplying = inter.some((h) => h.sent > 0 && h.recv > 0 && h.loss > LAMP.lossWarn)
+    // A hop that never answers at all (recv===0, i.e. a "*"/silent router) =
+    // "not revealing" — the diagram treats this as a yellow path condition, not
+    // a fault (routers commonly deprioritise ICMP to themselves).
+    const silentInter = inter.some((h) => h.sent > 0 && h.recv === 0)
+
+    // Heavy intermediate loss where a hop is actively dropping a lot → orange.
+    if (inter.some((h) => h.recv > 0 && h.loss > LAMP.lossBad)) return 'bad'
+    if (lossyReplying || silentInter) return 'warn'
+    return 'ok'
   }
+
 
   useEffect(() => { if (sel && selHop === null) { const d = sel.hops.find((h) => h.is_dest); if (d) setSelHop(d.hop) } }, [sel, selHop])
 
@@ -414,6 +509,34 @@ export default function App() {
 
   const addTarget = async () => {
     if (!form.target.trim()) return
+
+    // ── Duplicate check ──────────────────────────────────────────────────────
+    // A target is a "duplicate" when the same host name/IP is already being
+    // traced WITH the exact same config. If at least one config field differs
+    // (probe interval, timeout, payload size, max hops, raw mode, family, or
+    // source interface) the new entry is allowed — different configs produce
+    // meaningfully different measurement sets (e.g. IPv4 vs IPv6, two payload
+    // sizes for path-MTU checks, two probe rates for comparison).
+    const dupe = targets.find((t) => {
+      if (t.name !== form.target.trim()) return false
+      const c = t.config
+      if (!c) return false
+      return (
+        String(c.probe) === String(form.probe) &&
+        String(c.timeout) === String(form.timeout) &&
+        String(c.payload) === String(form.payload) &&
+        String(c.maxhops) === String(form.maxhops) &&
+        Boolean(c.raw) === Boolean(form.raw) &&
+        (c.family || 'auto') === (form.family || 'auto') &&
+        (c.src || '') === (iface || '')
+      )
+    })
+    if (dupe) {
+      alert(`"${form.target.trim()}" is already being traced with the same config.\n\nChange at least one setting (probe rate, payload, family, hops…) to add a parallel trace, or select the existing target in the list.`)
+      return
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     const q = new URLSearchParams({ target: form.target.trim(), family: form.family, probe: form.probe, trace: form.trace, timeout: form.timeout, payload: form.payload, maxhops: form.maxhops, raw: form.raw ? '1' : '0' })
     if (iface) q.set('src', iface)
     const r = await api(`/api/add?${q}`, { method: 'POST' })
@@ -423,6 +546,124 @@ export default function App() {
       setSelId(r.id); setSelHop(null)
     }
   }
+
+  // ── Protected session-file format ─────────────────────────────────────────
+  // The .npulse binary format is a simple authenticated-encryption envelope so
+  // files are only readable by NetPulse itself, not by a text editor or a
+  // competitor script.
+  //
+  // Envelope layout (all big-endian):
+  //   4 bytes  magic       0x4E505653  ("NPVS")
+  //   2 bytes  version     0x0001
+  //   12 bytes AES-GCM IV  (random per export)
+  //   4 bytes  ciphertext  length
+  //   N bytes  ciphertext  AES-128-GCM encrypted JSON
+  //   16 bytes GCM auth tag
+  //
+  // The key is derived from the magic constant + a fixed app salt — it is NOT
+  // cryptographically secret (the app is open-source), but it makes the file
+  // unreadable to generic tools and unambiguously identifies it as a NetPulse
+  // file, satisfying "no one else can open it except this application".
+  const NP_MAGIC   = 0x4E505653
+  const NP_VERSION = 0x0001
+  // 128-bit key: NPVS-NetPulse-v1- as UTF-8 (16 bytes exactly)
+  const NP_KEY_RAW = new Uint8Array([0x4e,0x50,0x56,0x53,0x2d,0x4e,0x65,0x74,0x50,0x75,0x6c,0x73,0x65,0x2d,0x76,0x31])
+
+  const npCryptoKey = () => crypto.subtle.importKey('raw', NP_KEY_RAW, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt'])
+
+  // Serialize targets to the export payload (full config + display name).
+  const targetListPayload = () => targets.map((t) => ({
+    target: t.name,
+    family: t.config?.family ?? 'auto',
+    probe:   t.config?.probe   ?? 1,
+    timeout: t.config?.timeout ?? 0,
+    payload: t.config?.payload ?? 56,
+    maxhops: t.config?.maxhops ?? 30,
+    raw:     t.config?.raw     ?? true,
+    src:     t.config?.src     ?? '',
+  }))
+
+  const exportTargetList = async () => {
+    const plain = new TextEncoder().encode(JSON.stringify({ version: 1, targets: targetListPayload() }))
+    const iv = crypto.getRandomValues(new Uint8Array(12))
+    const key = await npCryptoKey()
+    const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, tagLength: 128 }, key, plain)
+    // cipher includes the 16-byte auth tag appended by SubtleCrypto
+    const ctBytes  = new Uint8Array(cipher)
+    const ctLen    = ctBytes.length - 16  // payload without tag
+    const buf      = new ArrayBuffer(4 + 2 + 12 + 4 + ctBytes.length)
+    const dv       = new DataView(buf)
+    dv.setUint32(0,  NP_MAGIC,   false)
+    dv.setUint16(4,  NP_VERSION, false)
+    new Uint8Array(buf, 6, 12).set(iv)
+    dv.setUint32(18, ctLen,      false)
+    new Uint8Array(buf, 22).set(ctBytes)
+    const blob = new Blob([buf], { type: 'application/octet-stream' })
+    const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: 'netpulse_targets.npulse' })
+    a.click(); URL.revokeObjectURL(a.href)
+  }
+
+  const exportTargetsJson = () => {
+    download('netpulse_targets.json', JSON.stringify({ version: 1, targets: targetListPayload() }, null, 2), 'application/json')
+  }
+
+  const importTargetList = async (file) => {
+    try {
+      const buf = await file.arrayBuffer()
+      const dv  = new DataView(buf)
+      if (buf.byteLength < 22) throw new Error('File too short')
+      if (dv.getUint32(0, false) !== NP_MAGIC)   throw new Error('Not a NetPulse target list file (.npulse)')
+      if (dv.getUint16(4, false) !== NP_VERSION)  throw new Error('Unsupported .npulse version')
+      const iv    = new Uint8Array(buf, 6, 12)
+      const ctLen = dv.getUint32(18, false)
+      const cipher = new Uint8Array(buf, 22, ctLen + 16)
+      const key    = await npCryptoKey()
+      let plain
+      try {
+        plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, tagLength: 128 }, key, cipher)
+      } catch {
+        throw new Error('File is corrupt or was not created by NetPulse')
+      }
+      const { targets: list } = JSON.parse(new TextDecoder().decode(plain))
+      if (!Array.isArray(list)) throw new Error('Invalid target list format')
+
+      let added = 0, skipped = 0
+      for (const entry of list) {
+        if (!entry.target) continue
+        // respect the duplicate rule: same host + same config = skip
+        const existingDupe = targets.find((t) => {
+          if (t.name !== entry.target) return false
+          const c = t.config; if (!c) return false
+          return (
+            String(c.probe)   === String(entry.probe ?? 1)   &&
+            String(c.timeout) === String(entry.timeout ?? 0) &&
+            String(c.payload) === String(entry.payload ?? 56) &&
+            String(c.maxhops) === String(entry.maxhops ?? 30) &&
+            Boolean(c.raw)    === Boolean(entry.raw ?? true)  &&
+            (c.family||'auto') === (entry.family||'auto')      &&
+            (c.src||'')       === (entry.src||'')
+          )
+        })
+        if (existingDupe) { skipped++; continue }
+        const q = new URLSearchParams({
+          target: entry.target, family: entry.family ?? 'auto',
+          probe: entry.probe ?? 1, trace: 30,
+          timeout: entry.timeout ?? 0, payload: entry.payload ?? 56,
+          maxhops: entry.maxhops ?? 30, raw: (entry.raw ?? true) ? '1' : '0',
+        })
+        if (entry.src) q.set('src', entry.src)
+        await api(`/api/add?${q}`, { method: 'POST' })
+        added++
+      }
+      await refreshState()
+      const msg = [`Imported ${added} target${added !== 1 ? 's' : ''}.`, skipped ? `${skipped} skipped (already traced with same config).` : ''].filter(Boolean).join(' ')
+      alert(msg)
+    } catch (e) {
+      alert(`Import failed: ${e.message}`)
+    }
+  }
+  // ─────────────────────────────────────────────────────────────────────────
+
   const ctrl = (id, ep, extra = '') => api(`/api/${ep}?id=${id}${extra}`, { method: 'POST' })
   const openDetail = (ip) => {
     if (!bgp.isPublicIp(ip)) { setDetail({ ip, private: true, loading: false }); return }
@@ -557,15 +798,16 @@ export default function App() {
             {targets.map((t) => {
               const st = targetState(t)
               const d = destHopOf(t)
+              const isSel = sel && t.id === sel.id
               return (
-                <li key={t.id} className={(sel && t.id === sel.id ? 'sel ' : '') + 's-' + st} onClick={() => { setSelId(t.id); setSelHop(null) }}>
+                <li key={t.id} className={(isSel ? 'sel ' : '') + 's-' + st} onClick={() => { setSelId(t.id); setSelHop(null) }}>
                   <div className="flex items-center">
                     <span className="signal">
                       <span
                         className={'lamp st-' + destLamp(t)}
                         title={(() => {
                           const s = destLamp(t)
-                          const m = { discovering: 'Route discovery in progress', ok: 'Destination healthy', okloss: 'Destination: occasional loss', warn: 'Destination: elevated latency/loss', bad: 'Destination: high latency/loss', down: 'Destination unreachable' }
+                          const m = { discovering: 'Route discovery in progress', settling: 'Destination healthy — latency/route changed recently, stabilising', ok: 'Destination healthy', okloss: 'Destination: occasional loss', warn: 'Destination: elevated latency or minor loss (70ms+ / PL>5%)', bad: 'Destination: high latency or loss (100ms+ / PL>10%)', down: 'Destination: unreachable, or severe latency/loss/jitter (150ms+ / PL>20% / 50ms+ swings)' }
                           return `Target: ${m[s] || s}`
                         })()}
                         aria-label={`target-${destLamp(t)}`}
@@ -574,14 +816,20 @@ export default function App() {
                         className={'lamp st-' + pathLamp(t)}
                         title={(() => {
                           const s = pathLamp(t)
-                          const m = { discovering: 'Route discovery in progress', ok: 'Path healthy', warn: 'Upstream path: packet loss/latency', okloss: 'Upstream: light loss', bad: 'Upstream: high latency/loss', down: 'Upstream: unreachable' }
+                          const m = { discovering: 'Route discovery in progress', ok: 'Path healthy — packets routing cleanly to the target', warn: 'Path: an intermediate hop is dropping packets or not revealing itself', bad: 'Path: routing to the target pool via BGP, but the target or a router is dropping packets', down: 'Path: no route — internet/interface down, RTO, or first hop rejecting' }
                           return `Path: ${m[s] || s}`
                         })()}
                         aria-label={`path-${pathLamp(t)}`}
                       />
                     </span>
-                    <span className="truncate">{t.name}</span>
+                    <span className="truncate flex-1">{t.name}</span>
                     {STATE_LABEL[st] && <span className={'statelabel st-' + st}>{STATE_LABEL[st]}</span>}
+                    {/* Delete button lives in the card so each target is self-contained */}
+                    <button
+                      className="card-del"
+                      title="Remove target"
+                      onClick={(e) => { e.stopPropagation(); ctrl(t.id, 'remove').then(() => { if (isSel) setSelId(null); refreshState() }) }}
+                    >✕</button>
                   </div>
                   <small>{t.dest_ip} {t.family}{t.paused ? ' · paused' : ''}</small>
                   {d && (
@@ -602,11 +850,17 @@ export default function App() {
             <div className="row">
               <button onClick={() => ctrl(sel.id, 'pause', `&on=${sel.paused ? 0 : 1}`)}>{sel.paused ? '▶ Resume' : '⏸ Pause'}</button>
               <button onClick={() => ctrl(sel.id, 'stop')}>⏹ Stop</button>
-              <button onClick={() => { ctrl(sel.id, 'remove'); setSelId(null) }}>🗑</button>
             </div>
           )}
-          <button onClick={() => exportTargets(false)}>Export targets CSV</button>
-          <button onClick={() => exportTargets(true)}>Export targets JSON</button>
+          {/* ── Export / Import ─────────────────────────────────────────── */}
+          <div className="sidebar-actions">
+            <button onClick={exportTargetList} title="Save target list + config to a protected .npulse file (only NetPulse can open it)">⬇ Save list (.npulse)</button>
+            <button onClick={exportTargetsJson} title="Export target list + config as human-readable JSON">⬇ Export JSON</button>
+            <label className="import-btn" title="Load a .npulse target list (auto-starts tracing, skips exact duplicates)">
+              ⬆ Load list (.npulse)
+              <input type="file" accept=".npulse" style={{ display: 'none' }} onChange={(e) => { if (e.target.files[0]) importTargetList(e.target.files[0]); e.target.value = '' }} />
+            </label>
+          </div>
           <div
             onMouseDown={startDrag('sidebar')}
             title="Drag to resize"

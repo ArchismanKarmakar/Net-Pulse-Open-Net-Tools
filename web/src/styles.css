@@ -12,7 +12,7 @@
   --border:#1e2530; --border2:#2c3542; --btn-bg:#1a212c; --btn-hover:#252f3d;
   --text:#eef1f6; --muted:#a3aebd; --faint:#76818f; --sel:#152029;
   --accent:#22d3ee; --accent2:#38bdf8;
-  --good:#34d399; --good-soft:#6ee7b7;
+  --good:#34d399; --good-soft:#6ee7b7; --lime:#a3e635;
   --warn:#f59e0b; --warn-soft:#fbbf24;
   --bad:#fb923c; --danger:#f87171;
   --grid:#1a212c; --axis:#76818f;
@@ -26,7 +26,7 @@
   --border:#c9d2df; --border2:#aab6c7; --btn-bg:#eef2f7; --btn-hover:#dbe3ef;
   --text:#0f1620; --muted:#3d4a5c; --faint:#5f6b7c; --sel:#dff5fa;
   --accent:#0e7490; --accent2:#0369a1;
-  --good:#047857; --good-soft:#0d9488;
+  --good:#047857; --good-soft:#0d9488; --lime:#65a30d;
   --warn:#a15c07; --warn-soft:#c2760a;
   --bad:#b3400f; --danger:#c81e1e;
   /* grid needs to visibly contrast against bg, not just differ numerically —
@@ -96,6 +96,24 @@
   aside li { @apply px-2.5 py-2 rounded-lg cursor-pointer flex flex-col; position: relative; }
   aside li:hover { @apply bg-panel2; }
   aside li.sel { @apply bg-sel outline outline-1 outline-border2; box-shadow: var(--shadow-sm); }
+
+  /* Per-card delete button — small, lives in the card header, revealed on hover */
+  .card-del {
+    @apply ml-auto shrink-0 w-5 h-5 flex items-center justify-center rounded text-[11px] font-bold;
+    background: transparent; border: none; color: var(--faint); padding: 0; cursor: pointer;
+    opacity: 0; transition: opacity .12s, background .12s, color .12s; line-height: 1;
+  }
+  aside li:hover .card-del, aside li.sel .card-del { opacity: .55; }
+  .card-del:hover { opacity: 1 !important; background: color-mix(in srgb, var(--danger) 18%, var(--panel)); color: var(--danger); }
+
+  /* Export / import strip at the bottom of the sidebar */
+  .sidebar-actions { @apply flex flex-col gap-1 pt-2 mt-2 border-t border-border; }
+  .sidebar-actions button, .import-btn {
+    @apply w-full text-left text-[12px] px-2.5 py-1.5 rounded-lg cursor-pointer transition-colors;
+    background: var(--btn-bg); border: 1px solid var(--border2); color: var(--muted);
+  }
+  .sidebar-actions button:hover, .import-btn:hover { background: var(--btn-hover); color: var(--ink); }
+  .import-btn { display: block; }
   aside li small { @apply text-faint text-[11px]; }
     /* Use the two-lamp `signal` instead of tinting the card. */
 
@@ -115,6 +133,7 @@
   .lamp.st-bad    { background: var(--bad); opacity: 1; }
   .lamp.st-down   { background: var(--danger); opacity: 1; box-shadow: theme('boxShadow.led'); color: var(--danger); }
   .lamp.st-discovering { background: var(--accent); opacity: 1; animation: lamp-pulse 1s ease-in-out infinite; }
+  .lamp.st-settling { background: var(--lime); opacity: 1; animation: lamp-pulse 1.6s ease-in-out infinite; }
   @keyframes lamp-pulse { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
 
   .dot { @apply inline-block w-2 h-2 rounded-full mr-1.5; background: var(--good); }
@@ -125,6 +144,7 @@
   .dot.st-down   { background: var(--danger); box-shadow: theme('boxShadow.led'); color: var(--danger); }
   .statelabel { @apply text-[10px] px-1.5 rounded ml-1.5 font-semibold; }
   .statelabel.st-discovering { color: var(--accent); animation: lamp-pulse 1s ease-in-out infinite; }
+  .statelabel.st-settling { color: var(--lime); }
   .statelabel.st-ok     { color: var(--good); }
   .statelabel.st-okloss { color: var(--good-soft); }
   .statelabel.st-warn   { color: var(--warn-soft); }

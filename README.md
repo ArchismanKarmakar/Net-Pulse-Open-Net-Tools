@@ -28,6 +28,9 @@ A cross-platform **desktop** path-latency monitor (PingPlotter / mtr style):
 continuous per-hop ping + traceroute, IPv4 **and** IPv6, multiple targets, live
 config, per-hop ASN/BGP, alerts, exports, light & dark themes.
 
+Each target in the sidebar shows a **two-lamp status signal** (target + path) —
+see [Status lamps](#status-lamps) below for what the colours mean.
+
 NetPulse is a **native desktop app** — Electron shell + a C++ engine compiled as
 an in-process **Node-API addon**. There is **no web server, no localhost port,
 and no WebSocket**. The renderer talks to the engine only over Electron IPC,
@@ -183,6 +186,74 @@ Bundle `web/dist`, the Electron files, and the **Electron-ABI** addon
 - Native-addon guidance followed per
   <https://snyk.io/blog/nodejs-add-on-extensions/> (validate at the boundary,
   no untrusted input to native parsing, keep the C++ surface small).
+
+## Status lamps
+
+Each target in the sidebar shows a **two-lamp signal**, read together like a
+German railway *Hauptsignal* — the meaning comes from both lamps, not one
+blended colour. The **left lamp is the target** (the destination's own health);
+the **right lamp is the path** (the route/intermediate hops leading to it). This
+separates "the destination is slow/lossy" from "something upstream on the route
+is misbehaving", so you can tell at a glance *which* is the problem.
+
+**Target lamp** (destination health), graduated by latency and loss:
+
+| Colour | Meaning |
+|--------|---------|
+| 🟢 green | Healthy — low latency, no loss. |
+| 🟩 lime *(pulsing)* | Healthy, but the route or latency baseline **changed recently** (e.g. the destination's IP moved to a different path / load-balancer, or the median RTT shifted) — shown until it re-stabilises (timer). |
+| 🟡 yellow | Elevated — latency ≥ 70 ms **or** packet loss > 5%. |
+| 🟠 orange | Degraded — latency ≥ 100 ms **or** packet loss > 10%. |
+| 🔴 red | Unreachable, **or** latency ≥ 150 ms, **or** loss > 20%, **or** latency fluctuating with ≥ 50 ms swings. |
+| 🔵 cyan *(pulsing)* | Route discovery in progress (no confirmed destination yet). |
+
+**Path lamp** (route health):
+
+| Colour | Meaning |
+|--------|---------|
+| 🟢 green | Packets routing cleanly to the target. |
+| 🟡 yellow | An intermediate hop is dropping packets **or** not revealing itself (a `*`/silent router — often normal, as routers deprioritise ICMP to themselves). |
+| 🟠 orange | Packets are routing toward the target pool (via BGP) but the target or some router is **dropping** them. |
+| 🔴 red | No route — internet/interface down, RTO, or the first hop is rejecting. |
+| 🔵 cyan *(pulsing)* | Route discovery in progress. |
+
+The exact thresholds live in the `LAMP` object in `web/src/App.jsx`
+(`destLamp` / `pathLamp`); the colours are CSS-variable-driven in
+`web/src/styles.css` (`.lamp.st-*`). These thresholds are deliberately separate
+from the single `alerts.ms` / `alerts.loss` pair, which drives the per-hop table
+highlighting and the "N hops with loss/latency" banner.
+
+> **Note for maintainers:** the lamp classes are composed at runtime
+> (`'st-' + state`), so they never appear as literal strings for Tailwind's
+> content scanner. They are listed in `safelist` in `web/tailwind.config.js` —
+> **any new lamp state must be added there**, or Tailwind's tree-shaker will
+> silently drop its colour from the build.
+
+## Route discovery
+
+Discovery (finding the hops to the destination) and steady-state monitoring use
+different send cadences, governed by two cooperating mechanisms in
+`core/src/session.cpp`:
+
+1. **Per-hop desired cadence.** Unanswered hops become due quickly
+   (`kDiscoveryInterval`) so the route is found fast; answered hops fall back to
+   the configured steady `interval`. Non-responding (`*`) hops back off after a
+   few fast tries (`kDiscoveryTries`) so they don't hog the budget.
+2. **A single global token-bucket rate limiter** (`kMaxProbeRate` /
+   `kProbeBurst`) paces **all** ICMP sends into a smooth, low, constant stream.
+   This is deliberate: fast raw-socket ICMP bursts to one address are exactly
+   the pattern that behavioural AV, Windows Defender's network monitor, and
+   Smart App Control flag as flooding/scanning. The bucket caps the aggregate
+   send rate at or below the app's own steady all-hops rate, so discovery is
+   quick **without** ever emitting a flood/scan signature.
+
+Two related correctness details handled here: a reply that comes back **later
+than its timeout** is rejected (treated as loss) rather than recorded as a giant
+RTT — this prevents the "latency ramp" artifact when an edge briefly
+rate-limits/queues ICMP. And any **EchoReply** is accepted as reaching the
+destination even if its source address was rewritten by a NAT/load-balancer, so
+discovery isn't stalled by address rewriting (the visible destination IP is
+updated to the actual responder).
 
 ## Styling
 

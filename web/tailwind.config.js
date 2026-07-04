@@ -7,8 +7,8 @@ export default {
   // silently drops them from the build (this is why the 'discovering' and
   // 'down' states rendered with no colour). Safelist every state variant.
   safelist: [
-    's-discovering', 's-ok', 's-okloss', 's-warn', 's-bad', 's-down',
-    'st-discovering', 'st-ok', 'st-okloss', 'st-minor', 'st-loss', 'st-warn', 'st-bad', 'st-down', 'st-silent',
+    's-discovering', 's-settling', 's-ok', 's-okloss', 's-warn', 's-bad', 's-down',
+    'st-discovering', 'st-settling', 'st-ok', 'st-okloss', 'st-minor', 'st-loss', 'st-warn', 'st-bad', 'st-down', 'st-silent',
   ],
   darkMode: ['selector', '[data-theme="dark"]'],
   theme: {

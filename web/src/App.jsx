@@ -370,33 +370,128 @@ export default function App() {
   }
   const STATE_LABEL = { discovering: 'discovering', ok: 'ok', okloss: 'minor loss', warn: 'path', bad: 'high latency/loss', down: 'unreachable' }
 
-  // Two-lamp signal, in the spirit of German railway signal heads (Hauptsignal):
-  // meaning comes from reading TWO independently-lit lamps together, not one
-  // blended colour. Left lamp = the target itself; right lamp = the path
-  // leading to it. This tells you at a glance which of the two is the problem
-  // instead of folding both into a single ambiguous colour.
+  // ============================================================================
+  // TWO-LAMP SIGNAL — implements the meanings in the project's lamp diagram.
+  // Left lamp = TARGET (the destination's own health). Right lamp = PATH (the
+  // route/intermediate hops leading to it). Meaning comes from reading both
+  // together, German-Hauptsignal style, rather than one blended colour.
+  //
+  // Lamp states and the colours they map to (see .lamp.st-* in styles.css):
+  //   ok         → green        st-ok
+  //   settling   → lime (pulse) st-settling   (target reachable but latency just
+  //                                            shifted / route changed recently;
+  //                                            shown until it stabilises — timer)
+  //   warn       → yellow       st-warn
+  //   bad        → orange       st-bad
+  //   down       → red          st-down
+  //   discovering→ cyan (pulse) st-discovering
+  //
+  // Thresholds below come straight from the diagram. They intentionally do NOT
+  // reuse the single `alerts.ms/alerts.loss` pair, because the diagram defines a
+  // graduated scale (70 → 100 → 150 ms, 5% → 10% → 20% loss) that one pair can't
+  // express. `alerts` still drives the separate table highlighting / "N hops
+  // with loss/latency" banner, which is unchanged.
+  const LAMP = {
+    // target latency ladder (ms), from the diagram
+    latWarn: 70, latBad: 100, latDown: 150,
+    // target loss ladder (%), from the diagram
+    lossWarn: 5, lossBad: 10, lossDown: 20,
+    // "latency fluctuating" — jitter ladder (ms). The diagram calls out
+    // fluctuation of 50+ms as a red-level condition on the target.
+    jitBad: 50,
+    // how long to keep showing the lime "settling" lamp after the destination's
+    // address (route) changes or its latency baseline shifts, before trusting
+    // the new steady state.
+    settleSecs: 8,
+  }
+
+  // Detect a recent route/baseline change for the lime "settling" target lamp.
+  // We remember each target's last confirmed destination address + median RTT;
+  // when either shifts materially we start (or restart) a settle timer, and the
+  // target lamp reads lime until it elapses — matching the diagram's note:
+  // "1.1.1.1 was 25ms but suddenly switched to a different path / the hop
+  //  revealed a different IP / load-balancer changed, ping changed to 40ms —
+  //  show this until stable (use timer)".
+  const routeSettle = useRef({}) // id -> { addr, med, until }
+  const targetSettling = (t, d) => {
+    if (!d || d.med == null) return false
+    const rec = routeSettle.current[t.id]
+    const now = Date.now() / 1000
+    const addr = d.address || ''
+    if (!rec) { routeSettle.current[t.id] = { addr, med: d.med, until: 0 }; return false }
+    const addrChanged = rec.addr && addr && rec.addr !== addr
+    const medShifted = rec.med != null && Math.abs(d.med - rec.med) >= Math.max(10, rec.med * 0.5)
+    if (addrChanged || medShifted) {
+      routeSettle.current[t.id] = { addr, med: d.med, until: now + LAMP.settleSecs }
+      return true
+    }
+    // keep the baseline fresh but don't reset the timer for tiny drift
+    rec.addr = addr
+    if (now < rec.until) return true
+    rec.med = d.med // adopt the new steady baseline once settled
+    return false
+  }
+
+  // TARGET lamp — health of the destination itself.
   const destLamp = (t) => {
-    const d = destHopOf(t)
     if (isDiscovering(t)) return 'discovering'
+    const d = destHopOf(t)
     if (!d) {
       const f = frontierHop(t)
-      if (f && f.sent > 0 && f.recv === 0) return 'down'
+      if (f && f.sent > 0 && f.recv === 0) return frontierWithinGrace(t) ? 'discovering' : 'down'
       return 'discovering'
     }
-    const lat = d.med ?? d.avg
-    const latHigh = lat != null && lat > alerts.ms
-    const lossHigh = d.sent > 0 && d.loss > alerts.loss
-    const noReply = d.sent > 0 && d.recv === 0
-    if (noReply) return 'down'
-    if (lossHigh || latHigh) return 'bad'
-    if (d.loss > 0) return 'okloss'
+    // hard down: destination not answering at all
+    if (d.sent > 0 && d.recv === 0) return 'down'
+    const loss = d.loss ?? 0
+    const lat = d.med ?? d.avg ?? 0
+    const jit = d.jitter ?? 0
+    // red / down: heavy loss, very high latency, or large latency fluctuation
+    if (loss > LAMP.lossDown || lat >= LAMP.latDown || jit >= LAMP.jitBad) return 'down'
+    // orange / bad: notable loss or high latency
+    if (loss > LAMP.lossBad || lat >= LAMP.latBad) return 'bad'
+    // yellow / warn: minor loss or elevated latency
+    if (loss > LAMP.lossWarn || lat >= LAMP.latWarn) return 'warn'
+    // lime / settling: healthy, but route/latency changed recently → show until stable
+    if (targetSettling(t, d)) return 'settling'
     return 'ok'
   }
+
+  // PATH lamp — health of the route (intermediate hops) to the destination.
   const pathLamp = (t) => {
     if (isDiscovering(t)) return 'discovering'
     const hops = t.hops || []
-    return hops.some((h) => !h.is_dest && h.sent > 0 && h.recv > 0 && h.loss > alerts.loss) ? 'warn' : 'ok'
+    const d = destHopOf(t)
+    // Only consider hops BEFORE the destination as "path".
+    const destHopNo = d ? d.hop : (hops.length ? hops[hops.length - 1].hop : 0)
+    const inter = hops.filter((h) => !h.is_dest && h.hop < destHopNo)
+
+    // red: no route to the destination at all — the destination isn't reachable
+    // and there's no confirmed path carrying packets to it.
+    if (!d || (d.sent > 0 && d.recv === 0)) {
+      // if literally nothing on the path is replying either, the path is down
+      const anyReply = inter.some((h) => h.recv > 0) || (hops[0] && hops[0].recv > 0)
+      if (!anyReply) return 'down'
+      // packets are routing toward the target pool but the target/some router is
+      // dropping them → orange (diagram: "routing via BGP but target or some
+      // intermediate router dropping packets").
+      return 'bad'
+    }
+
+    // With a reachable destination, grade the intermediate path.
+    // A hop that answered (recv>0) but shows real loss = genuine path drop.
+    const lossyReplying = inter.some((h) => h.sent > 0 && h.recv > 0 && h.loss > LAMP.lossWarn)
+    // A hop that never answers at all (recv===0, i.e. a "*"/silent router) =
+    // "not revealing" — the diagram treats this as a yellow path condition, not
+    // a fault (routers commonly deprioritise ICMP to themselves).
+    const silentInter = inter.some((h) => h.sent > 0 && h.recv === 0)
+
+    // Heavy intermediate loss where a hop is actively dropping a lot → orange.
+    if (inter.some((h) => h.recv > 0 && h.loss > LAMP.lossBad)) return 'bad'
+    if (lossyReplying || silentInter) return 'warn'
+    return 'ok'
   }
+
 
   useEffect(() => { if (sel && selHop === null) { const d = sel.hops.find((h) => h.is_dest); if (d) setSelHop(d.hop) } }, [sel, selHop])
 
@@ -565,7 +660,7 @@ export default function App() {
                         className={'lamp st-' + destLamp(t)}
                         title={(() => {
                           const s = destLamp(t)
-                          const m = { discovering: 'Route discovery in progress', ok: 'Destination healthy', okloss: 'Destination: occasional loss', warn: 'Destination: elevated latency/loss', bad: 'Destination: high latency/loss', down: 'Destination unreachable' }
+                          const m = { discovering: 'Route discovery in progress', settling: 'Destination healthy — latency/route changed recently, stabilising', ok: 'Destination healthy', okloss: 'Destination: occasional loss', warn: 'Destination: elevated latency or minor loss (70ms+ / PL>5%)', bad: 'Destination: high latency or loss (100ms+ / PL>10%)', down: 'Destination: unreachable, or severe latency/loss/jitter (150ms+ / PL>20% / 50ms+ swings)' }
                           return `Target: ${m[s] || s}`
                         })()}
                         aria-label={`target-${destLamp(t)}`}
@@ -574,7 +669,7 @@ export default function App() {
                         className={'lamp st-' + pathLamp(t)}
                         title={(() => {
                           const s = pathLamp(t)
-                          const m = { discovering: 'Route discovery in progress', ok: 'Path healthy', warn: 'Upstream path: packet loss/latency', okloss: 'Upstream: light loss', bad: 'Upstream: high latency/loss', down: 'Upstream: unreachable' }
+                          const m = { discovering: 'Route discovery in progress', ok: 'Path healthy — packets routing cleanly to the target', warn: 'Path: an intermediate hop is dropping packets or not revealing itself', bad: 'Path: routing to the target pool via BGP, but the target or a router is dropping packets', down: 'Path: no route — internet/interface down, RTO, or first hop rejecting' }
                           return `Path: ${m[s] || s}`
                         })()}
                         aria-label={`path-${pathLamp(t)}`}

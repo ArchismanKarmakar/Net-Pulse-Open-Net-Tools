@@ -1,6 +1,15 @@
 /** @type {import('tailwindcss').Config} */
 export default {
   content: ['./index.html', './src/**/*.{js,jsx}'],
+  // These classes are composed dynamically at runtime (e.g. 's-' + state,
+  // 'st-' + lamp), so the string never appears literally in the source for
+  // Tailwind's content scanner to find — without safelisting, its tree-shaker
+  // silently drops them from the build (this is why the 'discovering' and
+  // 'down' states rendered with no colour). Safelist every state variant.
+  safelist: [
+    's-discovering', 's-ok', 's-okloss', 's-warn', 's-bad', 's-down',
+    'st-discovering', 'st-ok', 'st-okloss', 'st-minor', 'st-loss', 'st-warn', 'st-bad', 'st-down', 'st-silent',
+  ],
   darkMode: ['selector', '[data-theme="dark"]'],
   theme: {
     extend: {

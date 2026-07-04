@@ -97,6 +97,7 @@
   aside li:hover { @apply bg-panel2; }
   aside li.sel { @apply bg-sel outline outline-1 outline-border2; box-shadow: var(--shadow-sm); }
   aside li small { @apply text-faint text-[11px]; }
+  aside li.s-discovering { background: color-mix(in srgb, var(--accent) 12%, var(--panel)); }
   aside li.s-okloss { background: color-mix(in srgb, var(--good-soft) 12%, var(--panel)); }
   aside li.s-warn   { background: color-mix(in srgb, var(--warn-soft) 15%, var(--panel)); }
   aside li.s-bad    { background: color-mix(in srgb, var(--bad) 14%, var(--panel)); }
@@ -115,6 +116,8 @@
   .lamp.st-warn   { background: var(--warn-soft); opacity: 1; }
   .lamp.st-bad    { background: var(--bad); opacity: 1; }
   .lamp.st-down   { background: var(--danger); opacity: 1; box-shadow: theme('boxShadow.led'); color: var(--danger); }
+  .lamp.st-discovering { background: var(--accent); opacity: 1; animation: lamp-pulse 1s ease-in-out infinite; }
+  @keyframes lamp-pulse { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
 
   .dot { @apply inline-block w-2 h-2 rounded-full mr-1.5; background: var(--good); }
   .dot.st-ok     { background: var(--good); }
@@ -123,6 +126,7 @@
   .dot.st-bad    { background: var(--bad); }
   .dot.st-down   { background: var(--danger); box-shadow: theme('boxShadow.led'); color: var(--danger); }
   .statelabel { @apply text-[10px] px-1.5 rounded ml-1.5 font-semibold; }
+  .statelabel.st-discovering { color: var(--accent); animation: lamp-pulse 1s ease-in-out infinite; }
   .statelabel.st-ok     { color: var(--good); }
   .statelabel.st-okloss { color: var(--good-soft); }
   .statelabel.st-warn   { color: var(--warn-soft); }

@@ -274,10 +274,19 @@ export default function App() {
   //   green (ok) · light green (okloss, occasional loss) · yellow (warn, a middle
   //   hop is lossy/unreachable) · orange (bad, target loss + high latency) ·
   //   red (down, target unreachable)
+  // A target that hasn't produced any destination data yet is DISCOVERING —
+  // it must not read as green "healthy" (misleading) nor as red "down" (it
+  // isn't failing, it just started). This is the state shown in the list while
+  // DNS resolves and the first probes come back.
+  const isDiscovering = (t) => {
+    const d = destHopOf(t)
+    return !d || (d.sent === 0 && (d.recv ?? 0) === 0 && (d.loss ?? 0) === 0)
+  }
   const targetState = (t) => {
+    if (isDiscovering(t)) return 'discovering'
     const hops = t.hops || []
     const d = destHopOf(t)
-    if (!d) return 'ok'
+    if (!d) return 'discovering'
     const lat = d.med ?? d.avg
     const latHigh = lat != null && lat > alerts.ms
     const lossHigh = d.sent > 0 && d.loss > alerts.loss
@@ -290,7 +299,7 @@ export default function App() {
     if (minorLoss) return 'okloss'           // light green — occasional loss
     return 'ok'
   }
-  const STATE_LABEL = { ok: 'ok', okloss: 'minor loss', warn: 'path', bad: 'high latency/loss', down: 'unreachable' }
+  const STATE_LABEL = { discovering: 'discovering', ok: 'ok', okloss: 'minor loss', warn: 'path', bad: 'high latency/loss', down: 'unreachable' }
 
   // Two-lamp signal, in the spirit of German railway signal heads (Hauptsignal):
   // meaning comes from reading TWO independently-lit lamps together, not one
@@ -299,7 +308,7 @@ export default function App() {
   // instead of folding both into a single ambiguous colour.
   const destLamp = (t) => {
     const d = destHopOf(t)
-    if (!d) return 'ok'
+    if (!d || isDiscovering(t)) return 'discovering'
     const lat = d.med ?? d.avg
     const latHigh = lat != null && lat > alerts.ms
     const lossHigh = d.sent > 0 && d.loss > alerts.loss
@@ -310,6 +319,7 @@ export default function App() {
     return 'ok'
   }
   const pathLamp = (t) => {
+    if (isDiscovering(t)) return 'discovering'
     const hops = t.hops || []
     return hops.some((h) => !h.is_dest && h.sent > 0 && h.loss > alerts.loss) ? 'warn' : 'ok'
   }
@@ -519,11 +529,11 @@ export default function App() {
           {!sel ? <div className="empty">Add a target to begin.</div> : (
             <>
               <div className="statusbar">
-                <b>{sel.name}</b> → {sel.dest_ip || 'unresolved'} <span className="badge">{sel.family}</span> · {sel.hops.length} hops
-                {dest && dest.sent === 0 && (
-                  <span className="badge inline-flex items-center align-middle" title="Each hop's first few real replies are used only to establish its route/address and aren't shown as stats yet — this avoids a hop's very first reading (which can be an unrepresentative one-off) being displayed as if it were typical. This clears per-hop, as soon as real data is available, not on a fixed timer.">
+                <b>{sel.name}</b> → {sel.dest_ip || 'resolving…'} <span className="badge">{sel.family}</span> · {sel.hops.length} hops
+                {(sel.hops.length === 0 || (dest && dest.sent === 0)) && !sel.error && (
+                  <span className="badge inline-flex items-center align-middle" title="Discovering the route: resolving the destination and probing each hop. Each hop's first few real replies are used only to establish its address/route and aren't shown as stats yet, so an unrepresentative first reading isn't displayed as if it were typical. Clears per-hop as soon as real data is available.">
                     <span className="spinner sm" style={{ marginRight: 5 }} />
-                    discovering route…
+                    {sel.dest_ip ? 'discovering route…' : `resolving ${sel.name}…`}
                   </span>
                 )}
                 {(() => { const p = sel.hops.filter((h) => ['loss', 'warn', 'bad', 'down'].includes(hopStatus(h))); return p.length > 0 && <span className="err"> ⚠ {p.length} hop{p.length > 1 ? 's' : ''} with loss/latency</span> })()}
@@ -575,11 +585,9 @@ export default function App() {
                 </div>
               )}
 
-              {sel.hops.length === 0 && !sel.error ? (
+              {sel.error ? (
                 <div className="loading">
-                  <div className="spinner" />
-                  <div className="loading-text">{sel.dest_ip ? `Tracing route to ${sel.dest_ip}…` : `Resolving ${sel.name}…`}</div>
-                  <div className="loading-sub">first samples appear in a couple of seconds</div>
+                  <div className="loading-text" style={{ color: 'var(--danger)' }}>⚠ {sel.error}</div>
                 </div>
               ) : (
                 <>

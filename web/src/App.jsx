@@ -206,8 +206,17 @@ export default function App() {
   const focus = FOCUS[focusIdx][1]
 
   useEffect(() => {
-    document.documentElement.dataset.theme = theme
+    // Flipping data-theme recomputes every CSS-variable-driven colour at once;
+    // if elements are mid-transition when that happens, dozens of them (table
+    // rows, dots, buttons) animate simultaneously and the switch visibly janks.
+    // Fix: suspend all transitions for one frame, apply the theme, then
+    // restore transitions — the swap becomes instant instead of animated.
+    const root = document.documentElement
+    root.classList.add('theme-switching')
+    root.dataset.theme = theme
     try { localStorage.setItem('np-theme', theme) } catch {}
+    const id = requestAnimationFrame(() => requestAnimationFrame(() => root.classList.remove('theme-switching')))
+    return () => cancelAnimationFrame(id)
   }, [theme])
 
   useEffect(() => { api('/api/interfaces').then((j) => setInterfaces(Array.isArray(j) ? j : [])).catch(() => {}) }, [])
@@ -272,6 +281,28 @@ export default function App() {
     return 'ok'
   }
   const STATE_LABEL = { ok: 'ok', okloss: 'minor loss', warn: 'path', bad: 'high latency/loss', down: 'unreachable' }
+
+  // Two-lamp signal, in the spirit of German railway signal heads (Hauptsignal):
+  // meaning comes from reading TWO independently-lit lamps together, not one
+  // blended colour. Left lamp = the target itself; right lamp = the path
+  // leading to it. This tells you at a glance which of the two is the problem
+  // instead of folding both into a single ambiguous colour.
+  const destLamp = (t) => {
+    const d = destHopOf(t)
+    if (!d) return 'ok'
+    const lat = d.med ?? d.avg
+    const latHigh = lat != null && lat > alerts.ms
+    const lossHigh = d.sent > 0 && d.loss > alerts.loss
+    const noReply = d.sent > 0 && d.recv === 0
+    if (noReply) return 'down'
+    if (lossHigh || latHigh) return 'bad'
+    if (d.loss > 0) return 'okloss'
+    return 'ok'
+  }
+  const pathLamp = (t) => {
+    const hops = t.hops || []
+    return hops.some((h) => !h.is_dest && h.sent > 0 && h.loss > alerts.loss) ? 'warn' : 'ok'
+  }
 
   useEffect(() => { if (sel && selHop === null) { const d = sel.hops.find((h) => h.is_dest); if (d) setSelHop(d.hop) } }, [sel, selHop])
 
@@ -419,7 +450,11 @@ export default function App() {
               return (
                 <li key={t.id} className={(sel && t.id === sel.id ? 'sel ' : '') + 's-' + st} onClick={() => { setSelId(t.id); setSelHop(null) }}>
                   <div className="flex items-center">
-                    <span className={'dot st-' + st} /> <span className="truncate">{t.name}</span>
+                    <span className="signal" title={`Target: ${destLamp(t)} · Path: ${pathLamp(t)}`}>
+                      <span className={'lamp st-' + destLamp(t)} />
+                      <span className={'lamp st-' + pathLamp(t)} />
+                    </span>
+                    <span className="truncate">{t.name}</span>
                     {STATE_LABEL[st] && <span className={'statelabel st-' + st}>{STATE_LABEL[st]}</span>}
                   </div>
                   <small>{t.dest_ip} {t.family}{t.paused ? ' · paused' : ''}</small>

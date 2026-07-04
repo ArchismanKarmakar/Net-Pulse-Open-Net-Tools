@@ -20,7 +20,33 @@
 #include <tuple>
 #include <vector>
 
+#if defined(_WIN32)
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#elif defined(__linux__)
+#  include <sys/resource.h>
+#endif
+
 namespace netpulse {
+
+// Samples are appended in increasing-timestamp order (see WebTarget series
+// push logic), so finding "the first sample at or after `cutoff`" is a binary
+// search, not a linear scan. compute_stat() and the chart downsampler below
+// both used to `for (auto& s : pts) if (s.first < cutoff) continue;` — a scan
+// of the ENTIRE historical buffer on every single poll (every ~600ms),
+// regardless of how much history had piled up. That cost grows without bound
+// as a session runs and as more targets/hops accumulate — which is exactly
+// why the app got progressively laggier over time instead of staying flat
+// like PingPlotter. Jumping straight to `cutoff` via lower_bound turns that
+// into O(log N + only the in-window samples), independent of total history.
+inline std::vector<Sample>::const_iterator focus_begin(const std::vector<Sample>& pts,
+                                                         std::optional<double> cutoff) {
+    if (!cutoff) return pts.begin();
+    return std::lower_bound(pts.begin(), pts.end(), *cutoff,
+                             [](const Sample& s, double c) { return s.first < c; });
+}
 
 inline std::string esc(const std::string& s) {
     std::string o;
@@ -76,8 +102,8 @@ inline Stat compute_stat(const std::vector<Sample>& pts, std::optional<double> f
     Stat s;
     std::vector<double> rtts;
     std::optional<double> cur;
-    for (const auto& [ts, rtt] : pts) {
-        if (cutoff && ts < *cutoff) continue;
+    for (auto it = focus_begin(pts, cutoff); it != pts.end(); ++it) {
+        const auto& [ts, rtt] = *it;
         ++s.sent;
         cur = rtt;
         if (rtt) rtts.push_back(*rtt);
@@ -118,6 +144,20 @@ public:
         auto sess = std::make_shared<Session>(id, name, st);
         t->session = sess;
         t->th = std::thread([raw, sess, stop, paused]() {
+            // Timing accuracy in this loop depends on the thread actually
+            // getting scheduled promptly when a reply arrives — if the OS
+            // delays it (e.g. while the Electron main/UI thread is busy), the
+            // packet still arrived on time, but we don't read+timestamp it
+            // until we resume, so the reported RTT is inflated by however
+            // long we were descheduled. Mildly favoring this thread reduces
+            // (does not eliminate) that risk; a follow-up using kernel-level
+            // receive timestamps (SO_TIMESTAMP / SCM_TIMESTAMPING) would
+            // close the gap completely, independent of scheduling.
+#if defined(_WIN32)
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#elif defined(__linux__)
+            ::setpriority(PRIO_PROCESS, 0, -5); // best-effort; ignored without CAP_SYS_NICE
+#endif
             sess->run(stop, paused, [raw](const Snapshot& snap) {
                 std::lock_guard<std::mutex> lk(raw->mtx);
                 for (const auto& np : snap.new_points) {
@@ -230,8 +270,9 @@ public:
                 if (width <= 0) width = 1.0;
                 // bucket -> (representative ts, max rtt or none, sawLoss)
                 std::map<long long, std::tuple<double, std::optional<double>, bool>> buckets;
-                for (auto& [ts, rtt] : pts) {
-                    if (focus && ts < cutoff) continue;
+                for (auto it = focus_begin(pts, focus ? std::optional<double>(cutoff) : std::nullopt);
+                     it != pts.end(); ++it) {
+                    const auto& [ts, rtt] = *it;
                     long long b = static_cast<long long>(ts / width);
                     auto bit = buckets.find(b);
                     if (bit == buckets.end()) {

@@ -9,31 +9,37 @@
    ============================================================ */
 :root {
   --bg:#0a0d12; --panel:#11151c; --panel2:#161b24; --input-bg:#0d1117;
-  --border:#1e2530; --border2:#2a3340; --btn-bg:#1a212c; --btn-hover:#232c3a;
-  --text:#e4e9f1; --muted:#98a3b3; --faint:#6b7686; --sel:#152029;
+  --border:#1e2530; --border2:#2c3542; --btn-bg:#1a212c; --btn-hover:#252f3d;
+  --text:#eef1f6; --muted:#a3aebd; --faint:#76818f; --sel:#152029;
   --accent:#22d3ee; --accent2:#38bdf8;
   --good:#34d399; --good-soft:#6ee7b7;
   --warn:#f59e0b; --warn-soft:#fbbf24;
   --bad:#fb923c; --danger:#f87171;
-  --grid:#1a212c; --axis:#6b7686;
+  --grid:#1a212c; --axis:#76818f;
   /* elevation: subtle depth instead of a flat single-tone panel wash */
   --shadow-sm: 0 1px 2px rgba(0,0,0,.35);
   --shadow-md: 0 4px 16px -4px rgba(0,0,0,.45), 0 1px 3px rgba(0,0,0,.3);
   --shadow-inset: inset 0 1px 0 rgba(255,255,255,.03);
 }
 :root[data-theme=light] {
-  --bg:#f4f6f9; --panel:#ffffff; --panel2:#eef2f7; --input-bg:#ffffff;
-  --border:#dde3ec; --border2:#c7d0dd; --btn-bg:#eef2f7; --btn-hover:#e2e8f2;
-  --text:#161c26; --muted:#4b5768; --faint:#6e7a8c; --sel:#e7f6fa;
-  --accent:#0891b2; --accent2:#0e7490;
-  --good:#059669; --good-soft:#10b981;
-  --warn:#b45309; --warn-soft:#d97706;
-  --bad:#c2410c; --danger:#dc2626;
-  --grid:#e7ebf1; --axis:#7c8798;
-  --shadow-sm: 0 1px 2px rgba(30,41,59,.06);
-  --shadow-md: 0 8px 24px -8px rgba(30,41,59,.14), 0 1px 3px rgba(30,41,59,.08);
-  --shadow-inset: inset 0 1px 0 rgba(255,255,255,.6);
+  --bg:#eef1f6; --panel:#ffffff; --panel2:#e9eef4; --input-bg:#ffffff;
+  --border:#d3dae4; --border2:#b7c1d0; --btn-bg:#eef2f7; --btn-hover:#dde5ef;
+  --text:#0f1620; --muted:#3d4a5c; --faint:#5f6b7c; --sel:#dff5fa;
+  --accent:#0e7490; --accent2:#0369a1;
+  --good:#047857; --good-soft:#0d9488;
+  --warn:#a15c07; --warn-soft:#c2760a;
+  --bad:#b3400f; --danger:#c81e1e;
+  --grid:#dde4ec; --axis:#5f6b7c;
+  --shadow-sm: 0 1px 2px rgba(30,41,59,.08);
+  --shadow-md: 0 8px 24px -8px rgba(30,41,59,.16), 0 1px 3px rgba(30,41,59,.1);
+  --shadow-inset: inset 0 1px 0 rgba(255,255,255,.7);
 }
+
+/* Theme switch: freeze every transition for one frame while the CSS
+   variables flip, then restore. Without this, every transitioning element on
+   screen (rows, buttons, dots) animates its colour change at once and the
+   whole switch visibly janks — this makes it instant instead. */
+.theme-switching, .theme-switching * { transition: none !important; }
 
 @layer base {
   :root { color-scheme: dark; }
@@ -42,7 +48,7 @@
   html, body, #root { margin: 0; height: 100%; }
   body { @apply bg-bg text-ink antialiased; font: 14px/1.45 theme('fontFamily.sans'); }
   h1 { @apply m-0 text-[17px] font-semibold tracking-tight; }
-  button { @apply bg-btnbg border border-border2 text-ink rounded-lg px-2.5 py-1.5 cursor-pointer transition-all duration-150; }
+  button { @apply bg-btnbg border border-border2 text-ink rounded-lg px-2.5 py-1.5 cursor-pointer; transition: background-color .12s, box-shadow .12s, transform .08s; }
   button:hover { @apply bg-btnhover; box-shadow: var(--shadow-sm); }
   button:active { transform: translateY(0.5px); }
   button:focus-visible, select:focus-visible, input:focus-visible { @apply outline-none ring-2 ring-accent; }
@@ -83,8 +89,8 @@
   aside { @apply w-[230px] border-r border-border p-2.5 flex flex-col gap-2; background: var(--panel); }
   aside h3 { @apply m-0 text-[11px] text-muted uppercase tracking-wider; }
   aside ul { @apply list-none m-0 p-0 flex-1 overflow-auto flex flex-col gap-1; }
-  aside li { @apply px-2.5 py-2 rounded-lg cursor-pointer flex flex-col transition-all duration-150; }
-  aside li:hover { @apply bg-panel2; box-shadow: var(--shadow-sm); transform: translateX(1px); }
+  aside li { @apply px-2.5 py-2 rounded-lg cursor-pointer flex flex-col; }
+  aside li:hover { @apply bg-panel2; }
   aside li.sel { @apply bg-sel outline outline-1 outline-border2; box-shadow: var(--shadow-sm); }
   aside li small { @apply text-faint text-[11px]; }
   aside li.s-okloss { background: color-mix(in srgb, var(--good-soft) 12%, var(--panel)); }
@@ -97,6 +103,15 @@
   /* ---- LED-style status dots (signature element) ----
      Network hardware speaks in status LEDs; the target list and each hop row
      borrow that vernacular instead of tinting whole rows red/green. */
+  /* ---- two-lamp signal (destination + path), German Hauptsignal-style ---- */
+  .signal { @apply inline-flex gap-[3px] mr-2 p-[3px] rounded shrink-0; background: var(--btn-bg); border: 1px solid var(--border2); }
+  .lamp { @apply w-[7px] h-[7px] rounded-[1px]; background: var(--faint); opacity: .35; }
+  .lamp.st-ok     { background: var(--good); opacity: 1; }
+  .lamp.st-okloss { background: var(--good-soft); opacity: 1; }
+  .lamp.st-warn   { background: var(--warn-soft); opacity: 1; }
+  .lamp.st-bad    { background: var(--bad); opacity: 1; }
+  .lamp.st-down   { background: var(--danger); opacity: 1; box-shadow: theme('boxShadow.led'); color: var(--danger); }
+
   .dot { @apply inline-block w-2 h-2 rounded-full mr-1.5; background: var(--good); }
   .dot.st-ok     { background: var(--good); }
   .dot.st-okloss { background: var(--good-soft); }

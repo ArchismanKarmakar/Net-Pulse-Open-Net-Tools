@@ -108,13 +108,42 @@ static Napi::Value ListInterfaces(const Napi::CallbackInfo& info) {
     return arr;
 }
 
-// Returns the same JSON string the HTTP server served at /api/state, so the
-// renderer can parse it exactly as before — only the transport changed.
+// Building the JSON snapshot (stats + downsampled series for every hop of
+// every target) does real work — this runs it on N-API's worker thread pool
+// via AsyncWorker instead of on the calling thread. That matters specifically
+// because the caller here is Electron's MAIN process: a synchronous native
+// call there blocks not just this one IPC response but the whole process's
+// event loop (window messages, other IPC, compositing scheduling) for as long
+// as the call takes. Returning a Promise keeps the main thread free the whole
+// time; ipcMain.handle() already awaits promises transparently.
+class GetStateWorker : public Napi::AsyncWorker {
+public:
+    GetStateWorker(Napi::Env env, std::optional<double> focus)
+        : Napi::AsyncWorker(env), focus_(focus), deferred_(Napi::Promise::Deferred::New(env)) {}
+    void Execute() override { result_ = mgr().state_json(focus_); }
+    void OnOK() override {
+        Napi::HandleScope scope(Env());
+        deferred_.Resolve(Napi::String::New(Env(), result_));
+    }
+    void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
+    Napi::Promise GetPromise() { return deferred_.Promise(); }
+
+private:
+    std::optional<double> focus_;
+    std::string result_;
+    Napi::Promise::Deferred deferred_;
+};
+
+// Returns a Promise<string> of the same JSON shape the HTTP server used to
+// serve at /api/state, so the renderer's parsing code is unchanged — only the
+// transport (now async, in-process) is different.
 static Napi::Value GetState(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     std::optional<double> focus;
     if (info.Length() > 0 && info[0].IsNumber()) focus = info[0].ToNumber().DoubleValue();
-    return Napi::String::New(env, mgr().state_json(focus));
+    auto* worker = new GetStateWorker(env, focus);
+    worker->Queue();
+    return worker->GetPromise();
 }
 
 static Napi::Object Init(Napi::Env env, Napi::Object exports) {

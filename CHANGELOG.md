@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+- **Tools are now real tabbed pages** (top tab bar): **Path / MTR** (home, default),
+  **Ping** (streams the OS `ping`, cmd-style), **DNS Lookup** (forward A/AAAA/CNAME +
+  reverse PTR), and **Port Scanner** (bounded TCP connect, ≤2048 ports/scan). Backends
+  are implemented in the Electron main process (Node dns/net/child_process) over IPC.
+- **License changed to AGPL-3.0-or-later** (was MIT) to keep the project copyleft /
+  open-source for community development, VLC-style. Added `LICENSE` (full AGPL text),
+  `COPYRIGHT`, updated package manifests and README.
+- **IPv6 startup-loss:** reduced the discovery window (kDiscoveryWindow 6→3) so the
+  destination is hit by a smaller echo burst during route discovery, and the build now
+  does a **clean addon rebuild** (`cmake-js rebuild`, not incremental `compile`) — an
+  incremental build could silently skip a header-only engine change, which is the most
+  likely reason earlier fixes appeared to have no effect. The build also now fails hard
+  if the .node addon isn't produced, and the engine prints its build tag on load.
+
+
+## Unreleased
+
+- **IPv6 startup-loss fix (round 2 — root cause + verifiability).** In addition to
+  holding a hop's early losses during settling, the destination hop's discovery-phase
+  samples are now discarded the moment the destination is confirmed. During discovery
+  every TTL at/beyond the destination reaches it, and IPv6 anycast endpoints
+  (Cloudflare/Google) rate-limit that echo burst far harder than IPv4 — so the dest's
+  first samples were burst-induced losses. Once the destination is known the fan-out
+  stops and probing is one packet/interval, so we let the dest measure fresh from that
+  point. Verified in simulation for both fast and slow confirmation (0 loss exposed).
+- **Engine build banner.** The native addon now prints `[Net Pulse] native engine
+  loaded — build <tag>` on load and exports `engineBuild`, so you can confirm the
+  .node addon was actually recompiled (restarting Electron alone keeps the old binary).
+
+
+## Unreleased
+
+- **Fix — IPv6 hostname targets started at 100% loss for 3–5 s, then recovered
+  (IPv4 was unaffected):** the per-hop discovery "settling" window suppressed a
+  hop's first few *replies* but recorded its *losses* immediately. IPv6 paths
+  rate-limit the initial probe burst that discovers the route, so a hop's first
+  probes are dropped by the network — those losses showed at 100% while the
+  genuine early replies were still held back, which is why IPv6 flashed loss at
+  startup and IPv4 (whose initial probes weren't dropped) did not. A hop's early
+  losses are now held for the same settling window (until it has produced
+  kDiscoveryDropCount replies or the grace window elapses), so both families
+  show a brief "discovering" state and then real data. A genuinely unreachable
+  hop still surfaces its 100% loss a few seconds in.
+
+
+## Unreleased
+
 - **Fix — stuck on "discovering" after a reconnect / route change:** the frontier
   (`max_hop_seen_`) now *decays* to the deepest hop that answered recently instead of
   the deepest that ever answered, and phantom rows (hops that got an address from a

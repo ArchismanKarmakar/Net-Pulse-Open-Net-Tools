@@ -21,7 +21,14 @@ $electronVer = node -p "require('$($root -replace '\\','/')/electron/node_module
 Write-Host "      Electron version detected: $electronVer" -ForegroundColor DarkGray
 
 Write-Host "[3/4] Building the C++ engine as a Node-API addon for Electron $electronVer..." -ForegroundColor Cyan
-Push-Location "$root\napi"; npm install; npx cmake-js compile --runtime electron --runtime-version $electronVer; Pop-Location
+# Use `rebuild` (clean) rather than `compile` (incremental): a header-only change
+# (e.g. core/include/netpulse/manager.hpp) can be missed by an incremental build,
+# which silently leaves the OLD engine in place. A clean rebuild guarantees the
+# addon reflects the current source every time.
+Push-Location "$root\napi"; npm install; npx cmake-js rebuild --runtime electron --runtime-version $electronVer; Pop-Location
+$addon = Get-ChildItem -Path "$root\napi\build" -Recurse -Filter *.node -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $addon) { Write-Error "Native addon (.node) was NOT produced — the engine did not build. Fix the C++ build errors above before running."; exit 1 }
+Write-Host "      Built native addon: $($addon.FullName)" -ForegroundColor DarkGray
 
 Write-Host "[4/4] Launching NetPulse..." -ForegroundColor Green
 Push-Location "$root\electron"; npm start; Pop-Location

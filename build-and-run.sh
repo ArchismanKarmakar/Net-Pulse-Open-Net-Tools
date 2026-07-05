@@ -12,6 +12,6 @@ echo "[2/4] Installing Electron..."
 ver="$(node -p "require('$root/electron/node_modules/electron/package.json').version")"
 echo "      Electron version detected: $ver"
 echo "[3/4] Building the C++ engine as a Node-API addon for Electron $ver..."
-( cd "$root/napi" && npm install && npx cmake-js compile --runtime electron --runtime-version "$ver" )
+( cd "$root/napi" && npm install && npx cmake-js rebuild --runtime electron --runtime-version "$ver" )
 echo "[4/4] Launching NetPulse..."
 ( cd "$root/electron" && npm start )

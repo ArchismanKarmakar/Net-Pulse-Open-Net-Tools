@@ -271,8 +271,30 @@ the CSP (`connect-src 'self' https:`) simple.
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE). Third-party components and their licenses are
-listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+**GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)** — see
+[`LICENSE`](LICENSE) and [`COPYRIGHT`](COPYRIGHT). Third-party components and
+their licenses are listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
+Net Pulse — Open Net Tools is copyleft, in the spirit of projects like VLC: it
+is and stays open source. The AGPL additionally requires that if you run a
+modified version as a **network service**, you must offer its users the
+corresponding source. Contributions are welcome and expected to be under the
+same license, keeping the project open for active community development.
 
 "PingPlotter" and "mtr" are referenced only for behavioral comparison and are
 trademarks of their respective owners; Net Pulse — Open Net Tools is an independent project.
+
+## Tools (tabs)
+
+The app is organized into tabs across the top:
+
+- **Path / MTR** (home) — the live multi-target path-latency monitor.
+- **Ping** — a single-host ping using the OS `ping`, streamed cmd-style.
+- **DNS Lookup** — forward (A/AAAA/CNAME) and reverse (PTR) resolution.
+- **Port Scanner** — a bounded TCP connect scan (≤ 2048 ports/scan). Only scan
+  hosts you own or are authorized to test.
+
+The Ping, DNS, and Port Scanner tools run in the desktop app (they use the OS
+network stack via the Electron main process); they are unavailable in a plain
+browser dev server.
+

@@ -72,6 +72,19 @@ constexpr int    kDiscoveryTries    = 5;    // fast attempts an unanswered hop g
 constexpr double kDestSettleSecs    = 1.0;  // s — keep fast cadence this long after the destination first answers
 constexpr double kMaxProbeRate      = 30.0; // probes/sec — GLOBAL hard cap on ICMP sends (<= the app's own all-hops steady rate; keeps traffic ping-like, never a flood)
 constexpr double kProbeBurst        = 4.0;  // max tokens — small burst allowance so sends stay a smooth stream, not spikes
+// Bounded route-discovery window. While the destination hasn't been located we
+// probe only up to kDiscoveryWindow hops PAST the deepest hop that has already
+// resolved, and slide that window outward as hops resolve — rather than probing
+// all max_hops TTLs at once. This matters most for rate-limiting endpoints
+// (notably ICMPv6, e.g. Cloudflare): if every TTL >= the destination's distance
+// is probed simultaneously, they ALL reach the destination, its rate-limiter
+// drops most of that burst, and the loss pollutes the destination row for the
+// whole focus window — which is exactly why an IPv6 hostname target flashed
+// 100% loss at startup while IPv4 (whose destination doesn't rate-limit) did
+// not. Walking outward means only ~one probe reaches the destination around the
+// moment it's found, so it isn't hammered.
+constexpr int    kDiscoveryWindow   = 3;    // hops probed beyond the resolved frontier while discovering (small = gentler burst on rate-limiting IPv6 dests)
+constexpr int    kFrontierProbes    = 2;    // sends after which an as-yet-unanswered hop still lets the window advance past it
 
 Session::Session(uint64_t id, std::string target, Settings settings)
     : id_(id), target_(std::move(target)), settings_(std::move(settings)) {
@@ -109,15 +122,33 @@ void Session::resolve() {
     }
     freeaddrinfo(res);
 
+    // Remember both A and AAAA for possible runtime fallback logic.
+    resolved_v4_ = v4;
+    resolved_v6_ = v6;
+
     std::optional<std::string> chosen;
     switch (settings_.family) {
         case FamilyPref::V4: chosen = v4; break;
         case FamilyPref::V6: chosen = v6; break;
         case FamilyPref::Auto: chosen = v4 ? v4 : v6; break;
     }
+    // If the requested family has no address but the other family does, fall
+    // back to it rather than failing the session. Hostnames frequently map
+    // to both A and AAAA; a strict failure here causes an immediate session
+    // error or false-loss behaviour in some networks. Fall back improves UX
+    // and matches common "happy eyeballs" expectations for tooling.
     if (!chosen) {
-        error_ = "no address of the requested family for " + target_;
-        return;
+        if (settings_.family == FamilyPref::V6 && v4) {
+            // Wanted v6 but only v4 exists — fallback to v4.
+            error_ = "preferred IPv6 address absent; falling back to IPv4 for " + target_;
+            chosen = v4;
+        } else if (settings_.family == FamilyPref::V4 && v6) {
+            error_ = "preferred IPv4 address absent; falling back to IPv6 for " + target_;
+            chosen = v6;
+        } else {
+            error_ = "no address of the requested family for " + target_;
+            return;
+        }
     }
     dest_ = chosen;
     family_ = (chosen->find(':') != std::string::npos) ? Family::V6 : Family::V4;
@@ -131,6 +162,81 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
         return;
     }
     on_update(snapshot(true, {})); // immediate "tracing…" with resolved IP
+
+    // Decide and validate the effective probing family using both DNS results
+    // and the local system's usable interfaces. If the user explicitly chose
+    // IPv6 but the host has no IPv6 egress, don't start probing — wait and
+    // retry (keeps the UI responsive without emitting a burst of timed-out
+    // probes that look like 100% loss). For `Auto`, prefer a family that has
+    // both a DNS record and a local egress address.
+    {
+        Settings s = settings_snapshot();
+        auto ifs = list_interfaces();
+        bool has_local_v4 = false, has_local_v6 = false;
+        for (const auto& ni : ifs) {
+            if (ni.v6) has_local_v6 = true; else has_local_v4 = true;
+        }
+
+        if (s.family == FamilyPref::Auto) {
+            // Prefer the family chosen by resolve() unless it's unusable.
+            // This preserves the previous Auto behavior of favoring IPv4 for
+            // dual-stack hosts, instead of switching to IPv6 simply because a
+            // local IPv6 address exists.
+            if (family_ == Family::V4 && resolved_v4_ && has_local_v4) {
+                family_ = Family::V4; dest_ = resolved_v4_;
+            } else if (family_ == Family::V6 && resolved_v6_ && has_local_v6) {
+                family_ = Family::V6; dest_ = resolved_v6_;
+            } else if (resolved_v4_ && has_local_v4) {
+                family_ = Family::V4; dest_ = resolved_v4_;
+            } else if (resolved_v6_ && has_local_v6) {
+                family_ = Family::V6; dest_ = resolved_v6_;
+            } else if (resolved_v4_) {
+                family_ = Family::V4; dest_ = resolved_v4_;
+            } else if (resolved_v6_) {
+                family_ = Family::V6; dest_ = resolved_v6_;
+            }
+        } else if (s.family == FamilyPref::V6) {
+            // Wait for a usable local IPv6 egress rather than probing blindly.
+            if (!has_local_v6) {
+                error_ = "No local IPv6 egress available — waiting for IPv6 or change family";
+                on_update(snapshot(true, {}));
+                // Poll for up to 30s for a new interface or a settings change.
+                for (int i = 0; i < 30 && !stop->load(); ++i) {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    auto s2 = settings_snapshot();
+                    if (s2.family != s.family) break; // user changed pref
+                    auto ifs2 = list_interfaces();
+                    for (const auto& ni : ifs2) if (ni.v6) { has_local_v6 = true; break; }
+                    if (has_local_v6) break;
+                }
+                if (!has_local_v6 && settings_snapshot().family == FamilyPref::V6) {
+                    error_ = "No local IPv6 egress detected; aborting probe for " + target_;
+                    on_update(snapshot(false, {}));
+                    return;
+                }
+            }
+            if (resolved_v6_) { family_ = Family::V6; dest_ = resolved_v6_; }
+        } else if (s.family == FamilyPref::V4) {
+            if (!has_local_v4) {
+                error_ = "No local IPv4 egress available — waiting for IPv4 or change family";
+                on_update(snapshot(true, {}));
+                for (int i = 0; i < 30 && !stop->load(); ++i) {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    auto s2 = settings_snapshot();
+                    if (s2.family != s.family) break;
+                    auto ifs2 = list_interfaces();
+                    for (const auto& ni : ifs2) if (!ni.v6) { has_local_v4 = true; break; }
+                    if (has_local_v4) break;
+                }
+                if (!has_local_v4 && settings_snapshot().family == FamilyPref::V4) {
+                    error_ = "No local IPv4 egress detected; aborting probe for " + target_;
+                    on_update(snapshot(false, {}));
+                    return;
+                }
+            }
+            if (resolved_v4_) { family_ = Family::V4; dest_ = resolved_v4_; }
+        }
+    }
 
     auto make_prober = [&]() {
         Settings s = settings_snapshot();
@@ -216,7 +322,24 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
         // declaring loss — like ping/PingPlotter, which expose interval, not a
         // hard timeout.
         double timeout = s.timeout > 0.0 ? s.timeout : std::max(interval, 1.0);
-        uint8_t max_hop = dest_hop_ ? *dest_hop_ : s.max_hops;
+        // Probe range. Once the destination is known we probe exactly 1..dest.
+        // While still discovering, use a sliding window (see kDiscoveryWindow):
+        // only probe up to kDiscoveryWindow hops past the deepest already-resolved
+        // hop, so we walk out to the destination instead of blasting every TTL at
+        // it at once (which is what a rate-limiting IPv6 endpoint drops en masse).
+        uint8_t max_hop;
+        if (dest_hop_) {
+            max_hop = *dest_hop_;
+        } else {
+            uint8_t frontier = 0;
+            for (const auto& [h, cnt] : tries) {
+                bool resolved = last_reply_at.count(h) > 0 || cnt >= kFrontierProbes;
+                if (resolved && h > frontier) frontier = h;
+            }
+            int window_top = static_cast<int>(frontier) + kDiscoveryWindow;
+            int capped = std::min<int>(static_cast<int>(s.max_hops), window_top);
+            max_hop = static_cast<uint8_t>(capped < 1 ? 1 : capped);
+        }
         double now = now_secs();
 
         // Global token-bucket pacer. Refill toward kMaxProbeRate (capped at a
@@ -252,10 +375,25 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
             if (now >= nx) {
                 if (tokens >= 1.0) {
                     uint16_t seq = next_seq();
-                    if (prober->send(*dest_, ttl, icmp_id_, seq, s.payload_size))
+                    bool sent = prober->send(*dest_, ttl, icmp_id_, seq, s.payload_size);
+                    if (!sent) {
+                        // If send failed and we're unprivileged and using a
+                        // large payload, try a conservative fallback once.
+                        size_t fallback = 1432;
+                        if (!s.privileged && s.payload_size > fallback) {
+                            sent = prober->send(*dest_, ttl, icmp_id_, seq, fallback);
+                        }
+                    }
+                    if (sent) {
                         pending[seq] = Pending{ttl, now};
-                    tokens -= 1.0;
-                    ++tries[ttl];
+                        tokens -= 1.0;
+                        ++tries[ttl];
+                    } else {
+                        // do not consume a token or count a try for a failed send;
+                        // mark that pacing prevented sends this round if we would
+                        // otherwise have retried quickly.
+                        due_but_paced_out = true;
+                    }
                     // Fast cadence only where it helps: an answered hop only
                     // during the post-destination settle window; an unanswered
                     // hop only for its first kDiscoveryTries attempts (after
@@ -392,8 +530,12 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
                 if (now - at <= kFrontierStaleSecs && h > fresh_max) fresh_max = h;
             max_hop_seen_ = fresh_max;
         }
+        // Before any hop has answered, do not treat the entire max-hop range as
+        // established frontier. That would record the first discovery round as
+        // 100% loss for all hops. Only once we have at least one reply do we
+        // advance the frontier beyond the first probe horizon.
         uint8_t bound = dest_hop_ ? *dest_hop_
-                                  : (max_hop_seen_ ? static_cast<uint8_t>(max_hop_seen_ + 1) : s.max_hops);
+                                  : (max_hop_seen_ ? static_cast<uint8_t>(max_hop_seen_ + 1) : 1);
         for (auto it = pending.begin(); it != pending.end();) {
             if (now - it->second.sent_at >= timeout) {
                 uint8_t hop = it->second.hop;

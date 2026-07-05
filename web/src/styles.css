@@ -273,3 +273,33 @@ aside li:hover .card-pause, aside li.sel .card-pause { opacity: .8; }
 
 /* Inline config validation errors (added) */
 .cfg-errs div { margin-top: 2px; }
+
+/* ── Tab bar + tool pages (added) ─────────────────────────────────────── */
+.tabbar { display: flex; gap: 4px; padding: 6px 10px 0; border-bottom: 1px solid var(--border);
+  background: var(--panel2); }
+.tab { background: transparent; border: 1px solid transparent; border-bottom: none; color: var(--muted);
+  padding: 7px 14px; border-radius: 8px 8px 0 0; font-size: 13px; cursor: pointer; }
+.tab:hover { color: var(--text); background: var(--btn-hover); box-shadow: none; }
+.tab.active { color: var(--text); background: var(--bg); border-color: var(--border);
+  position: relative; top: 1px; font-weight: 600; }
+.toolpage { padding: 18px 22px; max-width: 900px; }
+.toolpage h2 { margin: 0 0 14px; font-size: 18px; }
+.tool-row { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.tool-row label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+.tool-row input { background: var(--btn-bg); border: 1px solid var(--border2); color: var(--text);
+  border-radius: 8px; padding: 7px 9px; font-size: 13px; }
+.tool-row input.target { min-width: 320px; }
+.tool-console { background: #05070c; color: #d6e2ff; border: 1px solid var(--border2); border-radius: 10px;
+  padding: 12px 14px; font: 12.5px/1.5 ui-monospace, 'Cascadia Code', Consolas, monospace; white-space: pre-wrap;
+  min-height: 240px; max-height: 60vh; overflow: auto; }
+.tool-card { background: var(--panel); border: 1px solid var(--border2); border-radius: 10px; padding: 12px 14px; margin-top: 12px; }
+.tool-card h4 { margin: 0 0 8px; font-size: 13px; }
+.tool-note { background: var(--panel); border: 1px dashed var(--border2); border-radius: 10px; padding: 16px; color: var(--muted); }
+.dns-recs > div { display: flex; align-items: center; gap: 8px; padding: 3px 0; flex-wrap: wrap; }
+.dns-recs .rec-t { display: inline-block; min-width: 56px; font-size: 11px; font-weight: 700; color: var(--accent); }
+.dns-recs code { background: var(--btn-bg); border: 1px solid var(--border); border-radius: 6px; padding: 2px 7px; font-size: 12.5px; }
+.ports { display: flex; flex-wrap: wrap; gap: 8px; }
+.port-chip { background: color-mix(in srgb, var(--accent) 15%, var(--panel)); border: 1px solid var(--border2);
+  border-radius: 8px; padding: 4px 9px; font-size: 12.5px; }
+.port-chip em { color: var(--muted); font-style: normal; margin-left: 6px; }
+.toolpage .danger { color: var(--danger); }

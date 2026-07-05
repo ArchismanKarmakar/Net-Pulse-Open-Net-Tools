@@ -3,6 +3,7 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
 } from 'recharts'
 import * as bgp from './bgp'
+import ReactDOM from 'react-dom'
 
 const FOCUS = [
   ['Last 5 sec', 5], ['Last 10 sec', 10], ['Last 30 sec', 30],
@@ -215,7 +216,7 @@ function MenuBar({ menus }) {
 
 export default function App() {
   const [form, setForm] = useState({ target: '', family: 'auto', probe: 1, trace: 30, timeout: 0, payload: 56, maxhops: 30, raw: true })
-  const [focusIdx, setFocusIdx] = useState(6) // Last 10 min
+  const [focusIdx, setFocusIdx] = useState(2) // Last 30 sec
   const [overlay, setOverlay] = useState(false)
   const [alerts, setAlerts] = useState({ on: true, ms: 150, loss: 5 })
   const [state, setState] = useState({ targets: [] })
@@ -228,6 +229,8 @@ export default function App() {
   const [view, setView] = useState({ trend: true, latency: false })
   const [editing, setEditing] = useState(false)
   const [editForm, setEditForm] = useState(null)
+  const [tool, setTool] = useState(null)
+  const [tab, setTab] = useState('path') // 'path' (traceroute/MTR home) | 'ping' | 'dns' | 'ports'
   const [theme, setTheme] = useState(() => { try { return localStorage.getItem('np-theme') || 'dark' } catch { return 'dark' } })
   const chartRef = useRef(null)
 
@@ -312,7 +315,9 @@ export default function App() {
     }
     const now = Date.now() / 1000
     const probe = (t.config && t.config.probe) ? Number(t.config.probe) : 1
-    const grace = Math.max(2.0, probe * 3) // at least 2s, or 3× the probe interval
+    const baseGrace = Math.max(3.0, probe * 3) // at least 3s, or 3× the probe interval
+    const extraIpv6 = t.family === 'v6' ? 2.0 : 0.0
+    const grace = baseGrace + extraIpv6
     if (!frontierNoReplyAt.current[t.id]) frontierNoReplyAt.current[t.id] = now
     const elapsed = now - frontierNoReplyAt.current[t.id]
     return elapsed < grace
@@ -367,6 +372,11 @@ export default function App() {
   const sel = targets.find((t) => t.id === selId) || targets[0]
 
   const isAlerting = (h) => alerts.on && ((h.avg != null && h.avg > alerts.ms) || (h.sent > 0 && h.loss > alerts.loss))
+
+  const familyLabel = (actual, pref) => {
+    if (!actual) return pref || 'auto'
+    return pref && pref !== actual ? `${actual} (${pref})` : actual
+  }
 
   // Per-hop status dot (breakpoint-style). Intermediate hops that never answer
   // (100% loss) are GREY, not red — routers commonly deprioritise ICMP, so that
@@ -616,7 +626,40 @@ export default function App() {
     }
     // ─────────────────────────────────────────────────────────────────────────
 
-    const q = new URLSearchParams({ target: form.target.trim(), family: form.family, probe: form.probe, trace: form.trace, timeout: form.timeout, payload: form.payload, maxhops: form.maxhops, raw: form.raw ? '1' : '0' })
+    // Auto-translate / family-mismatch handling for literal IPs.
+    let targetText = form.target.trim()
+    const isIPv4Literal = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(targetText)
+    const isIPv6Literal = targetText.includes(':') && !targetText.includes(' ')
+    if (isIPv4Literal && form.family === 'v6') {
+      const ok = window.confirm('You entered an IPv4 address but selected IPv6.\n\nWould you like to translate to an IPv4-mapped IPv6 address (::ffff:a.b.c.d) and probe as IPv6?\n\nCancel will fall back to IPv4 family instead.')
+      if (ok) {
+        targetText = '::ffff:' + targetText
+      } else {
+        // fallback to IPv4 family
+        form.family = 'v4'
+        setForm({ ...form, family: 'v4' })
+      }
+    }
+    if (isIPv6Literal && form.family === 'v4') {
+      // If it's an IPv4-mapped IPv6 address, allow translating back to IPv4.
+      const m = targetText.match(/::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/)
+      if (m) {
+        const ok = window.confirm('You entered an IPv6 address that embeds an IPv4 address.\n\nTranslate to the embedded IPv4 and probe as IPv4?\n\nCancel will use IPv6 family instead.')
+        if (ok) {
+          targetText = m[1]
+        } else {
+          form.family = 'v6'
+          setForm({ ...form, family: 'v6' })
+        }
+      } else {
+        // Cannot translate arbitrary IPv6 → IPv4; switch family to v6.
+        alert('Cannot translate a generic IPv6 address to IPv4. The trace will use IPv6 family instead.')
+        form.family = 'v6'
+        setForm({ ...form, family: 'v6' })
+      }
+    }
+
+    const q = new URLSearchParams({ target: targetText, family: form.family, probe: form.probe, trace: form.trace, timeout: form.timeout, payload: form.payload, maxhops: form.maxhops, raw: form.raw ? '1' : '0' })
     if (iface) q.set('src', iface)
     const r = await api(`/api/add?${q}`, { method: 'POST' })
     setForm({ ...form, target: '' })
@@ -625,6 +668,12 @@ export default function App() {
       setSelId(r.id); setSelHop(null)
     }
   }
+
+  const openTool = (name) => {
+    setTool(name)
+  }
+
+  const closeTool = () => setTool(null)
 
   // ── Protected session-file format ─────────────────────────────────────────
   // The .npulse binary format is a simple authenticated-encryption envelope so
@@ -869,9 +918,14 @@ export default function App() {
         },
         {
           label: 'Tools', items: [
-            { label: 'Quick trace 1.1.1.1 (Cloudflare)', onClick: () => addTargetHost('1.1.1.1') },
-            { label: 'Quick trace 8.8.8.8 (Google)', onClick: () => addTargetHost('8.8.8.8') },
-            { label: 'Quick trace 9.9.9.9 (Quad9)', onClick: () => addTargetHost('9.9.9.9') },
+            { label: 'Path / MTR (home)', checked: tab === 'path', onClick: () => setTab('path') },
+            { label: 'Ping', checked: tab === 'ping', onClick: () => setTab('ping') },
+            { label: 'DNS Lookup (forward/reverse)', checked: tab === 'dns', onClick: () => setTab('dns') },
+            { label: 'Port Scanner', checked: tab === 'ports', onClick: () => setTab('ports') },
+            { sep: true },
+            { label: 'Quick trace 1.1.1.1 (Cloudflare)', onClick: () => { setTab('path'); addTargetHost('1.1.1.1') } },
+            { label: 'Quick trace 8.8.8.8 (Google)', onClick: () => { setTab('path'); addTargetHost('8.8.8.8') } },
+            { label: 'Quick trace 9.9.9.9 (Quad9)', onClick: () => { setTab('path'); addTargetHost('9.9.9.9') } },
             { sep: true },
             { label: 'Edit config (selected)…', onClick: () => { if (sel) { setEditForm({ probe: sel.config.probe, timeout: sel.config.timeout, payload: sel.config.payload, maxhops: sel.config.maxhops, family: sel.config.family, src: sel.config.src }); setEditErrs({}); setEditing(true) } }, disabled: !sel },
           ],
@@ -892,6 +946,15 @@ export default function App() {
           </div>
         </div>
       )}
+      <nav className="tabbar">
+        {[['path', '🌐 Path / MTR'], ['ping', '📡 Ping'], ['dns', '🔎 DNS Lookup'], ['ports', '🔌 Port Scanner']].map(([id, label]) => (
+          <button key={id} className={'tab' + (tab === id ? ' active' : '')} onClick={() => setTab(id)}>{label}</button>
+        ))}
+      </nav>
+      {tab === 'ping' && <PingPage />}
+      {tab === 'dns' && <DnsPage />}
+      {tab === 'ports' && <PortScanPage />}
+      {tab === 'path' && (<>
       <header>
         <h1 style={{ display: 'flex', alignItems: 'center', gap: '9px' }}>
           <svg width="24" height="24" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style={{ display: 'block', flexShrink: 0 }}>
@@ -1000,7 +1063,7 @@ export default function App() {
                       onClick={(e) => { e.stopPropagation(); ctrl(t.id, 'remove').then(() => { if (isSel) setSelId(null); refreshState() }) }}
                     >✕</button>
                   </div>
-                  <small>{t.dest_ip} {t.family}{t.paused ? ' · paused' : ''}</small>
+                  <small>{t.dest_ip} {familyLabel(t.family, t.config?.family)}{t.paused ? ' · paused' : ''}</small>
                   {d && (
                     <div className="grid grid-cols-3 gap-x-2.5 gap-y-0.5 mt-1.5 pt-1.5 border-t border-border text-[10px] font-mono text-muted">
                       <span>min <b className="text-ink">{fmt(d.min)}</b></span>
@@ -1042,7 +1105,7 @@ export default function App() {
           {!sel ? <div className="empty">Add a target to begin.</div> : (
             <>
               <div className="statusbar">
-                <b>{sel.name}</b> → {sel.dest_ip || 'resolving…'} <span className="badge">{sel.family}</span> · {sel.hops.length} hops
+                <b>{sel.name}</b> → {sel.dest_ip || 'resolving…'} <span className="badge">{familyLabel(sel.family, sel.config?.family)}</span> · {sel.hops.length} hops
                 {isDiscovering(sel) && !sel.error && (
                   <span className="badge inline-flex items-center align-middle" title="Discovering the route: resolving the destination and probing each hop. Each hop's first few real replies are used only to establish its address/route and aren't shown as stats yet, so an unrepresentative first reading isn't displayed as if it were typical. Clears per-hop as soon as real data is available.">
                     <span className="spinner sm" style={{ marginRight: 5 }} />
@@ -1091,7 +1154,11 @@ export default function App() {
                   <label>Interface
                     <select value={editForm.src} onChange={(e) => setEditForm({ ...editForm, src: e.target.value })}>
                       <option value="">Auto (default route)</option>
-                      {interfaces.filter((i) => editForm.family === 'auto' || (editForm.family === 'v6') === i.v6).map((i, k) => <option key={k} value={i.address}>{i.name} — {i.address}</option>)}
+                      {(() => {
+                        const effectiveFamily = editForm.family === 'auto' && sel ? sel.family : editForm.family
+                        return interfaces.filter((i) => effectiveFamily === 'auto' || (effectiveFamily === 'v6') === i.v6)
+                          .map((i, k) => <option key={k} value={i.address}>{i.name} — {i.address}</option>)
+                      })()}
                     </select>
                   </label>
                   <button className="apply" onClick={applyUpdate}>Apply (live)</button>
@@ -1178,6 +1245,140 @@ export default function App() {
 
         <Drawer detail={detail} onClose={() => setDetail(null)} />
       </div>
+      </>)}
+    </div>
+  )
+}
+
+// --- Tool pages ----------------------------------------------------------
+const toolsApi = () => (typeof window !== 'undefined' && window.netpulse && window.netpulse.tools) || null
+
+function ToolUnavailable() {
+  return <div className="tool-note">These tools run in the desktop app (they use the OS network stack). Open Net&nbsp;Pulse as the Electron app to use them.</div>
+}
+
+// Cmd-style ping — streams real `ping` output from the OS.
+function PingPage() {
+  const [host, setHost] = React.useState('')
+  const [count, setCount] = React.useState(10)
+  const [lines, setLines] = React.useState([])
+  const [running, setRunning] = React.useState(false)
+  const idRef = React.useRef(null)
+  const preRef = React.useRef(null)
+  React.useEffect(() => {
+    const t = toolsApi(); if (!t) return
+    const off1 = t.onPingLine(({ id, line }) => { if (id === idRef.current) setLines((L) => [...L, line]) })
+    const off2 = t.onPingDone(({ id }) => { if (id === idRef.current) setRunning(false) })
+    return () => { off1 && off1(); off2 && off2() }
+  }, [])
+  React.useEffect(() => { if (preRef.current) preRef.current.scrollTop = preRef.current.scrollHeight }, [lines])
+  const start = async () => {
+    const t = toolsApi(); if (!t || !host.trim()) return
+    setLines([]); setRunning(true)
+    const { id, error } = await t.pingStart(host.trim(), count)
+    if (error) { setLines([error]); setRunning(false); return }
+    idRef.current = id
+  }
+  const stop = async () => { const t = toolsApi(); if (t && idRef.current) await t.pingStop(idRef.current); setRunning(false) }
+  if (!toolsApi()) return <div className="toolpage"><h2>Ping</h2><ToolUnavailable /></div>
+  return (
+    <div className="toolpage">
+      <h2>Ping</h2>
+      <div className="tool-row">
+        <label>Host / IP <input className="target" value={host} placeholder="1.1.1.1, 2606:4700:4700::1111, example.com"
+          onChange={(e) => setHost(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && !running && start()} /></label>
+        <label>Count <input type="number" min="1" max="100" value={count} onChange={(e) => setCount(+e.target.value)} style={{ width: 70 }} /></label>
+        {running ? <button onClick={stop}>■ Stop</button> : <button className="primary" onClick={start}>▶ Ping</button>}
+      </div>
+      <pre ref={preRef} className="tool-console">{lines.join('') || 'Enter a host and press Ping.'}</pre>
+    </div>
+  )
+}
+
+// Forward + reverse DNS.
+function DnsPage() {
+  const [q, setQ] = React.useState('')
+  const [fwd, setFwd] = React.useState(null)
+  const [rev, setRev] = React.useState(null)
+  const [busy, setBusy] = React.useState(false)
+  const isIp = (s) => /:/.test(s) || /^\d{1,3}(\.\d{1,3}){3}$/.test(s)
+  const run = async () => {
+    const t = toolsApi(); if (!t || !q.trim()) return
+    setBusy(true); setFwd(null); setRev(null)
+    const query = q.trim()
+    try {
+      if (isIp(query)) { setRev(await t.reverse(query)); const names = (await t.reverse(query)).names; if (names && names[0]) setFwd(await t.dns(names[0])) }
+      else { setFwd(await t.dns(query)); const a = (await t.dns(query)); const first = (a.a[0] || a.aaaa[0]); if (first) setRev(await t.reverse(first)) }
+    } catch (e) { setFwd({ error: String(e) }) }
+    setBusy(false)
+  }
+  if (!toolsApi()) return <div className="toolpage"><h2>DNS Lookup</h2><ToolUnavailable /></div>
+  return (
+    <div className="toolpage">
+      <h2>DNS Lookup <span className="muted" style={{ fontWeight: 400 }}>— forward &amp; reverse</span></h2>
+      <div className="tool-row">
+        <label>Host or IP <input className="target" value={q} placeholder="example.com or 1.1.1.1"
+          onChange={(e) => setQ(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && run()} /></label>
+        <button className="primary" onClick={run} disabled={busy}>{busy ? 'Looking up…' : 'Lookup'}</button>
+      </div>
+      {fwd && (
+        <div className="tool-card">
+          <h4>Forward {fwd.name ? `(${fwd.name})` : ''}</h4>
+          {fwd.error ? <div className="danger">{fwd.error}</div> : (
+            <div className="dns-recs">
+              <div><span className="rec-t">A</span>{(fwd.a && fwd.a.length) ? fwd.a.map((x, i) => <code key={i}>{x}</code>) : <span className="muted">none</span>}</div>
+              <div><span className="rec-t">AAAA</span>{(fwd.aaaa && fwd.aaaa.length) ? fwd.aaaa.map((x, i) => <code key={i}>{x}</code>) : <span className="muted">none</span>}</div>
+              {fwd.cname && fwd.cname.length > 0 && <div><span className="rec-t">CNAME</span>{fwd.cname.map((x, i) => <code key={i}>{x}</code>)}</div>}
+            </div>
+          )}
+        </div>
+      )}
+      {rev && (
+        <div className="tool-card">
+          <h4>Reverse ({rev.addr})</h4>
+          {rev.error ? <div className="muted">{rev.error}</div>
+            : (rev.names && rev.names.length) ? <div className="dns-recs"><div><span className="rec-t">PTR</span>{rev.names.map((x, i) => <code key={i}>{x}</code>)}</div></div>
+            : <span className="muted">no PTR record</span>}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// TCP connect port scanner.
+function PortScanPage() {
+  const [host, setHost] = React.useState('')
+  const [start, setStart] = React.useState(1)
+  const [end, setEnd] = React.useState(1024)
+  const [res, setRes] = React.useState(null)
+  const [busy, setBusy] = React.useState(false)
+  const COMMON = { 20: 'ftp-data', 21: 'ftp', 22: 'ssh', 23: 'telnet', 25: 'smtp', 53: 'dns', 80: 'http', 110: 'pop3', 143: 'imap', 443: 'https', 445: 'smb', 3306: 'mysql', 3389: 'rdp', 5432: 'postgres', 6379: 'redis', 8080: 'http-alt', 8443: 'https-alt' }
+  const run = async () => {
+    const t = toolsApi(); if (!t || !host.trim()) return
+    setBusy(true); setRes(null)
+    setRes(await t.portscan(host.trim(), start, end))
+    setBusy(false)
+  }
+  if (!toolsApi()) return <div className="toolpage"><h2>Port Scanner</h2><ToolUnavailable /></div>
+  return (
+    <div className="toolpage">
+      <h2>Port Scanner <span className="muted" style={{ fontWeight: 400 }}>— TCP connect</span></h2>
+      <div className="tool-row">
+        <label>Host / IP <input className="target" value={host} placeholder="192.168.1.1 or example.com"
+          onChange={(e) => setHost(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && !busy && run()} /></label>
+        <label>From <input type="number" min="1" max="65535" value={start} onChange={(e) => setStart(+e.target.value)} style={{ width: 80 }} /></label>
+        <label>To <input type="number" min="1" max="65535" value={end} onChange={(e) => setEnd(+e.target.value)} style={{ width: 80 }} /></label>
+        <button className="primary" onClick={run} disabled={busy}>{busy ? 'Scanning…' : 'Scan'}</button>
+      </div>
+      <div className="muted" style={{ fontSize: 12, margin: '2px 0 8px' }}>Ranges are capped at 2048 ports per scan. Scan only hosts you own or are authorized to test.</div>
+      {res && (res.error ? <div className="danger">{res.error}</div> : (
+        <div className="tool-card">
+          <h4>{res.open.length} open {res.open.length === 1 ? 'port' : 'ports'} in {res.scanned[0]}–{res.scanned[1]} on {res.host}</h4>
+          {res.open.length === 0 ? <span className="muted">No open TCP ports found in range.</span> : (
+            <div className="ports">{res.open.map((p) => <span key={p} className="port-chip"><b>{p}</b>{COMMON[p] ? <em>{COMMON[p]}</em> : null}</span>)}</div>
+          )}
+        </div>
+      ))}
     </div>
   )
 }

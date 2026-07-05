@@ -87,6 +87,12 @@ private:
     bool rebuild_needed_ = false;  // family/source changed → rebuild socket
     std::optional<std::string> dest_;
     std::optional<Family> family_;
+    // Resolved A/AAAA addresses (if any) for the target. Stored so run()
+    // can attempt a pragmatic fallback if the preferred family proves
+    // unusable at startup (avoids showing false initial loss when a hostname
+    // has both records but one family is unreachable).
+    std::optional<std::string> resolved_v4_;
+    std::optional<std::string> resolved_v6_;
     uint16_t icmp_id_;
     uint16_t seq_ = 0;
     std::map<uint8_t, HopStats> hops_;

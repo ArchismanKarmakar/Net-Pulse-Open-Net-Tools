@@ -37,6 +37,15 @@ static Settings settings_from_obj(const Napi::Object& o, Settings base = Setting
     // for large-packet / MTU testing. Clamped so garbage input can't request a
     // multi-gigabyte buffer.
     base.payload_size = static_cast<size_t>(clamp(num("payload", static_cast<double>(base.payload_size)), 0.0, 65500.0));
+    // On Windows, unprivileged dgram-mode probing cannot reliably send very
+    // large ICMP payloads. Clamp non-privileged payloads to a conservative
+    // size (observed behaviour) so probes don't silently fail. Raw mode still
+    // allows larger sizes when run as admin.
+#ifdef _WIN32
+    if (!base.privileged) {
+        base.payload_size = std::min<size_t>(base.payload_size, 1432);
+    }
+#endif
     base.max_hops = static_cast<uint8_t>(clamp(num("maxhops", static_cast<double>(base.max_hops)), 1.0, 64.0));
     if (o.Has("raw")) base.privileged = o.Get("raw").ToBoolean().Value();
     if (o.Has("src")) {
@@ -151,7 +160,20 @@ static Napi::Value GetState(const Napi::CallbackInfo& info) {
     return worker->GetPromise();
 }
 
+// Bump this whenever the native engine changes so a rebuild can be verified at
+// runtime. If the banner below doesn't print (or `netpulse.engineBuild` differs)
+// after building, the .node addon was NOT recompiled — restarting Electron alone
+// keeps the old binary.
+#define NETPULSE_ENGINE_BUILD "2026-07-ipv6-startup-loss-fix"
+
+static Napi::Value EngineBuild(const Napi::CallbackInfo& info) {
+    return Napi::String::New(info.Env(), NETPULSE_ENGINE_BUILD);
+}
+
 static Napi::Object Init(Napi::Env env, Napi::Object exports) {
+    fprintf(stderr, "[Net Pulse] native engine loaded — build %s\n", NETPULSE_ENGINE_BUILD);
+    exports.Set("engineBuild", Napi::String::New(env, NETPULSE_ENGINE_BUILD));
+    exports.Set("getEngineBuild", Napi::Function::New(env, EngineBuild));
     exports.Set("addTarget", Napi::Function::New(env, AddTarget));
     exports.Set("updateTarget", Napi::Function::New(env, UpdateTarget));
     exports.Set("pauseTarget", Napi::Function::New(env, PauseTarget));

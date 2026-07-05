@@ -20,7 +20,7 @@
     "tailwindcss": "^3.4.19",
     "vite": "^5.4.10"
   },
-  "license": "MIT",
+  "license": "AGPL-3.0-or-later",
   "author": "Archisman Karmakar",
   "description": "Net Pulse — Open Net Tools: React UI"
 }

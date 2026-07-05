@@ -103,6 +103,8 @@ struct WebTarget {
     std::map<uint8_t, SampleBuf> series;
     std::map<uint8_t, int> discovery_count;            // per-hop, see kDiscoveryDropCount below
     std::map<uint8_t, double> discovery_first_reply_at; // time of the first real reply for each hop
+    std::map<uint8_t, double> discovery_first_seen_at;  // time of the first sample (reply OR loss) for each hop
+    std::optional<uint8_t> dest_reset_for;              // dest hop whose discovery-burst samples we've already discarded
     ~WebTarget() {
         if (stop) stop->store(true);
         if (th.joinable()) th.join();
@@ -128,6 +130,20 @@ struct WebTarget {
 // otherwise leave the UI without any stats for many seconds. In that case we
 // stop suppressing after a short grace window so the chart still begins
 // showing data promptly.
+//
+// The SAME settling window is applied to a hop's early LOSSES, not just its
+// replies. This is what fixes the "IPv6 hostname target starts at 100% loss
+// for 3–5 s, then recovers" report: IPv6 paths (e.g. Cloudflare / BSNL) tend to
+// rate-limit the initial probe burst that discovers the route, so a hop's first
+// couple of probes are dropped by the network. If those losses were recorded
+// immediately while the hop's genuine early replies are still being held back
+// for settling, the hop reads as 100% loss until the reply-drop clears — which
+// is exactly why IPv6 flashed loss at startup but IPv4 (whose initial probes
+// weren't dropped) did not. By holding a hop's early losses for the same
+// per-hop window, a hop stays blank ("discovering") until it has either
+// produced kDiscoveryDropCount real replies or kDiscoveryDropMaxSecs has
+// elapsed since it was first seen — after which losses record normally, so a
+// genuinely unreachable hop still surfaces its 100% loss a few seconds in.
 constexpr int kDiscoveryDropCount = 3;
 constexpr double kDiscoveryDropMaxSecs = 5.0;
 
@@ -226,22 +242,63 @@ public:
                 // reply was shifting up to 200,000 elements to make room.
                 size_t cap = sample_cap_for(sess->settings_snapshot().probe_interval);
                 for (const auto& np : snap.new_points) {
-                    // Only REAL replies count toward a hop's discovery budget
-                    // and get gated — loss/timeout entries always record
-                    // immediately, so a genuinely unreachable hop still shows
-                    // its 100%-loss status right away instead of looking
-                    // blank while "discovering" (it will never clear a
-                    // reply-based gate, since it never replies at all).
+                    // First time we see ANY sample (reply or loss) for this hop,
+                    // record when — this bounds the per-hop settling window for
+                    // losses too (see the note above kDiscoveryDropCount).
+                    if (!raw->discovery_first_seen_at.count(np.hop))
+                        raw->discovery_first_seen_at[np.hop] = np.ts;
+                    double seen_elapsed = np.ts - raw->discovery_first_seen_at[np.hop];
+
                     if (np.rtt.has_value()) {
+                        // Real reply: hold this hop's first kDiscoveryDropCount
+                        // replies for settling (unrepresentative first-hit RTTs).
                         int& n = raw->discovery_count[np.hop];
                         if (n == 0) raw->discovery_first_reply_at[np.hop] = np.ts;
                         ++n;
                         double elapsed = np.ts - raw->discovery_first_reply_at[np.hop];
                         if (n <= kDiscoveryDropCount && elapsed < kDiscoveryDropMaxSecs) continue; // still settling this hop — don't expose yet
+                    } else {
+                        // Loss/timeout: hold a hop's EARLY losses for the same
+                        // settling window so a rate-limited initial burst (the
+                        // IPv6 startup case) doesn't read as 100% loss before the
+                        // hop has had a fair chance to answer. Once the hop has
+                        // produced kDiscoveryDropCount real replies, OR the grace
+                        // window has elapsed since it was first seen, losses
+                        // record normally — so a genuinely unreachable hop still
+                        // surfaces its 100% loss shortly after.
+                        int replies = raw->discovery_count.count(np.hop) ? raw->discovery_count[np.hop] : 0;
+                        if (replies < kDiscoveryDropCount && seen_elapsed < kDiscoveryDropMaxSecs) continue; // still settling — suppress early loss
                     }
                     auto& v = raw->series[np.hop];
                     if (v.empty() || v.back().first != np.ts) v.emplace_back(np.ts, np.rtt);
                     while (v.size() > cap) v.pop_front();
+                }
+
+                // Root-cause fix for the "IPv6 target starts at 100% loss, then
+                // recovers" report. While the route is still being discovered,
+                // the engine fans probes out across many TTLs at once, and EVERY
+                // TTL at or beyond the destination's distance reaches the
+                // destination itself — so the destination is hit by a burst of
+                // echo requests during discovery. IPv6 anycast destinations
+                // (Cloudflare/Google) rate-limit ICMPv6 echo far more
+                // aggressively than their IPv4 counterparts, so that burst is
+                // partially dropped and the destination hop's FIRST samples are
+                // burst-induced losses rather than steady state. IPv4 dests
+                // (e.g. 1.1.1.1) absorb the same burst without dropping, which is
+                // exactly why IPv4 never showed the startup loss and IPv6 did.
+                // The moment the destination is confirmed (dest_hop known), the
+                // fan-out stops (max_hop collapses to the dest) and probing drops
+                // to one packet per interval — steady state. So we discard the
+                // destination hop's discovery-phase samples once, letting it
+                // measure fresh from that point. Family-agnostic, but only IPv6
+                // actually had burst losses to discard.
+                if (snap.dest_hop && raw->dest_reset_for != snap.dest_hop) {
+                    uint8_t dh = *snap.dest_hop;
+                    raw->series.erase(dh);
+                    raw->discovery_count.erase(dh);
+                    raw->discovery_first_seen_at.erase(dh);
+                    raw->discovery_first_reply_at.erase(dh);
+                    raw->dest_reset_for = snap.dest_hop;
                 }
                 raw->latest = snap;
                 raw->has = true;

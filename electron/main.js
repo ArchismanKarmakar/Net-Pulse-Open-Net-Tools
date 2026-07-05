@@ -19,7 +19,15 @@ function loadEngine() {
     path.join(process.resourcesPath || '', 'app.asar.unpacked', 'napi'),
   ]
   for (const dir of candidates) {
-    try { return require(dir) } catch (_) { /* next */ }
+    try {
+      const mod = require(dir)
+      if (mod) {
+        const build = (mod.engineBuild || (mod.getEngineBuild && mod.getEngineBuild())) || 'unknown'
+        console.log(`[Net Pulse] engine build: ${build}`)
+        if (build === 'unknown') console.warn('[Net Pulse] engine has no build tag — this is an OLD addon; run build-and-run to recompile it.')
+      }
+      return mod
+    } catch (_) { /* next */ }
   }
   return null
 }
@@ -33,11 +41,103 @@ function distDir() {
 function registerEngineIpc() {
   ipcMain.handle('np:getState', (_e, focus) => engine.getStateJSON(focus))
   ipcMain.handle('np:interfaces', () => engine.listInterfaces())
+  ipcMain.handle('np:engineBuild', () => (engine && (engine.engineBuild || (engine.getEngineBuild && engine.getEngineBuild()))) || 'unknown')
   ipcMain.handle('np:add', (_e, opts) => engine.addTarget(opts))
   ipcMain.handle('np:update', (_e, id, opts) => engine.updateTarget(id, opts))
   ipcMain.handle('np:pause', (_e, id, on) => engine.pauseTarget(id, on))
   ipcMain.handle('np:stop', (_e, id) => engine.stopTarget(id))
   ipcMain.handle('np:remove', (_e, id) => engine.removeTarget(id))
+
+  // ── Network tools (Node built-ins; no C++ engine needed) ──────────────────
+  const dns = require('dns')
+  const net = require('net')
+  const { spawn } = require('child_process')
+
+  const isHostish = (s) => typeof s === 'string' && /^[a-zA-Z0-9._:\-\[\]]{1,255}$/.test(s.trim())
+
+  // Forward DNS: resolve a name to A + AAAA records.
+  ipcMain.handle('np:tools:dns', async (_e, name) => {
+    name = String(name || '').trim()
+    if (!isHostish(name)) return { error: 'Invalid host name' }
+    const out = { name, a: [], aaaa: [], cname: [], error: null }
+    const tryResolve = (fn, key) => new Promise((res) => fn(name, (err, recs) => { if (!err && recs) out[key] = recs; res() }))
+    try {
+      await Promise.all([
+        tryResolve(dns.resolve4, 'a'),
+        tryResolve(dns.resolve6, 'aaaa'),
+        tryResolve(dns.resolveCname, 'cname'),
+      ])
+      if (!out.a.length && !out.aaaa.length) {
+        // fall back to a plain lookup (covers hosts files / single-record cases)
+        await new Promise((res) => dns.lookup(name, { all: true }, (err, addrs) => {
+          if (!err && addrs) for (const a of addrs) (a.family === 6 ? out.aaaa : out.a).push(a.address)
+          res()
+        }))
+      }
+    } catch (e) { out.error = String(e && e.message || e) }
+    return out
+  })
+
+  // Reverse DNS: address → PTR names.
+  ipcMain.handle('np:tools:reverse', async (_e, addr) => {
+    addr = String(addr || '').trim()
+    if (!isHostish(addr)) return { addr, names: [], error: 'Invalid address' }
+    return new Promise((res) => dns.reverse(addr, (err, names) => res({ addr, names: names || [], error: err ? String(err.message) : null })))
+  })
+
+  // TCP port scan: connect-scan a range, bounded and rate-safe.
+  ipcMain.handle('np:tools:portscan', async (_e, host, startPort, endPort) => {
+    host = String(host || '').trim()
+    let s = Math.max(1, Math.min(65535, parseInt(startPort, 10) || 1))
+    let e = Math.max(1, Math.min(65535, parseInt(endPort, 10) || 1024))
+    if (e < s) [s, e] = [e, s]
+    if (e - s > 2048) e = s + 2048 // cap the range so a scan can't run unbounded
+    if (!isHostish(host)) return { host, open: [], error: 'Invalid host' }
+    const ports = []; for (let p = s; p <= e; p++) ports.push(p)
+    const open = []
+    const CONCURRENCY = 200, TIMEOUT = 800
+    let idx = 0
+    const worker = () => new Promise((resolveW) => {
+      const next = () => {
+        if (idx >= ports.length) return resolveW()
+        const port = ports[idx++]
+        const sock = new net.Socket()
+        let done = false
+        const finish = (isOpen) => { if (done) return; done = true; try { sock.destroy() } catch {} ; if (isOpen) open.push(port); next() }
+        sock.setTimeout(TIMEOUT)
+        sock.once('connect', () => finish(true))
+        sock.once('timeout', () => finish(false))
+        sock.once('error', () => finish(false))
+        try { sock.connect(port, host) } catch { finish(false) }
+      }
+      next()
+    })
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, ports.length) }, worker))
+    open.sort((a, b) => a - b)
+    return { host, scanned: [s, e], open, error: null }
+  })
+
+  // Ping a single host using the OS `ping` (authentic cmd-style output). Args
+  // are passed as an array (never a shell string) so the validated host can't
+  // inject. Streams lines back to the renderer over 'np:tools:ping:line'.
+  const pingProcs = new Map()
+  ipcMain.handle('np:tools:ping:start', (_e, host, count) => {
+    host = String(host || '').trim()
+    if (!isHostish(host)) return { id: null, error: 'Invalid host' }
+    const n = Math.max(1, Math.min(100, parseInt(count, 10) || 10))
+    const isWin = process.platform === 'win32'
+    const args = isWin ? ['-n', String(n), host] : ['-c', String(n), host]
+    const id = Math.random().toString(36).slice(2)
+    let proc
+    try { proc = spawn('ping', args, { windowsHide: true }) } catch (e) { return { id: null, error: String(e.message) } }
+    pingProcs.set(id, proc)
+    const send = (chunk, stream) => { if (win && !win.isDestroyed()) win.webContents.send('np:tools:ping:line', { id, line: chunk.toString(), stream }) }
+    proc.stdout.on('data', (d) => send(d, 'out'))
+    proc.stderr.on('data', (d) => send(d, 'err'))
+    proc.on('close', (code) => { pingProcs.delete(id); if (win && !win.isDestroyed()) win.webContents.send('np:tools:ping:done', { id, code }) })
+    return { id, error: null }
+  })
+  ipcMain.handle('np:tools:ping:stop', (_e, id) => { const p = pingProcs.get(id); if (p) { try { p.kill() } catch {} pingProcs.delete(id) } return true })
 }
 
 function applyContentSecurityPolicy() {

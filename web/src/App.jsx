@@ -21,7 +21,7 @@ const SCALE_STEPS = [25, 50, 75, 100, 150, 200, 300, 500, 750, 1000, 1500, 2000,
 // removing it makes that guarantee explicit instead of implicit.
 const api = async (path, opts) => {
   const np = (typeof window !== 'undefined') && window.netpulse
-  if (!np) throw new Error('NetPulse native engine (window.netpulse) is not available — this UI must run inside the NetPulse Electron app.')
+  if (!np) throw new Error('Net Pulse native engine (window.netpulse) is not available — this UI must run inside the Net Pulse — Open Net Tools desktop app.')
   if (!path.startsWith('/api/')) throw new Error(`api(): unexpected path ${path}`)
   const [base, qs] = path.split('?')
   const q = {}; new URLSearchParams(qs || '').forEach((v, k) => { q[k] = v })
@@ -749,7 +749,26 @@ export default function App() {
   return (
     <div className="app">
       <header>
-        <h1>NetPulse <span>— Path Latency Studio</span>
+        <h1 style={{ display: 'flex', alignItems: 'center', gap: '9px' }}>
+          <svg width="24" height="24" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style={{ display: 'block', flexShrink: 0 }}>
+            <defs>
+              <linearGradient id="npPulse" x1="72" y1="256" x2="440" y2="256" gradientUnits="userSpaceOnUse">
+                <stop offset="0" stopColor="#22d3ee"/><stop offset="0.55" stopColor="#38e0d6"/><stop offset="1" stopColor="#4f7cff"/>
+              </linearGradient>
+              <radialGradient id="npNode" cx="0.5" cy="0.5" r="0.5">
+                <stop offset="0" stopColor="#eafcff"/><stop offset="0.4" stopColor="#5ff0ff"/><stop offset="1" stopColor="#22d3ee"/>
+              </radialGradient>
+            </defs>
+            <rect x="16" y="16" width="480" height="480" rx="112" fill="#0c1524"/>
+            <rect x="16.5" y="16.5" width="479" height="479" rx="111.5" fill="none" stroke="#22d3ee" strokeOpacity="0.16" strokeWidth="3"/>
+            <g stroke="#22d3ee" fill="none">
+              <circle cx="360" cy="196" r="46" strokeOpacity="0.30" strokeWidth="7"/>
+              <circle cx="360" cy="196" r="80" strokeOpacity="0.16" strokeWidth="6"/>
+            </g>
+            <path d="M72 300 H176 L214 300 L246 176 L286 372 L318 256 L344 256" fill="none" stroke="url(#npPulse)" strokeWidth="26" strokeLinecap="round" strokeLinejoin="round"/>
+            <circle cx="360" cy="196" r="30" fill="url(#npNode)"/>
+          </svg>
+          <span>Net&nbsp;Pulse <span style={{ opacity: 0.55, fontWeight: 500 }}>— Open Net Tools</span></span>
           <button className="themebtn" title="Toggle light / dark" onClick={() => setTheme((t) => t === 'light' ? 'dark' : 'light')}>{theme === 'light' ? '🌙' : '☀'}</button>
         </h1>
         <div className="controls">

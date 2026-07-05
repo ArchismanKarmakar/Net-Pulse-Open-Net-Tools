@@ -1,7 +1,7 @@
 {
-  "name": "netpulse-desktop",
+  "name": "net-pulse-open-net-tools-desktop",
   "version": "0.6.0",
-  "description": "NetPulse \u2014 cross-platform path-latency desktop app (Electron + C++ Node-API engine)",
+  "description": "Net Pulse — Open Net Tools: cross-platform path-latency & network diagnostics desktop app (Electron + C++ Node-API engine)",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
@@ -11,5 +11,6 @@
     "electron": "^29.1.0"
   },
   "license": "MIT",
-  "author": "Archisman Karmakar"
+  "author": "Archisman Karmakar",
+  "productName": "Net Pulse — Open Net Tools"
 }

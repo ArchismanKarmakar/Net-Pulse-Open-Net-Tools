@@ -1,5 +1,5 @@
 {
-  "name": "netpulse-web",
+  "name": "net-pulse-open-net-tools-web",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -21,5 +21,6 @@
     "vite": "^5.4.10"
   },
   "license": "MIT",
-  "author": "Archisman Karmakar"
+  "author": "Archisman Karmakar",
+  "description": "Net Pulse — Open Net Tools: React UI"
 }

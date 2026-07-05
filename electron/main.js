@@ -6,6 +6,9 @@ const { app, BrowserWindow, dialog, shell, ipcMain, session } = require('electro
 const path = require('path')
 
 const DEV = process.env.NETPULSE_DEV === '1'
+app.setName('Net Pulse — Open Net Tools')
+if (process.platform === 'win32') app.setAppUserModelId('com.archismankarmakar.netpulse.opennettools')
+
 let win = null
 let engine = null
 
@@ -60,7 +63,8 @@ function applyContentSecurityPolicy() {
 async function createWindow() {
   win = new BrowserWindow({
     width: 1340, height: 880, backgroundColor: '#0e1116',
-    title: 'NetPulse — Path Latency Studio',
+    title: 'Net Pulse — Open Net Tools',
+    icon: path.join(__dirname, 'icon.ico'),
     webPreferences: {
       contextIsolation: true,   // renderer can't touch Node directly
       nodeIntegration: false,   // no Node in the renderer
@@ -92,7 +96,7 @@ async function createWindow() {
 app.whenReady().then(() => {
   engine = loadEngine()
   if (!engine) {
-    dialog.showErrorBox('NetPulse',
+    dialog.showErrorBox('Net Pulse — Open Net Tools',
       'Native engine not found.\n\nBuild it first:\n  cd napi && npm install\n  npx cmake-js compile --runtime electron --runtime-version ' +
       process.versions.electron)
     app.quit()

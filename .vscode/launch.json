@@ -2,18 +2,18 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "NetPulse: Launch app (Electron)",
+      "name": "Net Pulse: Launch app (Electron)",
       "type": "node",
       "request": "launch",
       "cwd": "${workspaceFolder}/electron",
       "runtimeExecutable": "${workspaceFolder}/electron/node_modules/.bin/electron",
       "windows": { "runtimeExecutable": "${workspaceFolder}/electron/node_modules/.bin/electron.cmd" },
       "args": ["."],
-      "preLaunchTask": "NetPulse: Run app",
+      "preLaunchTask": "Net Pulse: Run app",
       "outputCapture": "std"
     },
     {
-      "name": "NetPulse: C++ unit tests (Debug)",
+      "name": "Net Pulse: C++ unit tests (Debug)",
       "type": "cppvsdbg",
       "request": "launch",
       "program": "${workspaceFolder}/build/Debug/netpulse_tests.exe",

@@ -1,6 +1,8 @@
-# NetPulse — Path Latency Studio
+# Net Pulse — Open Net Tools
 
-> **Running the app:** NetPulse is an **Electron desktop app**. Run it from a
+<p align="center"><img src="branding/logo.svg" width="96" height="96" alt="Net Pulse — Open Net Tools logo" /></p>
+
+> **Running the app:** Net Pulse is an **Electron desktop app**. Run it from a
 > terminal, **not** from VS Code's C++ *Debug/Play* button.
 >
 > One-shot: **`./build-and-run.ps1`** (Windows) or **`./build-and-run.sh`**
@@ -8,7 +10,7 @@
 > **Administrator** terminal (Windows) or grant `cap_net_raw` (Linux).
 >
 > **In VS Code:** open the Run and Debug panel (Ctrl+Shift+D) and pick
-> **"NetPulse: Launch app (Electron)"** from the dropdown, then press ▶. This
+> **"Net Pulse: Launch app (Electron)"** from the dropdown, then press ▶. This
 > builds everything and launches the real app. Do **not** use the default C++
 > "Debug"/▶ button in the status bar — CMake Tools auto-selects
 > `netpulse_tests` as its target (the only executable this CMake project
@@ -31,7 +33,7 @@ config, per-hop ASN/BGP, alerts, exports, light & dark themes.
 Each target in the sidebar shows a **two-lamp status signal** (target + path) —
 see [Status lamps](#status-lamps) below for what the colours mean.
 
-NetPulse is a **native desktop app** — Electron shell + a C++ engine compiled as
+Net Pulse — Open Net Tools is a **native desktop app** — Electron shell + a C++ engine compiled as
 an in-process **Node-API addon**. There is **no web server, no localhost port,
 and no WebSocket**. The renderer talks to the engine only over Electron IPC,
 exactly like a Qt app talks to its backend.
@@ -273,4 +275,4 @@ MIT — see [`LICENSE`](LICENSE). Third-party components and their licenses are
 listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 "PingPlotter" and "mtr" are referenced only for behavioral comparison and are
-trademarks of their respective owners; NetPulse is an independent project.
+trademarks of their respective owners; Net Pulse — Open Net Tools is an independent project.

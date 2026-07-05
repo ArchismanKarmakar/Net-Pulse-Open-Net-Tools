@@ -1,0 +1,44 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Net Pulse — Open Net Tools">
+  <defs>
+    <linearGradient id="np-bg" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0c1524"/>
+      <stop offset="1" stop-color="#0a1120"/>
+    </linearGradient>
+    <linearGradient id="np-pulse" x1="72" y1="256" x2="440" y2="256" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="0.55" stop-color="#38e0d6"/>
+      <stop offset="1" stop-color="#4f7cff"/>
+    </linearGradient>
+    <radialGradient id="np-node" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#eafcff"/>
+      <stop offset="0.4" stop-color="#5ff0ff"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </radialGradient>
+    <filter id="np-glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="9" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- app tile -->
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#np-bg)"/>
+  <rect x="16.5" y="16.5" width="479" height="479" rx="111.5" fill="none" stroke="#22d3ee" stroke-opacity="0.16" stroke-width="3"/>
+
+  <!-- radiating ping rings from the pulse node -->
+  <g stroke="#22d3ee" fill="none" stroke-linecap="round">
+    <circle cx="360" cy="196" r="46" stroke-opacity="0.30" stroke-width="7"/>
+    <circle cx="360" cy="196" r="80" stroke-opacity="0.16" stroke-width="6"/>
+    <circle cx="360" cy="196" r="116" stroke-opacity="0.08" stroke-width="6"/>
+  </g>
+
+  <!-- pulse / latency waveform -->
+  <g filter="url(#np-glow)">
+    <path d="M72 300 H176 L214 300 L246 176 L286 372 L318 256 L344 256"
+          fill="none" stroke="url(#np-pulse)" stroke-width="26"
+          stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+
+  <!-- node at the far end of the trace -->
+  <circle cx="360" cy="196" r="30" fill="url(#np-node)"/>
+  <circle cx="360" cy="196" r="30" fill="none" stroke="#eafcff" stroke-opacity="0.55" stroke-width="3"/>
+</svg>

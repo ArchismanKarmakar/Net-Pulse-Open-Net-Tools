@@ -321,17 +321,45 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
             if (debug_enabled) {
                 fprintf(stderr, "[netpulse] matched pending seq=%u hop=%u rtt=%.1fms\n", inc.reply.seq, hop, rtt);
             }
+            bool from_dest = dest_ && inc.from == *dest_;
+
+            // ICMP *Unreachable* from something OTHER than the destination is
+            // not a transit hop at this TTL — it's a router (very often your own
+            // gateway / ISP CGNAT during a link outage) reporting it can't
+            // deliver toward the target. Recording its source address here is
+            // exactly what paints private/CGNAT IPs (192.168.x, 10.x) across
+            // random high hops when the connection drops or restarts: the same
+            // box answers probes at many TTLs, so it appears at hop 8, 12, 25…
+            // at once, which is impossible for a real transit hop. So we do NOT
+            // set it as the hop's address and do NOT let it advance discovery;
+            // we count the probe as loss for that hop (we never heard from the
+            // real hop at this TTL) and move on. A TimeExceeded, by contrast, IS
+            // the genuine hop at this TTL and is recorded normally below.
+            if (inc.reply.kind == ReplyKind::Unreachable && !from_dest) {
+                if (debug_enabled)
+                    fprintf(stderr, "[netpulse] unreachable from %s for hop %u — counted as loss, not a transit hop\n",
+                            inc.from.c_str(), hop);
+                ensure_hop(hop).push(inc.at, std::nullopt);
+                buffer.push_back(NewPoint{hop, inc.at, std::nullopt});
+                pending.erase(it);
+                continue;
+            }
+
             HopStats& hs = ensure_hop(hop);
             hs.set_address(inc.from);
             hs.push(inc.at, rtt);
             buffer.push_back(NewPoint{hop, inc.at, rtt});
             if (hop > max_hop_seen_) max_hop_seen_ = hop;
-            if (inc.reply.kind == ReplyKind::EchoReply) {
-                // Treat any EchoReply as reaching the destination TTL. Some
+            // EchoReply = reached the destination. An Unreachable *from the
+            // destination itself* (e.g. ICMP port-unreachable) also means we
+            // reached it, so treat both as arrival.
+            if (inc.reply.kind == ReplyKind::EchoReply ||
+                (inc.reply.kind == ReplyKind::Unreachable && from_dest)) {
+                // Treat arrival as reaching the destination TTL. Some
                 // networks rewrite source addresses (NATs, load-balancers)
                 // so the reply may come from an address different from the
-                // original resolved `dest_`. Accept the EchoReply regardless
-                // of `inc.from` so the engine recognises the destination and
+                // original resolved `dest_`. Accept it regardless of
+                // `inc.from` so the engine recognises the destination and
                 // advances discovery. If the reply's source differs from the
                 // resolved address, update the visible `dest_` so the UI
                 // reflects the actual responding IP.

@@ -31,7 +31,12 @@ static Settings settings_from_obj(const Napi::Object& o, Settings base = Setting
     base.probe_interval = clamp(num("probe", base.probe_interval), 0.01, 3600.0);
     base.trace_interval = clamp(num("trace", base.trace_interval), 1.0, 86400.0);
     base.timeout = clamp(num("timeout", base.timeout), 0.0, 3600.0);
-    base.payload_size = static_cast<size_t>(clamp(num("payload", static_cast<double>(base.payload_size)), 0.0, 1472.0));
+    // Payload up to 65500 bytes, matching the system `ping -l` maximum. The ICMP
+    // theoretical ceiling is 65507 (65535 - 20 IP - 8 ICMP); anything past the
+    // path MTU (~1472 on Ethernet) is IP-fragmented by the OS, which is expected
+    // for large-packet / MTU testing. Clamped so garbage input can't request a
+    // multi-gigabyte buffer.
+    base.payload_size = static_cast<size_t>(clamp(num("payload", static_cast<double>(base.payload_size)), 0.0, 65500.0));
     base.max_hops = static_cast<uint8_t>(clamp(num("maxhops", static_cast<double>(base.max_hops)), 1.0, 64.0));
     if (o.Has("raw")) base.privileged = o.Get("raw").ToBoolean().Value();
     if (o.Has("src")) {

@@ -157,6 +157,7 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
     double last_refill = now_secs();
     std::map<uint8_t, int> tries;       // per-hop probe attempts (drives fast->steady backoff of non-responders)
     uint8_t rr = 1;                     // round-robin cursor so the paced budget is shared fairly across unanswered hops
+    std::map<uint8_t, double> last_reply_at; // per-hop wall-clock of last REAL reply (drives frontier decay + ghost pruning)
 
     auto ensure_hop = [&](uint8_t h) -> HopStats& {
         auto it = hops_.find(h);
@@ -199,6 +200,7 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
                     last_refill = now_secs();
                     tries.clear();
                     rr = 1;
+                    last_reply_at.clear();
                 }
             }
         }
@@ -349,6 +351,7 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
             hs.set_address(inc.from);
             hs.push(inc.at, rtt);
             buffer.push_back(NewPoint{hop, inc.at, rtt});
+            last_reply_at[hop] = inc.at; // a genuine transit/echo reply landed at this hop
             if (hop > max_hop_seen_) max_hop_seen_ = hop;
             // EchoReply = reached the destination. An Unreachable *from the
             // destination itself* (e.g. ICMP port-unreachable) also means we
@@ -375,6 +378,20 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
 
         // 3) expire timed-out probes as loss samples (only within the known path)
         now = now_secs();
+        // Decay the frontier. max_hop_seen_ must reflect the deepest hop that has
+        // answered RECENTLY, not the deepest that ever answered. Without this, a
+        // single stray reply during a link outage (e.g. a CGNAT box briefly
+        // answering at TTL 28) pins the frontier — and the ghost row it created —
+        // in place forever, so after the connection is restored the trace never
+        // settles back: the list keeps a sent=0 ghost as its last row and the UI
+        // stays stuck on "discovering" instead of resolving to the real state.
+        const double kFrontierStaleSecs = (std::max)(30.0, interval * 20.0);
+        {
+            uint8_t fresh_max = 0;
+            for (const auto& [h, at] : last_reply_at)
+                if (now - at <= kFrontierStaleSecs && h > fresh_max) fresh_max = h;
+            max_hop_seen_ = fresh_max;
+        }
         uint8_t bound = dest_hop_ ? *dest_hop_
                                   : (max_hop_seen_ ? static_cast<uint8_t>(max_hop_seen_ + 1) : s.max_hops);
         for (auto it = pending.begin(); it != pending.end();) {
@@ -396,6 +413,26 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
             for (auto it = hops_.begin(); it != hops_.end();) {
                 if (it->first > *dest_hop_) it = hops_.erase(it);
                 else ++it;
+            }
+        } else {
+            // No confirmed destination (discovering / unreachable): drop ghost
+            // rows — hops that got an address from a stray reply during an
+            // outage/route-flap but are now silent AND sit beyond the current
+            // (decayed) frontier. These are exactly the sent=0 phantom rows that
+            // otherwise linger past a reconnect and keep the target from
+            // resolving to its true state.
+            uint8_t keep_bound = max_hop_seen_ ? static_cast<uint8_t>(max_hop_seen_ + 1) : 0;
+            for (auto it = hops_.begin(); it != hops_.end();) {
+                uint8_t h = it->first;
+                auto ra = last_reply_at.find(h);
+                bool recent = ra != last_reply_at.end() && (now - ra->second) <= kFrontierStaleSecs;
+                bool within_frontier = keep_bound && h <= keep_bound;
+                if (!recent && !within_frontier) {
+                    last_reply_at.erase(h);
+                    it = hops_.erase(it);
+                } else {
+                    ++it;
+                }
             }
         }
         for (auto& [h, hs] : hops_) hs.set_is_dest(dest_hop_ && h == *dest_hop_);

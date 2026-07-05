@@ -236,3 +236,40 @@
   .resize-handle-y::before { content: ''; @apply block w-10 h-1 rounded-full; background: var(--border2); }
   .resize-handle-y:hover::before, .resize-handle-y:active::before { background: var(--accent); }
 }
+
+/* ── Top menu bar (added) ─────────────────────────────────────────────── */
+.menubar { display: flex; align-items: stretch; gap: 2px; background: var(--panel2);
+  border-bottom: 1px solid var(--border); padding: 2px 6px; position: relative; z-index: 40;
+  user-select: none; -webkit-app-region: drag; }
+.menubar .menu { position: relative; -webkit-app-region: no-drag; }
+.menu-top { background: transparent; border: none; color: var(--text); padding: 4px 10px;
+  border-radius: 6px; font-size: 13px; line-height: 1.2; cursor: pointer; }
+.menu-top:hover, .menu.open .menu-top { background: var(--btn-hover); box-shadow: none; }
+.menu-drop { position: absolute; top: 100%; left: 0; margin-top: 3px; min-width: 240px;
+  background: var(--panel); border: 1px solid var(--border2); border-radius: 8px;
+  box-shadow: var(--shadow-md); padding: 4px; z-index: 60; }
+.menu-item { display: flex; align-items: center; width: 100%; gap: 6px; background: transparent;
+  border: none; color: var(--text); text-align: left; padding: 6px 8px; border-radius: 6px;
+  font-size: 13px; cursor: pointer; }
+.menu-item:hover:not(:disabled) { background: var(--btn-hover); box-shadow: none; }
+.menu-item:disabled { opacity: .4; cursor: default; }
+.menu-item .menu-check { width: 14px; flex: 0 0 14px; color: var(--accent); font-size: 12px; }
+.menu-item .menu-label { flex: 1; }
+.menu-sep { height: 1px; background: var(--border); margin: 4px 2px; }
+
+/* Per-card pause button (added) */
+.card-pause { opacity: .0; margin-left: 2px; background: transparent; border: none;
+  color: var(--muted); font-size: 12px; line-height: 1; padding: 2px 5px; border-radius: 6px;
+  cursor: pointer; transition: opacity .12s, background .12s, color .12s; }
+aside li:hover .card-pause, aside li.sel .card-pause { opacity: .8; }
+.card-pause:hover { opacity: 1 !important; background: color-mix(in srgb, var(--accent) 18%, var(--panel));
+  color: var(--accent); box-shadow: none; }
+
+/* About dialog (added) */
+.about-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.5); display: flex;
+  align-items: center; justify-content: center; z-index: 200; }
+.about-box { background: var(--panel); border: 1px solid var(--border2); border-radius: 12px;
+  box-shadow: var(--shadow-md); padding: 20px 22px; max-width: 380px; }
+
+/* Inline config validation errors (added) */
+.cfg-errs div { margin-top: 2px; }

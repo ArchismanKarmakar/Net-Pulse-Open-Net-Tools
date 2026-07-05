@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **Fix — stuck on "discovering" after a reconnect / route change:** the frontier
+  (`max_hop_seen_`) now *decays* to the deepest hop that answered recently instead of
+  the deepest that ever answered, and phantom rows (hops that got an address from a
+  stray reply during an outage but are now silent and beyond the frontier) are pruned.
+  This lets a target settle back to its true state (path / unreachable) after the link
+  is restored, instead of holding a sent=0 ghost row and spinning forever.
+- **Payload up to 65500 B** (was 1472), matching `ping -l`; larger-than-MTU sizes are
+  OS-fragmented. All config fields (probe, trace, timeout, payload, max hops) now carry
+  min/max limits and are validated on Add and on live Edit, with inline errors.
+- **Menu bar** (File / Targets / View / Tools / Help) with quick-trace shortcuts,
+  pause-all, view toggles, config edit, and About.
+- **Pause reworked:** per-target pause on every card (⏸/▶) plus a global Pause-all /
+  Resume-all. The **Stop** button (which only froze a target with no way to resume) was
+  removed — use pause to freeze, ✕ to remove.
+
+
+## Unreleased
+
 - **Rebrand:** renamed to **Net Pulse — Open Net Tools** across the window title, in-app header, HTML title, package manifests, VS Code tasks and README; added a new logo (`branding/logo.svg`) wired in as the app/window icon, favicon and header mark.
 - **Fix (link loss / route flux, e.g. ISP restart):** ICMP *Destination Unreachable* replies are no longer recorded as transit hops. Previously an Unreachable from your gateway/CGNAT during an outage was painted as a hop at the probe's TTL, scattering private/CGNAT IPs (192.168.x, 10.x) across random high hops. They are now counted as loss for that hop; only *Time Exceeded* (a genuine transit hop) and *Echo Reply* / destination-sourced Unreachable (arrival) populate the path.
 

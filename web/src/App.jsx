@@ -153,6 +153,66 @@ function Drawer({ detail, onClose }) {
   )
 }
 
+// ── Config field limits ─────────────────────────────────────────────────────
+// Mirrors the engine's clamps (napi.cpp). The engine still clamps defensively,
+// but validating here gives immediate feedback and stops obviously-bad values.
+const CFG_LIMITS = {
+  probe:   { min: 0.1, max: 3600,  step: 0.1, label: 'Probe interval (s)' },
+  trace:   { min: 1,   max: 86400, step: 1,   label: 'Trace interval (s)' },
+  timeout: { min: 0,   max: 3600,  step: 0.1, label: 'Timeout (s, 0 = auto)' },
+  payload: { min: 0,   max: 65500, step: 1,   label: 'Payload (bytes)' },
+  maxhops: { min: 1,   max: 64,    step: 1,   label: 'Max hops' },
+}
+// Returns a { field: message } map of any out-of-range / non-numeric values.
+function validateCfg(cfg) {
+  const errs = {}
+  for (const k of Object.keys(CFG_LIMITS)) {
+    if (cfg[k] == null || cfg[k] === '') continue
+    const v = Number(cfg[k]); const L = CFG_LIMITS[k]
+    if (!Number.isFinite(v)) errs[k] = `${L.label} must be a number`
+    else if (v < L.min || v > L.max) errs[k] = `${L.label} must be between ${L.min} and ${L.max}`
+  }
+  return errs
+}
+
+// ── Top menu bar ────────────────────────────────────────────────────────────
+// Lightweight click-to-open menus (File / Targets / View / Tools / Help). Each
+// item is { label, onClick, checked?, sep?, disabled?, hint? }.
+function MenuBar({ menus }) {
+  const [open, setOpen] = useState(null)
+  const ref = useRef(null)
+  useEffect(() => {
+    if (open == null) return
+    const away = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(null) }
+    const esc = (e) => { if (e.key === 'Escape') setOpen(null) }
+    window.addEventListener('mousedown', away); window.addEventListener('keydown', esc)
+    return () => { window.removeEventListener('mousedown', away); window.removeEventListener('keydown', esc) }
+  }, [open])
+  return (
+    <nav className="menubar" ref={ref}>
+      {menus.map((m, i) => (
+        <div key={i} className={'menu' + (open === i ? ' open' : '')}>
+          <button className="menu-top" onClick={() => setOpen(open === i ? null : i)}
+            onMouseEnter={() => open != null && setOpen(i)}>{m.label}</button>
+          {open === i && (
+            <div className="menu-drop">
+              {m.items.filter(Boolean).map((it, j) => it.sep
+                ? <div key={j} className="menu-sep" />
+                : (
+                  <button key={j} className="menu-item" disabled={it.disabled}
+                    onClick={() => { setOpen(null); it.onClick && it.onClick() }} title={it.hint || ''}>
+                    <span className="menu-check">{it.checked ? '✓' : ''}</span>
+                    <span className="menu-label">{it.label}</span>
+                  </button>
+                ))}
+            </div>
+          )}
+        </div>
+      ))}
+    </nav>
+  )
+}
+
 export default function App() {
   const [form, setForm] = useState({ target: '', family: 'auto', probe: 1, trace: 30, timeout: 0, payload: 56, maxhops: 30, raw: true })
   const [focusIdx, setFocusIdx] = useState(6) // Last 10 min
@@ -293,8 +353,12 @@ export default function App() {
     return () => { alive = false; clearInterval(h) }
   }, [focus])
 
+  const [editErrs, setEditErrs] = useState({})
   const applyUpdate = async () => {
     if (!sel || !editForm) return
+    const errs = validateCfg(editForm)
+    setEditErrs(errs)
+    if (Object.keys(errs).length) return
     const q = new URLSearchParams({ id: sel.id, probe: editForm.probe, timeout: editForm.timeout, payload: editForm.payload, maxhops: editForm.maxhops, family: editForm.family, src: editForm.src })
     try { await api(`/api/update?${q}`, { method: 'POST' }); setEditing(false) } catch {}
   }
@@ -507,8 +571,23 @@ export default function App() {
     })
   }, [ipKey]) // eslint-disable-line
 
+  // Quick-add a host directly (menu shortcuts) using default config, without
+  // touching the add form. Skips exact-duplicate hosts already being traced.
+  const addTargetHost = async (host) => {
+    host = String(host || '').trim()
+    if (!host) return
+    if (targets.some((t) => t.name === host)) { const ex = targets.find((t) => t.name === host); if (ex) { setSelId(ex.id); setSelHop(null) }; return }
+    const q = new URLSearchParams({ target: host, family: 'auto', probe: 1, trace: 30, timeout: 0, payload: 56, maxhops: 30, raw: '1' })
+    const r = await api(`/api/add?${q}`, { method: 'POST' })
+    if (r && r.id) { await refreshState(); setSelId(r.id); setSelHop(null) }
+  }
+
   const addTarget = async () => {
     if (!form.target.trim()) return
+
+    // ── Config validation ────────────────────────────────────────────────────
+    const cfgErrs = validateCfg(form)
+    if (Object.keys(cfgErrs).length) { alert('Please fix the config:\n\n• ' + Object.values(cfgErrs).join('\n• ')); return }
 
     // ── Duplicate check ──────────────────────────────────────────────────────
     // A target is a "duplicate" when the same host name/IP is already being
@@ -665,6 +744,14 @@ export default function App() {
   // ─────────────────────────────────────────────────────────────────────────
 
   const ctrl = (id, ep, extra = '') => api(`/api/${ep}?id=${id}${extra}`, { method: 'POST' })
+
+  // ── Global target controls (used by the menu bar and sidebar) ──────────────
+  const allPaused = targets.length > 0 && targets.every((t) => t.paused)
+  const pauseAll = (on) => Promise.all(targets.map((t) => ctrl(t.id, 'pause', `&on=${on ? 1 : 0}`))).then(refreshState).catch(() => {})
+  const pauseOne = (t) => ctrl(t.id, 'pause', `&on=${t.paused ? 0 : 1}`).then(refreshState).catch(() => {})
+  const removeAll = () => { if (!targets.length) return; if (!confirm(`Remove all ${targets.length} target(s)?`)) return; Promise.all(targets.map((t) => ctrl(t.id, 'remove'))).then(() => { setSelId(null); refreshState() }).catch(() => {}) }
+  const quickAdd = (host) => { setForm((f) => ({ ...f, target: host })); setTimeout(() => addTargetHost(host), 0) }
+  const [about, setAbout] = useState(false)
   const openDetail = (ip) => {
     if (!bgp.isPublicIp(ip)) { setDetail({ ip, private: true, loading: false }); return }
     setDetail({ ip, loading: true })
@@ -748,6 +835,63 @@ export default function App() {
 
   return (
     <div className="app">
+      <MenuBar menus={[
+        {
+          label: 'File', items: [
+            { label: 'Add target…', onClick: () => { document.querySelector('input.target')?.focus() }, hint: 'Focus the host/IP field' },
+            { sep: true },
+            { label: 'Save target list (.npulse)…', onClick: exportTargetList, disabled: !targets.length },
+            { label: 'Export targets as JSON…', onClick: exportTargetsJson, disabled: !targets.length },
+            { label: 'Load target list (.npulse)…', onClick: () => document.getElementById('np-import-input')?.click() },
+            { sep: true },
+            { label: 'Export hops CSV (selected)…', onClick: () => sel && exportHopsCsv && exportHopsCsv(), disabled: !sel },
+          ],
+        },
+        {
+          label: 'Targets', items: [
+            { label: allPaused ? 'Resume all' : 'Pause all', onClick: () => pauseAll(!allPaused), disabled: !targets.length },
+            { label: sel ? (sel.paused ? 'Resume selected' : 'Pause selected') : 'Pause selected', onClick: () => sel && pauseOne(sel), disabled: !sel },
+            { sep: true },
+            { label: 'Remove selected', onClick: () => sel && ctrl(sel.id, 'remove').then(() => { setSelId(null); refreshState() }), disabled: !sel },
+            { label: 'Remove all…', onClick: removeAll, disabled: !targets.length },
+          ],
+        },
+        {
+          label: 'View', items: [
+            { label: 'Dark / light theme', onClick: () => setTheme((t) => t === 'light' ? 'dark' : 'light') },
+            { sep: true },
+            { label: 'Trend sparklines', checked: view.trend, onClick: () => setView((v) => ({ ...v, trend: !v.trend })) },
+            { label: 'Latency graph', checked: view.latency, onClick: () => setView((v) => ({ ...v, latency: !v.latency })) },
+            { label: 'Clip spikes', checked: clipOutliers, onClick: () => setClipOutliers((c) => !c) },
+            { label: 'Overlay all hops', checked: overlay, onClick: () => setOverlay((o) => !o) },
+            { label: 'Alerts', checked: alerts.on, onClick: () => setAlerts((a) => ({ ...a, on: !a.on })) },
+          ],
+        },
+        {
+          label: 'Tools', items: [
+            { label: 'Quick trace 1.1.1.1 (Cloudflare)', onClick: () => addTargetHost('1.1.1.1') },
+            { label: 'Quick trace 8.8.8.8 (Google)', onClick: () => addTargetHost('8.8.8.8') },
+            { label: 'Quick trace 9.9.9.9 (Quad9)', onClick: () => addTargetHost('9.9.9.9') },
+            { sep: true },
+            { label: 'Edit config (selected)…', onClick: () => { if (sel) { setEditForm({ probe: sel.config.probe, timeout: sel.config.timeout, payload: sel.config.payload, maxhops: sel.config.maxhops, family: sel.config.family, src: sel.config.src }); setEditErrs({}); setEditing(true) } }, disabled: !sel },
+          ],
+        },
+        {
+          label: 'Help', items: [
+            { label: 'About Net Pulse — Open Net Tools', onClick: () => setAbout(true) },
+            { label: 'Project on GitHub', onClick: () => { try { window.open('https://github.com/ArchismanKarmakar/Net-Pulse-Open-Net-Tools', '_blank') } catch {} } },
+          ],
+        },
+      ]} />
+      {about && (
+        <div className="about-overlay" onClick={() => setAbout(false)}>
+          <div className="about-box" onClick={(e) => e.stopPropagation()}>
+            <h2 style={{ margin: '0 0 6px' }}>Net Pulse — Open Net Tools</h2>
+            <p style={{ margin: '0 0 10px', opacity: 0.75 }}>Cross-platform path-latency &amp; network diagnostics. Native C++ probe engine + Electron UI.</p>
+            <button className="primary" onClick={() => setAbout(false)}>Close</button>
+          </div>
+        </div>
+      )}
       <header>
         <h1 style={{ display: 'flex', alignItems: 'center', gap: '9px' }}>
           <svg width="24" height="24" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style={{ display: 'block', flexShrink: 0 }}>
@@ -778,11 +922,11 @@ export default function App() {
           <button className="primary" onClick={addTarget}>＋ Add</button>
           <label>Family<select value={form.family} onChange={(e) => setForm({ ...form, family: e.target.value })}>
             <option value="auto">Auto</option><option value="v4">IPv4</option><option value="v6">IPv6</option></select></label>
-          <label>Probe<input type="number" step="0.1" value={form.probe} onChange={(e) => setForm({ ...form, probe: e.target.value })} /></label>
-          <label>Trace<input type="number" value={form.trace} onChange={(e) => setForm({ ...form, trace: e.target.value })} /></label>
-          <label>Timeout<input type="number" step="0.1" value={form.timeout} onChange={(e) => setForm({ ...form, timeout: e.target.value })} /></label>
-          <label>Payload<input type="number" value={form.payload} onChange={(e) => setForm({ ...form, payload: e.target.value })} /></label>
-          <label>Hops<input type="number" value={form.maxhops} onChange={(e) => setForm({ ...form, maxhops: e.target.value })} /></label>
+          <label title="Seconds between probes per hop (0.1–3600)">Probe<input type="number" min="0.1" max="3600" step="0.1" value={form.probe} onChange={(e) => setForm({ ...form, probe: e.target.value })} /></label>
+          <label title="Route re-discovery interval, seconds (1–86400)">Trace<input type="number" min="1" max="86400" step="1" value={form.trace} onChange={(e) => setForm({ ...form, trace: e.target.value })} /></label>
+          <label title="Per-probe timeout, seconds; 0 = auto (0–3600)">Timeout<input type="number" min="0" max="3600" step="0.1" value={form.timeout} onChange={(e) => setForm({ ...form, timeout: e.target.value })} /></label>
+          <label title="ICMP payload bytes (0–65500; &gt;~1472 is fragmented)">Payload<input type="number" min="0" max="65500" step="1" value={form.payload} onChange={(e) => setForm({ ...form, payload: e.target.value })} /></label>
+          <label title="Maximum hops / TTL (1–64)">Hops<input type="number" min="1" max="64" step="1" value={form.maxhops} onChange={(e) => setForm({ ...form, maxhops: e.target.value })} /></label>
           <label className="cb"><input type="checkbox" checked={form.raw} onChange={(e) => setForm({ ...form, raw: e.target.checked })} />Raw</label>
           <label>Interface
             <select value={iface} onChange={(e) => setIface(e.target.value)}>
@@ -843,6 +987,12 @@ export default function App() {
                     </span>
                     <span className="truncate flex-1">{t.name}</span>
                     {STATE_LABEL[st] && <span className={'statelabel st-' + st}>{STATE_LABEL[st]}</span>}
+                    {/* Per-target pause/resume — selectively freeze one target */}
+                    <button
+                      className="card-pause"
+                      title={t.paused ? 'Resume this target' : 'Pause this target'}
+                      onClick={(e) => { e.stopPropagation(); pauseOne(t) }}
+                    >{t.paused ? '▶' : '⏸'}</button>
                     {/* Delete button lives in the card so each target is self-contained */}
                     <button
                       className="card-del"
@@ -865,10 +1015,10 @@ export default function App() {
               )
             })}
           </ul>
-          {sel && (
+          {targets.length > 0 && (
             <div className="row">
-              <button onClick={() => ctrl(sel.id, 'pause', `&on=${sel.paused ? 0 : 1}`)}>{sel.paused ? '▶ Resume' : '⏸ Pause'}</button>
-              <button onClick={() => ctrl(sel.id, 'stop')}>⏹ Stop</button>
+              <button className={allPaused ? 'primary' : ''} onClick={() => pauseAll(!allPaused)}
+                title="Pause or resume ALL targets">{allPaused ? '▶ Resume all' : '⏸ Pause all'}</button>
             </div>
           )}
           {/* ── Export / Import ─────────────────────────────────────────── */}
@@ -877,7 +1027,7 @@ export default function App() {
             <button onClick={exportTargetsJson} title="Export target list + config as human-readable JSON">⬇ Export JSON</button>
             <label className="import-btn" title="Load a .npulse target list (auto-starts tracing, skips exact duplicates)">
               ⬆ Load list (.npulse)
-              <input type="file" accept=".npulse" style={{ display: 'none' }} onChange={(e) => { if (e.target.files[0]) importTargetList(e.target.files[0]); e.target.value = '' }} />
+              <input id="np-import-input" type="file" accept=".npulse" style={{ display: 'none' }} onChange={(e) => { if (e.target.files[0]) importTargetList(e.target.files[0]); e.target.value = '' }} />
             </label>
           </div>
           <div
@@ -931,8 +1081,8 @@ export default function App() {
                 <div className="editpanel">
                   <label>Probe (s)<input type="number" step="0.1" min="0.1" value={editForm.probe} onChange={(e) => setEditForm({ ...editForm, probe: e.target.value })} /></label>
                   <label>Timeout (s, 0=auto)<input type="number" step="0.1" min="0" value={editForm.timeout} onChange={(e) => setEditForm({ ...editForm, timeout: e.target.value })} /></label>
-                  <label>Payload<input type="number" value={editForm.payload} onChange={(e) => setEditForm({ ...editForm, payload: e.target.value })} /></label>
-                  <label>Max hops<input type="number" value={editForm.maxhops} onChange={(e) => setEditForm({ ...editForm, maxhops: e.target.value })} /></label>
+                  <label title="ICMP payload bytes (0–65500)">Payload<input type="number" min="0" max="65500" step="1" value={editForm.payload} onChange={(e) => setEditForm({ ...editForm, payload: e.target.value })} /></label>
+                  <label title="Maximum hops / TTL (1–64)">Max hops<input type="number" min="1" max="64" step="1" value={editForm.maxhops} onChange={(e) => setEditForm({ ...editForm, maxhops: e.target.value })} /></label>
                   <label>Family
                     <select value={editForm.family} onChange={(e) => setEditForm({ ...editForm, family: e.target.value })}>
                       <option value="auto">Auto</option><option value="v4">IPv4</option><option value="v6">IPv6</option>
@@ -945,6 +1095,11 @@ export default function App() {
                     </select>
                   </label>
                   <button className="apply" onClick={applyUpdate}>Apply (live)</button>
+                  {Object.keys(editErrs).length > 0 && (
+                    <div className="cfg-errs" style={{ flexBasis: '100%', color: 'var(--danger)', fontSize: 12, marginTop: 4 }}>
+                      {Object.values(editErrs).map((m, i) => <div key={i}>⚠ {m}</div>)}
+                    </div>
+                  )}
                 </div>
               )}
 

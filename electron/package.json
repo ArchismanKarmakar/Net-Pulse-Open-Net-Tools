@@ -8,7 +8,7 @@
     "dev": "NETPULSE_DEV=1 electron ."
   },
   "devDependencies": {
-    "electron": "^29.1.0"
+    "electron": "^39.8.5"
   },
   "license": "AGPL-3.0-or-later",
   "author": "Archisman Karmakar",

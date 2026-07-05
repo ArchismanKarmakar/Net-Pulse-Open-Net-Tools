@@ -12,7 +12,7 @@
   },
   "dependencies": {
     "node-addon-api": "^8.0.0",
-    "cmake-js": "^7.3.0"
+    "cmake-js": "^8.0.0"
   },
   "license": "MIT",
   "author": "Archisman Karmakar"

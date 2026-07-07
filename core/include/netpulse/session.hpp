@@ -3,6 +3,7 @@
 #pragma once
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -12,6 +13,7 @@
 #include <vector>
 
 #include "netpulse/icmp.hpp"
+#include "netpulse/transport.hpp"
 #include "netpulse/stats.hpp"
 
 namespace netpulse {
@@ -51,6 +53,7 @@ struct Snapshot {
 class Session {
 public:
     Session(uint64_t id, std::string target, Settings settings);
+    ~Session();
 
     uint64_t id() const { return id_; }
     const std::string& target() const { return target_; }
@@ -102,6 +105,18 @@ private:
     std::optional<std::string> error_;
     std::optional<uint8_t> dest_hop_; // hop index of the destination, once reached
     uint8_t max_hop_seen_ = 0;        // furthest hop that has ever responded
+
+    // Cross-session reply routing. On Windows, when several targets each open a
+    // raw ICMP socket, inbound ICMP replies are often delivered to only ONE of
+    // the sockets, so a reply for target B can arrive on target A's socket and
+    // be discarded (wrong id) — leaving B's shared hops (router/BNG) at high
+    // loss even though the replies came back. To fix this, every session
+    // registers its ICMP id in a process-global table; a session that receives a
+    // reply not addressed to it hands it to the owning session's inbox, which
+    // that session drains on its own thread (so hops_ stays single-threaded).
+    std::mutex inbox_mtx_;
+    std::deque<Incoming> inbox_;
+    void route_reply_(const Incoming& inc); // deliver a foreign reply to its owner
 };
 
 } // namespace netpulse

@@ -121,12 +121,37 @@ function registerEngineIpc() {
   // are passed as an array (never a shell string) so the validated host can't
   // inject. Streams lines back to the renderer over 'np:tools:ping:line'.
   const pingProcs = new Map()
-  ipcMain.handle('np:tools:ping:start', (_e, host, count) => {
+  ipcMain.handle('np:tools:ping:start', (_e, host, opts) => {
     host = String(host || '').trim()
     if (!isHostish(host)) return { id: null, error: 'Invalid host' }
-    const n = Math.max(1, Math.min(100, parseInt(count, 10) || 10))
+    opts = opts && typeof opts === 'object' ? opts : {}
     const isWin = process.platform === 'win32'
-    const args = isWin ? ['-n', String(n), host] : ['-c', String(n), host]
+    const isMac = process.platform === 'darwin'
+    const clampInt = (v, lo, hi, d) => { const n = parseInt(v, 10); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : d }
+    const count = clampInt(opts.count, 1, 10000, 10)
+    const size = opts.size != null ? clampInt(opts.size, 0, 65500, 56) : null
+    const ttl = opts.ttl != null ? clampInt(opts.ttl, 1, 255, null) : null
+    const timeoutMs = opts.timeout != null ? clampInt(opts.timeout, 100, 60000, null) : null
+    const interval = opts.interval != null ? Math.max(0.2, Math.min(60, Number(opts.interval) || 1)) : null
+    const cont = !!opts.continuous
+    const fam = opts.family === 'v4' ? '4' : opts.family === 'v6' ? '6' : null
+
+    const args = []
+    if (fam) args.push('-' + fam)
+    if (isWin) {
+      if (cont) args.push('-t'); else { args.push('-n', String(count)) }
+      if (size != null) args.push('-l', String(size))
+      if (ttl != null) args.push('-i', String(ttl))          // Windows: -i = TTL
+      if (timeoutMs != null) args.push('-w', String(timeoutMs)) // Windows: -w = ms
+    } else {
+      if (!cont) args.push('-c', String(count))
+      if (size != null) args.push('-s', String(size))
+      if (ttl != null) args.push('-t', String(ttl))          // Unix: -t = TTL
+      if (interval != null) args.push('-i', String(interval))
+      if (timeoutMs != null) args.push(isMac ? '-t' : '-W', String(isMac ? Math.ceil(timeoutMs / 1000) : Math.ceil(timeoutMs / 1000)))
+    }
+    args.push(host)
+
     const id = Math.random().toString(36).slice(2)
     let proc
     try { proc = spawn('ping', args, { windowsHide: true }) } catch (e) { return { id: null, error: String(e.message) } }
@@ -135,7 +160,7 @@ function registerEngineIpc() {
     proc.stdout.on('data', (d) => send(d, 'out'))
     proc.stderr.on('data', (d) => send(d, 'err'))
     proc.on('close', (code) => { pingProcs.delete(id); if (win && !win.isDestroyed()) win.webContents.send('np:tools:ping:done', { id, code }) })
-    return { id, error: null }
+    return { id, error: null, cmd: 'ping ' + args.join(' ') }
   })
   ipcMain.handle('np:tools:ping:stop', (_e, id) => { const p = pingProcs.get(id); if (p) { try { p.kill() } catch {} pingProcs.delete(id) } return true })
 }

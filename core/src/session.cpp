@@ -22,6 +22,42 @@
 
 namespace netpulse {
 
+// ---------------------------------------------------------------------------
+// Cross-session reply registry (fixes multi-target shared-hop loss).
+//
+// Each target runs on its own thread with its own raw ICMP socket. On Windows
+// especially, inbound ICMP is frequently delivered to just ONE of those sockets
+// rather than copied to all of them, so a reply meant for target B lands on
+// target A's socket, where it's discarded because the ICMP id isn't A's. The
+// owning session then never sees its reply and its shared hops (home router,
+// ISP BNG, common intermediates) read as high/100% loss even though the router
+// answered — exactly the "0% for one target, 89% for another on the SAME hop"
+// symptom.
+//
+// The registry maps each session's unique ICMP id -> Session*. A session that
+// drains a reply whose id isn't its own routes it to the owning session's inbox
+// (below), so every reply is processed by exactly the right session regardless
+// of which socket the OS happened to hand it to.
+namespace {
+std::mutex g_reg_mtx;
+std::map<uint16_t, Session*> g_registry;
+} // namespace
+
+void Session::route_reply_(const Incoming& inc) {
+    std::lock_guard<std::mutex> lk(g_reg_mtx);
+    auto it = g_registry.find(inc.reply.id);
+    if (it != g_registry.end() && it->second && it->second != this) {
+        std::lock_guard<std::mutex> ib(it->second->inbox_mtx_);
+        it->second->inbox_.push_back(inc);
+    }
+}
+
+Session::~Session() {
+    std::lock_guard<std::mutex> lk(g_reg_mtx);
+    auto it = g_registry.find(icmp_id_);
+    if (it != g_registry.end() && it->second == this) g_registry.erase(it);
+}
+
 // Delay between successive hops' FIRST probe, so a fresh session ramps up
 // gradually instead of bursting every hop's packet in the same instant. 25ms
 // matches PingPlotter's own documented fix for this (Options > Engine >
@@ -88,6 +124,11 @@ constexpr int    kFrontierProbes    = 2;    // sends after which an as-yet-unans
 
 Session::Session(uint64_t id, std::string target, Settings settings)
     : id_(id), target_(std::move(target)), settings_(std::move(settings)) {
+    // Per-target-unique ICMP identifier. Every raw ICMP socket in the process
+    // receives a copy of every reply, so sessions demultiplex by this id; mixing
+    // the monotonically-increasing target id_ in keeps ids distinct across
+    // concurrent targets (so one target can't match/consume another's replies)
+    // while matching the long-proven v19 behaviour.
     icmp_id_ = static_cast<uint16_t>((static_cast<uint64_t>(now_secs())) ^ id_ ^ 0x4242u);
 }
 
@@ -162,6 +203,7 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
         return;
     }
     on_update(snapshot(true, {})); // immediate "tracing…" with resolved IP
+    { std::lock_guard<std::mutex> lk(g_reg_mtx); g_registry[icmp_id_] = this; } // enable cross-session reply routing
 
     // Decide and validate the effective probing family using both DNS results
     // and the local system's usable interfaces. If the user explicitly chose
@@ -438,11 +480,20 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
         double stale_ceiling = (std::max)(timeout * 2.0, 2.0); // seconds
         // Optional runtime debug tracing: enable by setting NETPULSE_DEBUG=1
         static bool debug_enabled = !!getenv("NETPULSE_DEBUG");
-        for (const auto& inc : prober->drain(now + slice)) {
+        // Gather replies from our own socket AND our inbox — replies that other
+        // targets' sockets received on our behalf and routed here (see the
+        // cross-session registry note above). Draining both keeps every reply
+        // going to the correct session regardless of which socket the OS chose.
+        std::vector<Incoming> replies = prober->drain(now + slice);
+        {
+            std::lock_guard<std::mutex> lk(inbox_mtx_);
+            while (!inbox_.empty()) { replies.push_back(std::move(inbox_.front())); inbox_.pop_front(); }
+        }
+        for (const auto& inc : replies) {
             if (debug_enabled) {
                 fprintf(stderr, "[netpulse] reply seq=%u kind=%d from=%s\n", inc.reply.seq, int(inc.reply.kind), inc.from.c_str());
             }
-            if (inc.reply.id != icmp_id_) continue;
+            if (inc.reply.id != icmp_id_) { route_reply_(inc); continue; } // not ours — hand to the owning session
             auto it = pending.find(inc.reply.seq);
             if (it == pending.end()) continue;
             uint8_t hop = it->second.hop;

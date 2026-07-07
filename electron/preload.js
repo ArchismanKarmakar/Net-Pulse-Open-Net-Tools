@@ -20,7 +20,7 @@ contextBridge.exposeInMainWorld('netpulse', {
     dns: (name) => ipcRenderer.invoke('np:tools:dns', name),
     reverse: (addr) => ipcRenderer.invoke('np:tools:reverse', addr),
     portscan: (host, s, e) => ipcRenderer.invoke('np:tools:portscan', host, s, e),
-    pingStart: (host, count) => ipcRenderer.invoke('np:tools:ping:start', host, count),
+    pingStart: (host, opts) => ipcRenderer.invoke('np:tools:ping:start', host, opts),
     pingStop: (id) => ipcRenderer.invoke('np:tools:ping:stop', id),
     onPingLine: (cb) => { const h = (_e, d) => cb(d); ipcRenderer.on('np:tools:ping:line', h); return () => ipcRenderer.removeListener('np:tools:ping:line', h) },
     onPingDone: (cb) => { const h = (_e, d) => cb(d); ipcRenderer.on('np:tools:ping:done', h); return () => ipcRenderer.removeListener('np:tools:ping:done', h) },

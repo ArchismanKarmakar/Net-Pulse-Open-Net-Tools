@@ -1404,11 +1404,14 @@ function ToolUnavailable() {
 // Cmd-style ping — streams real `ping` output from the OS.
 function PingPage() {
   const [host, setHost] = React.useState('')
-  const [count, setCount] = React.useState(10)
+  const [opts, setOpts] = React.useState({ count: 10, size: 56, timeout: 2000, ttl: '', interval: 1, family: 'auto', continuous: false })
   const [lines, setLines] = React.useState([])
   const [running, setRunning] = React.useState(false)
+  const [cmd, setCmd] = React.useState('')
   const idRef = React.useRef(null)
   const preRef = React.useRef(null)
+  const set = (k, v) => setOpts((o) => ({ ...o, [k]: v }))
+
   React.useEffect(() => {
     const t = toolsApi(); if (!t) return
     const off1 = t.onPingLine(({ id, line }) => { if (id === idRef.current) setLines((L) => [...L, line]) })
@@ -1416,25 +1419,80 @@ function PingPage() {
     return () => { off1 && off1(); off2 && off2() }
   }, [])
   React.useEffect(() => { if (preRef.current) preRef.current.scrollTop = preRef.current.scrollHeight }, [lines])
+
   const start = async () => {
     const t = toolsApi(); if (!t || !host.trim()) return
     setLines([]); setRunning(true)
-    const { id, error } = await t.pingStart(host.trim(), count)
-    if (error) { setLines([error]); setRunning(false); return }
-    idRef.current = id
+    const payload = { count: opts.count, size: opts.size, timeout: opts.timeout, interval: opts.interval, family: opts.family, continuous: opts.continuous }
+    if (opts.ttl !== '' && opts.ttl != null) payload.ttl = opts.ttl
+    const res = await t.pingStart(host.trim(), payload)
+    if (!res || res.error) { setLines([(res && res.error) || 'Failed to start ping']); setRunning(false); return }
+    idRef.current = res.id; setCmd(res.cmd || '')
   }
   const stop = async () => { const t = toolsApi(); if (t && idRef.current) await t.pingStop(idRef.current); setRunning(false) }
+
+  // Parse the streamed output into per-reply samples + running stats.
+  const text = lines.join('')
+  const stats = React.useMemo(() => {
+    const rtts = []; let replies = 0, timeouts = 0
+    const re = /time[=<]\s*([\d.]+)\s*ms/gi; let m
+    while ((m = re.exec(text))) { rtts.push(parseFloat(m[1])); replies++ }
+    timeouts = (text.match(/timed out|100% (packet )?loss|Destination host unreachable|no answer|Request timeout/gi) || []).length
+    if (!rtts.length && !timeouts) return null
+    const min = rtts.length ? Math.min(...rtts) : null
+    const max = rtts.length ? Math.max(...rtts) : null
+    const avg = rtts.length ? rtts.reduce((a, b) => a + b, 0) / rtts.length : null
+    const jit = rtts.length > 1 ? rtts.slice(1).reduce((a, b, i) => a + Math.abs(b - rtts[i]), 0) / (rtts.length - 1) : 0
+    const sent = replies + timeouts
+    const loss = sent ? (timeouts / sent) * 100 : 0
+    return { replies, timeouts, sent, loss, min, max, avg, jit, last: rtts[rtts.length - 1] }
+  }, [text])
+
+  const colorLine = (ln, i) => {
+    let cls = ''
+    if (/time[=<]/i.test(ln)) cls = 'pl-ok'
+    else if (/timed out|unreachable|100%|failure|could not find|no answer|Request timeout/i.test(ln)) cls = 'pl-bad'
+    else if (/statistics|min|avg|max|packets/i.test(ln)) cls = 'pl-stat'
+    return <span key={i} className={cls}>{ln}</span>
+  }
+
   if (!toolsApi()) return <div className="toolpage"><h2>Ping</h2><ToolUnavailable /></div>
+  const fmt = (v) => v == null ? '—' : v.toFixed(1)
   return (
-    <div className="toolpage">
-      <h2>Ping</h2>
+    <div className="toolpage wide">
+      <h2>Ping <span className="muted" style={{ fontWeight: 400, fontSize: 13 }}>— ICMP echo (OS ping)</span></h2>
       <div className="tool-row">
-        <label>Host / IP <input className="target" value={host} placeholder="1.1.1.1, 2606:4700:4700::1111, example.com"
+        <label style={{ flex: 1, minWidth: 260 }}>Host / IP <input className="target" value={host} placeholder="1.1.1.1, 2606:4700:4700::1111, example.com"
           onChange={(e) => setHost(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && !running && start()} /></label>
-        <label>Count <input type="number" min="1" max="100" value={count} onChange={(e) => setCount(+e.target.value)} style={{ width: 70 }} /></label>
         {running ? <button onClick={stop}>■ Stop</button> : <button className="primary" onClick={start}>▶ Ping</button>}
       </div>
-      <pre ref={preRef} className="tool-console">{lines.join('') || 'Enter a host and press Ping.'}</pre>
+      <div className="tool-row ping-opts">
+        <label>Count <input type="number" min="1" max="10000" disabled={opts.continuous} value={opts.count} onChange={(e) => set('count', +e.target.value)} style={{ width: 78 }} /></label>
+        <label>Size (B) <input type="number" min="0" max="65500" value={opts.size} onChange={(e) => set('size', +e.target.value)} style={{ width: 78 }} /></label>
+        <label>Timeout (ms) <input type="number" min="100" max="60000" step="100" value={opts.timeout} onChange={(e) => set('timeout', +e.target.value)} style={{ width: 90 }} /></label>
+        <label>TTL <input type="number" min="1" max="255" value={opts.ttl} placeholder="auto" onChange={(e) => set('ttl', e.target.value)} style={{ width: 66 }} /></label>
+        <label>Interval (s) <input type="number" min="0.2" max="60" step="0.1" value={opts.interval} onChange={(e) => set('interval', +e.target.value)} style={{ width: 78 }} /></label>
+        <label>Family
+          <select value={opts.family} onChange={(e) => set('family', e.target.value)}>
+            <option value="auto">Auto</option><option value="v4">IPv4</option><option value="v6">IPv6</option>
+          </select>
+        </label>
+        <label className="cb"><input type="checkbox" checked={opts.continuous} onChange={(e) => set('continuous', e.target.checked)} />Continuous</label>
+      </div>
+      {stats && (
+        <div className="ping-stats">
+          <div><span>Sent</span><b>{stats.sent}</b></div>
+          <div><span>Recv</span><b>{stats.replies}</b></div>
+          <div className={stats.loss > 0 ? 'danger' : ''}><span>Loss</span><b>{stats.loss.toFixed(1)}%</b></div>
+          <div><span>Last</span><b>{fmt(stats.last)}</b></div>
+          <div><span>Min</span><b>{fmt(stats.min)}</b></div>
+          <div><span>Avg</span><b>{fmt(stats.avg)}</b></div>
+          <div><span>Max</span><b>{fmt(stats.max)}</b></div>
+          <div><span>Jitter</span><b>{fmt(stats.jit)}</b></div>
+        </div>
+      )}
+      {cmd && <div className="muted" style={{ fontSize: 11, margin: '2px 0 6px', fontFamily: 'ui-monospace, monospace' }}>$ {cmd}</div>}
+      <pre ref={preRef} className="tool-console">{lines.length ? lines.map(colorLine) : 'Set options and press Ping.'}</pre>
     </div>
   )
 }

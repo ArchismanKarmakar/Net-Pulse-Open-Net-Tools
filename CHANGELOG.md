@@ -1,5 +1,77 @@
 # Changelog
 
+## 0.7.6 — fix multi-target shared-hop loss (reply misdirection)
+
+- **Root cause found:** with multiple targets, each runs its own raw ICMP socket, but the OS
+  (notably Windows) often delivers ALL inbound ICMP to just ONE of those sockets. A reply for
+  target B arriving on target A's socket was discarded (wrong ICMP id), so B never saw its
+  router/BNG replies — the same shared hop showed 0%% loss for one target and ~90%% for another
+  (your 1.1.1.1 vs 8.8.8.8 on 10.1.1.1). This is why it appeared with the multi-threaded design.
+- **Fix:** a process-global registry maps each session's unique ICMP id -> session. A session
+  that receives a reply not addressed to it now ROUTES it to the owning session's inbox, which
+  that session drains on its own thread. So every reply reaches the right session no matter
+  which socket the OS delivered it to. Duplicates (when the OS does copy to all sockets) are
+  harmlessly de-duplicated by the pending-map. Verified with a concurrent test: with 100%% of
+  replies misdirected to one socket, both targets still record 100%% of their replies.
+- Reverted the 0.7.5 per-IP rate cap — that addressed rate-limiting, but the real issue was
+  reply misdirection; the engine's send path is back to the v19 behaviour plus this routing.
+
+
+## 0.7.5 — cross-target shared-hop rate coordination
+
+- **Fixed multi-target loss on shared hops (router / BNG / common intermediates).** Root
+  cause: each target runs on its own thread + socket (correct), but those threads probed the
+  SAME shared hops independently, so N targets put N× the ICMP load on one device and the
+  router's ICMP rate-limiting dropped the excess — loss that grows with target count (present
+  in v19 too; it's inherent to N uncoordinated traceroutes through one router).
+  Added a process-global token bucket keyed by hop IP: the AGGREGATE probe rate to any single
+  hop IP across all target threads is capped (~3/s). It applies ONLY to already-discovered
+  hops — route discovery is never throttled — and a throttled probe is skipped, NOT counted
+  as loss. Verified: 1 target unaffected (10/10 sent); 6 targets to one router capped at ~3/s
+  aggregate; unique destinations never throttled.
+- The multi-threaded design itself is sound (independent thread + socket + unique ICMP id per
+  target); the missing piece was cross-thread coordination on shared hops, now added.
+
+
+## 0.7.4 — restore v19 hop discovery
+
+- **Fixed 'not all hops discovered' regression** by reverting the ICMP-identifier change: the
+  engine's probing/discovery code is now byte-identical to the known-good v19 (the only
+  additions are the no-op-when-empty per-hop-pause skip and the pausedHops config field).
+  v19's id formula already makes each target's id per-target-unique, so replies still can't
+  be stolen between targets — the extra atomic-counter change was unnecessary and was the
+  sole engine difference from v19, so it's gone.
+- **Multi-target shared-hop loss:** with the engine back to v19, this returns to v19's level.
+  The residual loss when several targets trace through the same router is the router's own
+  ICMP-error (TTL-exceeded) rate-limiting — inherent to concurrent traceroute through one
+  device, not an app bug; pinging the router directly (echo reply, not rate-limited) stays clean.
+- UI fixes from 0.7.3 retained: solid chart hover tooltip, accent-coloured dark-mode selection
+  bar, and the advanced Ping tool.
+
+
+## 0.7.3 — multi-target ICMP fix, tooltip/selection UI, advanced ping
+
+- **Multi-target router loss:** each target session now gets a process-GLOBAL unique ICMP
+  identifier (atomic counter) instead of a time-based one. Every raw ICMP socket receives a
+  copy of every reply, so a colliding id let one target match/consume another's shared-hop
+  (router) replies — exactly the 'enable target 1 → target 2 router goes 100%%' symptom.
+  Unique ids mean replies are attributed to exactly one session.
+  NOTE: routers (incl. ASUS) rate-limit ICMP *error* (TTL-exceeded) generation per RFC, so
+  many targets tracing through the same router can still show some shared-hop loss — that
+  part is the router, not the app; pinging the router directly (echo reply, not rate-limited)
+  won't show it.
+- **Confirmed multi-threaded:** every target runs on its own std::thread with its own raw
+  socket and unique ICMP id; the resolver runs in the Electron main process. Independent and
+  concurrent.
+- **Chart hover tooltip** now has a solid themed background (was transparent → text blended
+  into the plot grid in both themes).
+- **Selected-target bar** is now accent-coloured in dark mode (the accent tokens existed only
+  for light mode, so the dark bar rendered black).
+- **Advanced Ping tool:** size, timeout, TTL, interval, IPv4/IPv6, and continuous mode
+  (cross-platform flag mapping), live parsed stats (sent/recv/loss/min/avg/max/jitter), and
+  colorized output.
+
+
 ## 0.7.2 — latest packages, everything working
 
 - **All packages at latest, probing preserved.** The 0-hops regression was proven (by the

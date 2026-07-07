@@ -366,7 +366,10 @@ public:
                   << ",\"maxhops\":" << int(cfg.max_hops)
                   << ",\"raw\":" << (cfg.privileged ? "true" : "false")
                   << ",\"family\":\"" << fam << "\""
-                  << ",\"src\":\"" << esc(cfg.source_addr) << "\"},";
+                  << ",\"src\":\"" << esc(cfg.source_addr) << "\""
+                  << ",\"pausedHops\":[";
+                { bool first = true; for (uint8_t ph : cfg.paused_hops) { if (!first) o << ","; o << int(ph); first = false; } }
+                o << "]},";
             }
             o << "\"hops\":[";
             double cutoff = focus ? now_secs() - *focus : 0;

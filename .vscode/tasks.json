@@ -4,8 +4,8 @@
     {
       "label": "Net Pulse: Build engine (Node-API addon)",
       "type": "shell",
-      "windows": { "command": "npm install; npx cmake-js compile --runtime electron --runtime-version $(node -p \"require('../electron/node_modules/electron/package.json').version\")" },
-      "linux":   { "command": "npm install && npx cmake-js compile --runtime electron --runtime-version \"$(node -p \"require('../electron/node_modules/electron/package.json').version\")\"" },
+      "windows": { "command": "npm install; npx cmake-js rebuild --runtime electron --runtime-version $(node -p \"require('../electron/node_modules/electron/package.json').version\")" },
+      "linux":   { "command": "npm install && npx cmake-js rebuild --runtime electron --runtime-version \"$(node -p \"require('../electron/node_modules/electron/package.json').version\")\"" },
       "options": { "cwd": "${workspaceFolder}/napi" },
       "problemMatcher": []
     },

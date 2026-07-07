@@ -7,6 +7,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,7 @@ struct Settings {
     bool privileged = true;
     std::optional<double> focus_secs = 600.0;
     std::string source_addr; // optional local IP to bind (choose egress interface)
+    std::set<uint8_t> paused_hops; // hops the user paused — skipped in send loop (cuts load)
 };
 
 struct NewPoint {

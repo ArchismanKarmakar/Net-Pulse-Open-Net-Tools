@@ -368,6 +368,7 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
         double soonest = now + 0.25;
         bool due_but_paced_out = false;
         auto try_send = [&](uint8_t ttl) {
+            if (s.paused_hops.count(ttl)) return; // user paused this hop
             double& nx = next_send[ttl];
             // First-probe stagger (as before): ramp across hops instead of one
             // simultaneous burst. Subsequent cadence is carried by `nx`.

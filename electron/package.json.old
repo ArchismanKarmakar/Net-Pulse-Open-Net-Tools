@@ -1,6 +1,6 @@
 {
   "name": "net-pulse-open-net-tools-desktop",
-  "version": "0.7.1",
+  "version": "0.6.2",
   "description": "Net Pulse — Open Net Tools: cross-platform path-latency & network diagnostics desktop app (Electron + C++ Node-API engine)",
   "main": "main.js",
   "scripts": {
@@ -13,24 +13,18 @@
     "dist:dir": "electron-builder --dir"
   },
   "devDependencies": {
-    "electron": "^43.0.0",
+    "electron": "^33.0.0",
     "electron-builder": "^26.15.3"
   },
   "license": "AGPL-3.0-or-later",
   "author": "Archisman Karmakar",
   "productName": "Net Pulse — Open Net Tools",
   "engines": {
-    "node": ">=20.19"
+    "node": ">=20"
   },
   "homepage": "https://github.com/ArchismanKarmakar/Net-Pulse-Open-Net-Tools",
   "repository": {
     "type": "git",
     "url": "https://github.com/ArchismanKarmakar/Net-Pulse-Open-Net-Tools.git"
-  },
-  "overrides": {
-    "glob": "^13.0.6",
-    "rimraf": "^6.0.1",
-    "inflight": "npm:@favware/skip-dependency@^1.2.4",
-    "boolean": "npm:@favware/skip-dependency@^1.2.4"
   }
 }

@@ -30,7 +30,7 @@ const api = async (path, opts) => {
     case '/api/state': return np.getState(q.focus && q.focus !== 'all' ? Number(q.focus) : undefined)
     case '/api/interfaces': return np.listInterfaces()
     case '/api/add': return { id: await np.addTarget({ target: q.target, family: q.family, probe: Number(q.probe), trace: Number(q.trace), timeout: Number(q.timeout), payload: Number(q.payload), maxhops: Number(q.maxhops), raw: q.raw !== '0', src: q.src || '' }) }
-    case '/api/update': { const o = {}; ['probe', 'timeout', 'payload', 'maxhops'].forEach((k) => { if (q[k] != null) o[k] = Number(q[k]) }); if (q.family) o.family = q.family; if (q.src != null) o.src = q.src; await np.updateTarget(Number(q.id), o); return { ok: true } }
+    case '/api/update': { const o = {}; ['probe', 'timeout', 'payload', 'maxhops'].forEach((k) => { if (q[k] != null) o[k] = Number(q[k]) }); if (q.family) o.family = q.family; if (q.src != null) o.src = q.src; if (q.pausedHops != null) o.pausedHops = q.pausedHops === '' ? [] : q.pausedHops.split(',').map(Number).filter((n) => Number.isFinite(n)); await np.updateTarget(Number(q.id), o); return { ok: true } }
     case '/api/pause': await np.pauseTarget(Number(q.id), q.on !== '0'); return {}
     case '/api/stop': await np.stopTarget(Number(q.id)); return {}
     case '/api/remove': await np.removeTarget(Number(q.id)); return {}
@@ -233,6 +233,19 @@ export default function App() {
   const [tab, setTab] = useState('path') // 'path' (traceroute/MTR home) | 'ping' | 'dns' | 'ports'
   const [theme, setTheme] = useState(() => { try { return localStorage.getItem('np-theme') || 'dark' } catch { return 'dark' } })
   const chartRef = useRef(null)
+  const [modal, setModal] = useState(null)
+  const modalResolveRef = useRef(null)
+  const showModal = ({ title, message, details, buttons = [{ label: 'OK', value: true, primary: true }] }) => new Promise((resolve) => {
+    modalResolveRef.current = resolve
+    setModal({ title, message, details, buttons })
+  })
+  const closeModal = (value) => {
+    setModal(null)
+    if (modalResolveRef.current) {
+      modalResolveRef.current(value)
+      modalResolveRef.current = null
+    }
+  }
 
   // ---- resizable panels (sidebar width, table/chart split) ----
   const [sidebarWidth, setSidebarWidth] = useState(() => { const v = Number(localStorage.getItem('np-sidebar-w')); return v >= 230 ? v : 300 })
@@ -366,6 +379,15 @@ export default function App() {
     if (Object.keys(errs).length) return
     const q = new URLSearchParams({ id: sel.id, probe: editForm.probe, timeout: editForm.timeout, payload: editForm.payload, maxhops: editForm.maxhops, family: editForm.family, src: editForm.src })
     try { await api(`/api/update?${q}`, { method: 'POST' }); setEditing(false) } catch {}
+  }
+
+  // Pause/resume probing of an individual hop (cuts network load for that hop).
+  const toggleHopPause = async (hop) => {
+    if (!sel) return
+    const cur = new Set(sel.config?.pausedHops || [])
+    cur.has(hop) ? cur.delete(hop) : cur.add(hop)
+    const list = [...cur].sort((a, b) => a - b).join(',')
+    try { await api(`/api/update?id=${sel.id}&pausedHops=${list}`, { method: 'POST' }); refreshState() } catch {}
   }
 
   const targets = state.targets || []
@@ -571,6 +593,28 @@ export default function App() {
 
   // ASN/network enrichment for public hop IPs (cached; only refetches on change)
   const ipKey = useMemo(() => sel ? [...new Set(sel.hops.map((h) => h.address).filter(bgp.isPublicIp))].sort().join(',') : '', [sel])
+
+  // Reverse-DNS hostnames, resolved in the Electron main process (Node dns) so
+  // the probe engine never blocks on getnameinfo. Cached per IP; results fill
+  // the HOST column.
+  const hostCacheRef = useRef({})
+  const [hostCache, setHostCache] = useState({})
+  useEffect(() => {
+    const rev = (typeof window !== 'undefined' && window.netpulse && window.netpulse.tools && window.netpulse.tools.reverse)
+    if (!sel || !rev) return
+    const ips = [...new Set(sel.hops.map((h) => h.address))].filter((ip) => ip && bgp.isPublicIp(ip) && !(ip in hostCacheRef.current))
+    if (!ips.length) return
+    let alive = true
+    ;(async () => {
+      for (const ip of ips) {
+        hostCacheRef.current[ip] = '' // mark in-flight so we don't re-request
+        try { const r = await rev(ip); hostCacheRef.current[ip] = (r && r.names && r.names[0]) || '' } catch { hostCacheRef.current[ip] = '' }
+        if (alive) setHostCache({ ...hostCacheRef.current })
+      }
+    })()
+    return () => { alive = false }
+  }, [ipKey])
+  const hostOf = (h) => h.hostname || hostCache[h.address] || ''
   useEffect(() => {
     if (!ipKey) return
     ipKey.split(',').filter(Boolean).forEach(async (ip) => {
@@ -597,7 +641,14 @@ export default function App() {
 
     // ── Config validation ────────────────────────────────────────────────────
     const cfgErrs = validateCfg(form)
-    if (Object.keys(cfgErrs).length) { alert('Please fix the config:\n\n• ' + Object.values(cfgErrs).join('\n• ')); return }
+    if (Object.keys(cfgErrs).length) {
+      await showModal({
+        title: 'Invalid configuration',
+        message: 'Please fix the config before adding the target.',
+        details: <div>{Object.values(cfgErrs).map((m, i) => <div key={i}>• {m}</div>)}</div>,
+      })
+      return
+    }
 
     // ── Duplicate check ──────────────────────────────────────────────────────
     // A target is a "duplicate" when the same host name/IP is already being
@@ -621,7 +672,11 @@ export default function App() {
       )
     })
     if (dupe) {
-      alert(`"${form.target.trim()}" is already being traced with the same config.\n\nChange at least one setting (probe rate, payload, family, hops…) to add a parallel trace, or select the existing target in the list.`)
+      await showModal({
+        title: 'Duplicate trace',
+        message: `"${form.target.trim()}" is already being traced with the same config.`,
+        details: <div>Change at least one setting (probe rate, payload, family, hops…) to add a parallel trace, or select the existing target in the list.</div>,
+      })
       return
     }
     // ─────────────────────────────────────────────────────────────────────────
@@ -631,7 +686,15 @@ export default function App() {
     const isIPv4Literal = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(targetText)
     const isIPv6Literal = targetText.includes(':') && !targetText.includes(' ')
     if (isIPv4Literal && form.family === 'v6') {
-      const ok = window.confirm('You entered an IPv4 address but selected IPv6.\n\nWould you like to translate to an IPv4-mapped IPv6 address (::ffff:a.b.c.d) and probe as IPv6?\n\nCancel will fall back to IPv4 family instead.')
+      const ok = await showModal({
+        title: 'IPv4 address selected with IPv6 mode',
+        message: 'You entered an IPv4 address but selected IPv6.',
+        details: <div>Translate to an IPv4-mapped IPv6 address (::ffff:a.b.c.d) and probe as IPv6? Cancel will fall back to IPv4 family instead.</div>,
+        buttons: [
+          { label: 'Translate to IPv6', value: true, primary: true },
+          { label: 'Use IPv4 instead', value: false },
+        ],
+      })
       if (ok) {
         targetText = '::ffff:' + targetText
       } else {
@@ -644,7 +707,15 @@ export default function App() {
       // If it's an IPv4-mapped IPv6 address, allow translating back to IPv4.
       const m = targetText.match(/::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/)
       if (m) {
-        const ok = window.confirm('You entered an IPv6 address that embeds an IPv4 address.\n\nTranslate to the embedded IPv4 and probe as IPv4?\n\nCancel will use IPv6 family instead.')
+        const ok = await showModal({
+          title: 'IPv6 address selected with IPv4 mode',
+          message: 'You entered an IPv6 address that embeds an IPv4 address.',
+          details: <div>Translate to the embedded IPv4 and probe as IPv4? Cancel will use IPv6 family instead.</div>,
+          buttons: [
+            { label: 'Translate to IPv4', value: true, primary: true },
+            { label: 'Use IPv6 instead', value: false },
+          ],
+        })
         if (ok) {
           targetText = m[1]
         } else {
@@ -653,7 +724,12 @@ export default function App() {
         }
       } else {
         // Cannot translate arbitrary IPv6 → IPv4; switch family to v6.
-        alert('Cannot translate a generic IPv6 address to IPv4. The trace will use IPv6 family instead.')
+        await showModal({
+          title: 'Cannot translate to IPv4',
+          message: 'Cannot translate a generic IPv6 address to IPv4.',
+          details: <div>The trace will use IPv6 family instead.</div>,
+          buttons: [{ label: 'OK', value: true, primary: true }],
+        })
         form.family = 'v6'
         setForm({ ...form, family: 'v6' })
       }
@@ -785,9 +861,9 @@ export default function App() {
       }
       await refreshState()
       const msg = [`Imported ${added} target${added !== 1 ? 's' : ''}.`, skipped ? `${skipped} skipped (already traced with same config).` : ''].filter(Boolean).join(' ')
-      alert(msg)
+      await showModal({ title: 'Import complete', message: msg, buttons: [{ label: 'OK', value: true, primary: true }] })
     } catch (e) {
-      alert(`Import failed: ${e.message}`)
+      await showModal({ title: 'Import failed', message: `Import failed: ${e.message}`, buttons: [{ label: 'OK', value: true, primary: true }] })
     }
   }
   // ─────────────────────────────────────────────────────────────────────────
@@ -798,7 +874,19 @@ export default function App() {
   const allPaused = targets.length > 0 && targets.every((t) => t.paused)
   const pauseAll = (on) => Promise.all(targets.map((t) => ctrl(t.id, 'pause', `&on=${on ? 1 : 0}`))).then(refreshState).catch(() => {})
   const pauseOne = (t) => ctrl(t.id, 'pause', `&on=${t.paused ? 0 : 1}`).then(refreshState).catch(() => {})
-  const removeAll = () => { if (!targets.length) return; if (!confirm(`Remove all ${targets.length} target(s)?`)) return; Promise.all(targets.map((t) => ctrl(t.id, 'remove'))).then(() => { setSelId(null); refreshState() }).catch(() => {}) }
+  const removeAll = async () => {
+    if (!targets.length) return
+    const ok = await showModal({
+      title: 'Remove all targets',
+      message: `Remove all ${targets.length} target(s)?`,
+      buttons: [
+        { label: 'Remove all', value: true, primary: true },
+        { label: 'Cancel', value: false },
+      ],
+    })
+    if (!ok) return
+    Promise.all(targets.map((t) => ctrl(t.id, 'remove'))).then(() => { setSelId(null); refreshState() }).catch(() => {})
+  }
   const quickAdd = (host) => { setForm((f) => ({ ...f, target: host })); setTimeout(() => addTargetHost(host), 0) }
   const [about, setAbout] = useState(false)
   const openDetail = (ip) => {
@@ -881,6 +969,57 @@ export default function App() {
 
   const dest = sel ? sel.hops.find((h) => h.is_dest) : null
   const asnOf = (ip) => asn[ip] || null
+
+  function CustomTooltip({ active, payload, label }) {
+    if (!active || !payload || !payload.length || !sel) return null
+    const time = timeFmt(label)
+    return (
+      <div className="chart-tooltip">
+        <div className="chart-tooltip-header">{time}</div>
+        <div className="chart-tooltip-body">
+          {payload.map((p, idx) => {
+            const hopNo = Number(String(p.dataKey || '').replace(/^h/, ''))
+            const hop = sel.hops.find((h) => Number(h.hop) === hopNo)
+            if (!hop) return null
+            const info = asn[hop.address] || {}
+            return (
+              <div key={idx} className="chart-tooltip-row">
+                <div className="ctr-left">
+                  <div className="ctr-hop">Hop {hop.hop}</div>
+                  <div className="ctr-host">{hop.hostname || hostCache[hop.address] || hop.address}</div>
+                  <div className="ctr-meta">{info.asn ? `AS${info.asn}` : '—'}{info.holder ? ` · ${info.holder}` : ''}</div>
+                </div>
+                <div className="ctr-right">
+                  <div className="ctr-rtt">{p.value == null ? '—' : `${p.value.toFixed(1)} ms`}</div>
+                  <div className="ctr-statline">sent {hop.sent} · recv {hop.recv} · loss {hop.loss.toFixed(1)}%</div>
+                  <div className="ctr-stats">med {fmt(hop.med)} · avg {fmt(hop.avg)} · min {fmt(hop.min)} · max {fmt(hop.max)} · jit {fmt(hop.jitter)}</div>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    )
+  }
+
+  function Modal({ title, message, details, buttons = [], onClose }) {
+    return (
+      <div className="modal-overlay" onClick={() => onClose(false)}>
+        <div className="modal-box" onClick={(e) => e.stopPropagation()}>
+          <h2 className="modal-title">{title}</h2>
+          <div className="modal-message">{message}</div>
+          {details && <div className="modal-details">{details}</div>}
+          <div className="modal-actions">
+            {buttons.map((btn, idx) => (
+              <button key={idx} className={btn.primary ? 'primary' : ''} onClick={() => onClose(btn.value)}>
+                {btn.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="app">
@@ -1191,12 +1330,17 @@ export default function App() {
                           const boundary = a && prev && a.asn && prev.asn && a.asn !== prev.asn
                           const prevAvg = i > 0 ? sel.hops[i - 1].avg : null
                           const nextAvg = i < sel.hops.length - 1 ? sel.hops[i + 1].avg : null
+                          const hopPaused = (sel.config?.pausedHops || []).includes(h.hop)
                           return (
-                            <tr key={h.hop} className={h.hop === selHop ? 'selrow' : ''} onClick={() => setSelHop(h.hop)}>
-                              <td><span className={'hopdot st-' + hopStatus(h)} title={hopStatus(h)} />{h.hop}{h.is_dest ? ' ◀' : ''}</td>
+                            <tr key={h.hop} className={(h.hop === selHop ? 'selrow' : '') + (hopPaused ? ' hoppaused' : '')} onClick={() => setSelHop(h.hop)}>
+                              <td>
+                                <button className="hop-pause" title={hopPaused ? 'Resume probing this hop' : 'Pause probing this hop (reduce load)'}
+                                  onClick={(e) => { e.stopPropagation(); toggleHopPause(h.hop) }}>{hopPaused ? '▶' : '⏸'}</button>
+                                <span className={'hopdot st-' + hopStatus(h)} title={hopStatus(h)} />{h.hop}{h.is_dest ? ' ◀' : ''}
+                              </td>
                               <td><div className="plbar"><span style={{ width: `${Math.min(100, h.loss)}%` }} /></div><i className={h.loss > 0 ? 'loss' : ''}>{h.loss.toFixed(0)}</i></td>
                               <td className="mono">{h.address}</td>
-                              <td className="host">{h.hostname}</td>
+                              <td className="host" title={hostOf(h)}>{hostOf(h)}</td>
                               <td className={'asn' + (boundary ? ' boundary' : '')} onClick={(e) => { e.stopPropagation(); openDetail(h.address) }}>
                                 {a ? (a.loading ? '…' : a.asn ? `AS${a.asn}` : '—') : (bgp.isPublicIp(h.address) ? '…' : 'priv')}
                               </td>
@@ -1229,7 +1373,7 @@ export default function App() {
                         <CartesianGrid stroke="var(--grid)" />
                         <XAxis dataKey="ts" type="number" domain={["dataMin","dataMax"]} tickFormatter={timeFmt} stroke="var(--axis)" tick={{ fill: "var(--axis)" }} fontSize={12} />
                         <YAxis stroke="var(--axis)" tick={{ fill: "var(--axis)" }} fontSize={12} domain={yDomain} allowDataOverflow label={{ value: "ms", angle: -90, position: "insideLeft", fill: "var(--axis)" }} />
-                        <Tooltip labelFormatter={timeFmt} contentStyle={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 6, color: "var(--text)" }} labelStyle={{ color: "var(--muted)" }} itemStyle={{ color: "var(--text)" }} />
+                        <Tooltip content={<CustomTooltip />} labelFormatter={timeFmt} contentStyle={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 6, color: "var(--text)" }} labelStyle={{ color: "var(--muted)" }} itemStyle={{ color: "var(--text)" }} />
                         <Legend />
                         {shownHops.map((h, i) => (
                           <Line key={h.hop} type="linear" dataKey={`h${h.hop}`} name={`hop ${h.hop}`} stroke={hopColor(i, h.hop === selHop)} dot={false} connectNulls={false} strokeWidth={h.hop === selHop ? 2.5 : 1.3} isAnimationActive={false} />

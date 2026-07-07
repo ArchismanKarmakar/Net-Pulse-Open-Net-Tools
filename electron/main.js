@@ -141,6 +141,11 @@ function registerEngineIpc() {
 }
 
 function applyContentSecurityPolicy() {
+  // The renderer needs no privileged web permissions (camera, mic, geolocation,
+  // notifications, USB, …). Deny every permission request/check outright.
+  session.defaultSession.setPermissionRequestHandler((_wc, _perm, cb) => cb(false))
+  if (session.defaultSession.setPermissionCheckHandler)
+    session.defaultSession.setPermissionCheckHandler(() => false)
   // Allow self + https for the external BGP/routing lookups (RIPEstat, DoH, RDAP);
   // block everything else. No remote scripts, no eval.
   session.defaultSession.webRequest.onHeadersReceived((details, cb) => {
@@ -169,6 +174,10 @@ async function createWindow() {
       contextIsolation: true,   // renderer can't touch Node directly
       nodeIntegration: false,   // no Node in the renderer
       sandbox: true,            // renderer runs sandboxed
+      webSecurity: true,        // enforce same-origin / CSP (explicit for audits)
+      allowRunningInsecureContent: false,
+      webviewTag: false,        // no <webview> embedding
+      spellcheck: false,
       preload: path.join(__dirname, 'preload.js'),
     },
   })
@@ -197,8 +206,8 @@ app.whenReady().then(() => {
   engine = loadEngine()
   if (!engine) {
     dialog.showErrorBox('Net Pulse — Open Net Tools',
-      'Native engine not found.\n\nBuild it first:\n  cd napi && npm install\n  npx cmake-js compile --runtime electron --runtime-version ' +
-      process.versions.electron)
+      'Native engine not found.\n\nBuild it first:\n  cd napi && npm install\n  npm run build:electron\n\n(Electron version ' +
+      process.versions.electron + ')')
     app.quit()
     return
   }

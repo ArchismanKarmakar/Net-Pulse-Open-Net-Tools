@@ -1,0 +1,25 @@
+// {
+//   "name": "netpulse-native",
+//   "version": "0.6.3",
+//   "description": "Net Pulse — Open Net Tools C++ path-latency engine as a CMake.js Node-API addon (in-process, no port)",
+//   "main": "index.js",
+//   "scripts": {
+//     "install": "node -e \"console.log('[netpulse-native] npm install does not build the addon (no node-gyp). Run: npm run build:electron')\"",
+//     "build": "cmake-js rebuild",
+//     "build:debug": "cmake-js rebuild -D",
+//     "build:electron": "node build-electron.js",
+//     "clean": "cmake-js clean",
+//     "_note": "This addon builds with CMake.js only (no node-gyp). `npm i` just fetches deps; run `npm run build:electron` to build for the installed Electron ABI."
+//   },
+//   "dependencies": {
+//     "node-addon-api": "^8.5.0"
+//   },
+//   "devDependencies": {
+//     "cmake-js": "^7.3.0"
+//   },
+//   "engines": {
+//     "node": ">=20"
+//   },
+//   "license": "AGPL-3.0-or-later",
+//   "author": "Archisman Karmakar"
+// }

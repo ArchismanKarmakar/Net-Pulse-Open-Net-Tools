@@ -20,6 +20,10 @@
   --shadow-sm: 0 1px 2px rgba(0,0,0,.35);
   --shadow-md: 0 4px 16px -4px rgba(0,0,0,.45), 0 1px 3px rgba(0,0,0,.3);
   --shadow-inset: inset 0 1px 0 rgba(255,255,255,.03);
+  /* Sidebar target-card isolation. In dark mode a transparent card blended into
+     the panel; give each card a slightly raised fill + a visible border so the
+     list reads as distinct cards, matching the clarity light mode already had. */
+  --card-bg:#141a23; --card-border:#252f3d; --card-hover:#1b232f;
 }
 :root[data-theme=light] {
   --bg:#e8edf3; --panel:#ffffff; --panel2:#eaeff5; --input-bg:#ffffff;
@@ -29,6 +33,11 @@
   --good:#047857; --good-soft:#0d9488; --lime:#65a30d;
   --warn:#a15c07; --warn-soft:#c2760a;
   --bad:#b3400f; --danger:#c81e1e;
+  --target-card-accent-bg: color-mix(in srgb, var(--accent) 9%, var(--panel));
+  --target-card-accent-bar: var(--accent);
+  --card-bg:#ffffff; --card-border:#d3dbe6; --card-hover:#eef2f7;
+  --traceroute-header-bg: var(--panel);
+  --traceroute-header-text: var(--text);
   /* grid needs to visibly contrast against bg, not just differ numerically —
      the previous value (#dde4ec on #eef1f6) was nearly the same pale tone, so
      the dot-grid chart texture that's obvious in dark mode was nearly
@@ -67,6 +76,7 @@
   table { @apply w-full border-collapse text-[13px]; }
   th, td { @apply text-left px-2.5 py-[5px] border-b border-border whitespace-nowrap; }
   th { @apply sticky top-0 bg-panel2 text-muted font-medium text-[11px] uppercase tracking-wide; }
+  :root[data-theme=light] th { background: var(--traceroute-header-bg); color: var(--traceroute-header-text); }
 }
 
 @layer components {
@@ -88,14 +98,32 @@
   button.primary, .apply { @apply bg-accent border-accent text-[#04222b] font-semibold; }
   button.primary:hover, .apply:hover { @apply brightness-110; }
   .themebtn { @apply bg-transparent border-none text-base px-1 ml-2; }
+  :root[data-theme=light] button.primary, :root[data-theme=light] .apply { background: var(--accent); border-color: var(--accent); color: #ffffff; }
+  :root[data-theme=light] button.primary:hover, :root[data-theme=light] .apply:hover { filter: brightness(1.05); }
 
   /* ---- targets sidebar ---- */
   aside { @apply w-[230px] border-r border-border p-2.5 flex flex-col gap-2; background: var(--panel); }
   aside h3 { @apply m-0 text-[11px] text-muted uppercase tracking-wider; }
   aside ul { @apply list-none m-0 p-0 flex-1 overflow-auto flex flex-col gap-1; }
-  aside li { @apply px-2.5 py-2 rounded-lg cursor-pointer flex flex-col; position: relative; }
-  aside li:hover { @apply bg-panel2; }
-  aside li.sel { @apply bg-sel outline outline-1 outline-border2; box-shadow: var(--shadow-sm); }
+  aside li { @apply px-2.5 py-2 rounded-lg cursor-pointer flex flex-col; position: relative; background: var(--card-bg); border: 1px solid var(--card-border); transition: background-color .12s, border-color .12s; }
+  aside li:hover { background: var(--card-hover); border-color: var(--border2); }
+  aside li.sel {
+    @apply bg-sel;
+    background: var(--target-card-accent-bg);
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--card-border));
+    padding-left: 1.75rem;
+    box-shadow: var(--shadow-sm);
+  }
+  aside li.sel::before {
+    content: '';
+    position: absolute;
+    left: 10px;
+    top: 10px;
+    bottom: 10px;
+    width: 4px;
+    border-radius: 999px;
+    background: var(--target-card-accent-bar);
+  }
 
   /* Per-card delete button — small, lives in the card header, revealed on hover */
   .card-del {
@@ -303,3 +331,13 @@ aside li:hover .card-pause, aside li.sel .card-pause { opacity: .8; }
   border-radius: 8px; padding: 4px 9px; font-size: 12.5px; }
 .port-chip em { color: var(--muted); font-style: normal; margin-left: 6px; }
 .toolpage .danger { color: var(--danger); }
+
+/* Per-hop pause control (added) */
+.hop-pause { opacity: 0; background: transparent; border: none; color: var(--muted);
+  font-size: 11px; line-height: 1; padding: 1px 4px; margin-right: 4px; border-radius: 5px;
+  cursor: pointer; vertical-align: middle; transition: opacity .12s, color .12s, background .12s; }
+tr:hover .hop-pause, tr.hoppaused .hop-pause { opacity: .75; }
+.hop-pause:hover { opacity: 1 !important; color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent); box-shadow: none; }
+tr.hoppaused { opacity: .5; }
+tr.hoppaused .hop-pause { color: var(--accent); }

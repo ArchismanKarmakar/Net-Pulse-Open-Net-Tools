@@ -2,6 +2,22 @@
 
 <p align="center"><img src="branding/logo.svg" width="96" height="96" alt="Net Pulse — Open Net Tools logo" /></p>
 
+> ### ⚠️ Upgrading? Extract into a CLEAN folder
+> Do **not** unzip a new release *over* an old one. Extraction doesn't delete
+> files that were removed in the new version — most importantly `napi/binding.gyp`.
+> If a stale `napi/binding.gyp` is present, `npm install` in `napi/` will run
+> **node-gyp** (which forces **C++17** and shows `overriding '/std:c++20' with
+> '/std:c++17'`) instead of the CMake.js **C++20** build. This project no longer
+> ships `binding.gyp`; if you see node-gyp run, delete `napi/binding.gyp` and
+> `napi/build/` (or just run `build-and-run.ps1`, which cleans them for you).
+>
+> The deprecation warnings during `npm install` in `electron/` (`inflight`,
+> `glob@7`, `rimraf@2`, `boolean`) come from **electron-builder's** own
+> dependency tree — they are **dev-only build tooling, not shipped in the app**,
+> and don't affect the signed binary. They'll clear as electron-builder updates
+> upstream; don't `npm audit fix --force` (it pulls breaking majors).
+
+
 > **Running the app:** Net Pulse is an **Electron desktop app**. Run it from a
 > terminal, **not** from VS Code's C++ *Debug/Play* button.
 >
@@ -64,17 +80,17 @@ exactly like a Qt app talks to its backend.
 
 ## Prerequisites
 
-- **Node.js** 18+ and npm
+- **Node.js 20+ LTS** and npm (the project targets active-LTS Node — 20 or 22).
 - **CMake** 3.15+ on your **PATH** — CMake.js does *not* bundle it.
   - Easiest: install from <https://cmake.org/download/> and tick **"Add CMake to
     the system PATH"**, then open a **new** terminal and check `cmake --version`.
   - Or use the CMake that ships with Visual Studio by launching
     **"Developer PowerShell for VS"** (it puts VS's CMake on PATH).
-- A **C++17 compiler**
+- A **C++20 compiler**
   - Windows: Visual Studio Build Tools / VS 2022+ — *"Desktop development with C++"*
-  - Linux: `build-essential`; macOS: Xcode command-line tools
-- The addon is built with **CMake.js**, so it is **independent of the Node.js
-  version** (and rebuildable for Electron's ABI).
+  - Linux: `build-essential` (GCC 10+/Clang 12+); macOS: Xcode command-line tools
+- The addon is built with **CMake.js** only (no node-gyp), so it is **independent
+  of the Node.js version** and rebuildable for Electron's ABI.
 
 > `npm install` in `napi/` only fetches dependencies — it does **not** build the
 > addon. You build it explicitly (below), after CMake is on your PATH.
@@ -85,13 +101,16 @@ exactly like a Qt app talks to its backend.
 
 ```bash
 cd napi
-npm install                  # fetches node-addon-api + cmake-js (no build yet)
-npm run build:electron       # builds netpulse.node for Electron's ABI
+npm install                  # fetches node-addon-api + cmake-js only (no build)
+npm run build:electron       # builds netpulse.node for the INSTALLED Electron's ABI
 # (or `npm run build` to build for plain Node, e.g. for the test in index.js)
 ```
 
-`build:electron` pins Electron 29.1.0; if you use a different Electron, run:
-`npx cmake-js compile --runtime electron --runtime-version <your version>`.
+`build:electron` auto-detects the Electron version installed in `../electron`
+(via `build-electron.js`) — nothing is hard-coded, so upgrading Electron just
+works. Install Electron first (`cd electron && npm install`) so it can be found.
+Both `build` scripts do a **clean** rebuild (`cmake-js rebuild`) so a header-only
+engine change is never missed.
 
 ### 2. Renderer
 
@@ -108,6 +127,30 @@ cd electron
 npm install            # electron
 npm start              # launches the app (loads the addon; no server/port)
 ```
+
+On launch the engine logs its build tag, e.g.
+`[Net Pulse] native engine loaded — build <tag>` and `[Net Pulse] engine build: <tag>`.
+If `engine build:` shows a real tag (not `unknown`), the freshly-built addon is
+loaded. `unknown` means the addon wasn't rebuilt (or an old `.node` is on disk).
+
+### 4. Distributable installers (signed)
+
+Build order matters: build the UI and the addon (for the target Electron ABI)
+first, then package.
+
+```bash
+cd web    && npm install && npm run build            # UI → web/dist
+cd ../napi && npm install && npm run build:electron  # addon → napi/build/Release/*.node
+cd ../electron && npm install && npm run dist        # → ../release/ (installer)
+```
+
+`electron/electron-builder.yml` produces an NSIS installer (Windows), dmg/zip
+(macOS), and AppImage/deb (Linux). **Code signing** is wired via environment
+variables (`CSC_LINK`/`CSC_KEY_PASSWORD`, plus Apple notarization vars on macOS)
+so no secret is stored in the repo. For OS/AV trust and a clean VirusTotal
+result you **must sign** the artifacts — see [`SECURITY.md`](SECURITY.md), which
+covers signing, notarization, reputation, and handling AV false positives. The
+config never packs/obfuscates binaries (a common false-positive trigger).
 
 Dev mode (hot-reload UI from Vite while still using the native engine):
 

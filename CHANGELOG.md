@@ -1,5 +1,128 @@
 # Changelog
 
+## 0.7.2 — latest packages, everything working
+
+- **All packages at latest, probing preserved.** The 0-hops regression was proven (by the
+  v19 diff) to be the in-engine resolver thread producing empty hops — the frontend parsed
+  dest/config fine, so React 19 / Vite 8 were NOT the cause. The engine stays on v19's
+  byte-identical probing core (no resolver thread; hostnames run in the Electron main
+  process instead), so we can ship the latest frontend safely:
+  - React **19.2**, Vite **8.1** (Rolldown), @vitejs/plugin-react **6**, Recharts **3.9**,
+    Tailwind 3.4 (latest 3.x; v4 is a breaking config rewrite, not requested).
+  - Electron **43**, electron-builder **26**, node-addon-api **8.5**, cmake-js **8.0**, C++**20**.
+- **Security: 0 vulnerabilities across every tree** (web, napi, electron). cmake-js 8 drops
+  the vulnerable tar + deprecated npmlog/gauge/are-we-there-yet; glob pinned to **13.0.6**
+  (current, not deprecated); rimraf 6 + inflight/boolean stubs. Only unavoidable dev-only
+  note is any transitive glob the toolchain still resolves — now on 13, it's clean.
+- Per-hop pause, tabbed tools, dark-mode sidebar isolation, and main-process hostnames retained.
+
+
+## 0.7.1 — restore working probing (regression fix) + cmake-js 8 + glob 13
+
+- **Fixed: all targets stuck "discovering / 0 hops".** Root cause isolated by diffing
+  against the known-good v19: the regression was the in-engine reverse-DNS **resolver
+  thread** plus the **React 19 / Vite 8 (Rolldown)** frontend — v19 uses React 18 + Vite 6
+  and has no engine thread. The engine is restored to v19's byte-identical probing core
+  (only the safe, no-op-when-empty per-hop-pause skip is re-added), and the frontend is
+  back on the verified React 18.3 + Vite 6.3 stack (Recharts 3 kept — v19 already used it).
+- **Hostnames without touching the engine:** reverse DNS now runs in the Electron main
+  process (Node `dns`) and fills the HOST column via a cached lookup — no getnameinfo on
+  the probe path, so it can't stall or crash probing.
+- **cmake-js 8.0** (was 7.4): removes the vulnerable `tar` and the deprecated
+  npmlog/gauge/are-we-there-yet stack. napi now audits **0 vulnerabilities**, no deprecations.
+- **glob 13.0.6** override (was forcing 11): 13 is the current release and is **not**
+  deprecated, so the electron packaging tree no longer shows the glob deprecation. rimraf 6
+  + inflight/boolean stubs remain → **0 vulnerabilities**.
+- Per-hop pause, tabbed tools, and dark-mode sidebar isolation retained.
+
+
+## 0.7.0 — package refresh, hostnames, per-hop pause
+
+- **Latest toolchain:** React **19**, Vite **8** (Rolldown), Recharts **3**, Electron **43**,
+  node-addon-api **8.9**, C++**20**. Web build verified; web tree has **0 vulnerabilities**.
+  electron-builder kept at 26 with **npm `overrides`** (modern glob/rimraf, stubbed
+  inflight/boolean) → **0 vulnerabilities** and all deprecations removed EXCEPT `glob`,
+  which its own maintainer marks deprecated on *every* version (a funding notice) and which
+  electron-builder must pull — so it is unavoidable, dev-only, and non-vulnerable. Tailwind
+  kept at 3.4 (latest 3.x, not deprecated, no vulns): v4 is a config-format rewrite that
+  would risk 100+ @apply/theme calls with zero security benefit.
+- **Hostnames now resolve** (HOST column). Reverse DNS runs on a dedicated per-session
+  **resolver thread** with a request/result queue, so getnameinfo never stalls the probe
+  loop — this also directly advances the multi-threading goal (probe thread + resolver
+  thread per target, all sessions independent).
+- **Per-hop pause:** each hop row has a ⏸/▶ toggle to stop probing that hop (cuts network
+  load); paused hops are skipped in the send loop and reported in the target config.
+- **Dark-mode sidebar isolation:** target cards now have a raised fill + border per theme
+  so the list reads as distinct cards in dark mode, matching light mode.
+- **N-API safety:** pausedHops input is validated/bounded like all other numeric input.
+
+
+## Unreleased
+
+- **Definitive fix for `node-gyp` running + `/std:c++20 → c++17` downgrade.** Root cause
+  was a **stale `napi/binding.gyp`** left behind when a new release is unzipped *over* an
+  old folder — npm then auto-runs node-gyp (which forces C++17) instead of the CMake.js
+  C++20 build. `binding.gyp` is gone from the project, and now a no-op `install` script in
+  `napi/package.json` means npm will **never** auto-run node-gyp even if a stale
+  `binding.gyp` is present; `build-and-run` also deletes any stale `napi/binding.gyp` +
+  `napi/build/` before building. README warns to extract into a clean folder.
+- Clarified that the `inflight`/`glob@7`/`rimraf@2`/`boolean` deprecation warnings are
+  **electron-builder's dev-only transitive deps** — not shipped in the app, not a runtime
+  security concern; a clean reinstall (no stale tree) also drops stray packages like
+  electron-winstaller.
+
+
+## Unreleased
+
+- **N-API hardening:** every exported native function is now exception-safe — the
+  pause/stop/remove/listInterfaces entry points gained try/catch so a C++ exception can
+  never cross the N-API boundary and abort the process (add/update already had it).
+  Numeric options now reject NaN/Inf, and `target` must be a proper non-empty string
+  (was coerced, which could add a literal "undefined" target).
+- **Deployment trust:** confirmed the signing-ready `electron/electron-builder.yml`
+  (Authenticode via CSC_LINK/CSC_KEY_PASSWORD, SHA-256 + RFC-3161 timestamp, macOS
+  hardened-runtime + entitlements, no UPX/packer) and the SECURITY.md guide covering
+  code-signing, SmartScreen reputation, and clearing VirusTotal detections. Honest
+  caveat documented: an unsigned network tool with a port scanner will draw heuristic
+  flags regardless of code cleanliness — signing + reputation is the fix.
+
+
+## Unreleased
+
+- **Security hardening & trusted-release pipeline:**
+  - N-API boundary: `pauseTarget`/`stopTarget`/`removeTarget` now validate arity/type
+    and throw cleanly (all inputs were already range-clamped and exception-wrapped).
+  - Electron: explicit `webSecurity`/`allowRunningInsecureContent:false`/`webviewTag:false`,
+    and a deny-all permission request/check handler (on top of existing contextIsolation,
+    sandbox, CSP, and navigation locks).
+  - Added **electron-builder** config (`electron/electron-builder.yml`) producing NSIS /
+    dmg+zip / AppImage+deb, with **code-signing + macOS notarization wired via env vars**
+    (no secrets in the repo), correct resource layout for the prebuilt UI and `.node`
+    addon, and no packing/obfuscation. Added `dist*` scripts and installer icons.
+  - Added **SECURITY.md** — hardening posture and an honest, actionable guide to making
+    signed builds trusted by SmartScreen/AV/VirusTotal (signing, notarization, reputation,
+    false-positive handling).
+
+
+## Unreleased
+
+- **Toolchain modernization & build-compat fixes:**
+  - `napi/index.js` now forwards the engine build tag, so `engine build: <tag>` shows
+    the real value instead of a false `unknown` / "OLD addon" warning.
+  - Removed `binding.gyp`: the addon builds with **CMake.js only**. `npm i` no longer
+    auto-runs **node-gyp** and no longer produces a wrong-ABI `.node` that shadowed the
+    CMake.js build.
+  - `build:electron` now **auto-detects the installed Electron version** (build-electron.js)
+    instead of hard-coding 29.1.0 — upgrading Electron no longer causes an ABI mismatch.
+  - Both addon build scripts use clean `cmake-js rebuild` (also in the VS Code task).
+  - **C++20** (was C++17) across both CMake targets — clears the MSVC `/std:c++20`
+    override warning and modernizes the build.
+  - Dependency bumps: Electron 29 → **^33**, Vite 5 → **^6.3**, Recharts 2.12 → **^2.15**,
+    node-addon-api → **^8.5**; added `engines: node >=20` (active LTS). React 18 and
+    Tailwind 3 kept intentionally (React 19 needs a Recharts-3 migration; Tailwind 4 is a
+    config rewrite) to avoid breaking the UI. Web build verified on Vite 6.
+
+
 ## Unreleased
 
 - **Tools are now real tabbed pages** (top tab bar): **Path / MTR** (home, default),

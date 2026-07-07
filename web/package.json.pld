@@ -1,7 +1,7 @@
 {
   "name": "net-pulse-open-net-tools-web",
   "private": true,
-  "version": "0.7.2",
+  "version": "0.6.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,19 +9,19 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "react": "^19.2.0",
-    "react-dom": "^19.2.0",
-    "recharts": "^3.9.2"
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "recharts": "^2.15.4"
   },
   "devDependencies": {
-    "@vitejs/plugin-react": "^6.0.3",
-    "autoprefixer": "^10.4.22",
-    "postcss": "^8.5.10",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.21",
+    "postcss": "^8.5.6",
     "tailwindcss": "^3.4.19",
-    "vite": "^8.1.3"
+    "vite": "^6.3.6"
   },
   "engines": {
-    "node": ">=20.19"
+    "node": ">=20"
   },
   "license": "AGPL-3.0-or-later",
   "author": "Archisman Karmakar",

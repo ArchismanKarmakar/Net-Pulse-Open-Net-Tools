@@ -4,10 +4,13 @@
 // process. Probing runs on the engine's own background threads; getState()
 // returns the latest JSON snapshot (identical shape to the old /api/state).
 //
-// Build:  npm install   (runs node-gyp; needs a C++17 toolchain)
-//         for Electron:  npx electron-rebuild   (matches Electron's ABI)
+// Build:  npm install                (fetches node-addon-api + cmake-js only)
+//         npm run build:electron      (CMake.js rebuild for the installed Electron ABI)
 
 #include <napi.h>
+
+#include <algorithm>
+#include <cmath>
 
 #include "netpulse/manager.hpp"
 
@@ -25,7 +28,9 @@ static Manager& mgr() {
 // huge allocations or unbounded loops.
 static Settings settings_from_obj(const Napi::Object& o, Settings base = Settings{}) {
     auto num = [&](const char* k, double def) {
-        return o.Has(k) && !o.Get(k).IsUndefined() ? o.Get(k).ToNumber().DoubleValue() : def;
+        if (!o.Has(k) || o.Get(k).IsUndefined() || o.Get(k).IsNull()) return def;
+        double v = o.Get(k).ToNumber().DoubleValue();
+        return std::isfinite(v) ? v : def; // reject NaN/Inf from hostile input
     };
     auto clamp = [](double v, double lo, double hi) { return v < lo ? lo : v > hi ? hi : v; };
     base.probe_interval = clamp(num("probe", base.probe_interval), 0.01, 3600.0);
@@ -56,6 +61,18 @@ static Settings settings_from_obj(const Napi::Object& o, Settings base = Setting
         std::string f = o.Get("family").ToString().Utf8Value();
         base.family = f == "v4" ? FamilyPref::V4 : f == "v6" ? FamilyPref::V6 : FamilyPref::Auto;
     }
+    if (o.Has("pausedHops") && o.Get("pausedHops").IsArray()) {
+        base.paused_hops.clear();
+        Napi::Array arr = o.Get("pausedHops").As<Napi::Array>();
+        for (uint32_t i = 0; i < arr.Length(); ++i) {
+            Napi::Value v = arr.Get(i);
+            if (v.IsNumber()) {
+                double h = v.As<Napi::Number>().DoubleValue();
+                if (std::isfinite(h) && h >= 1.0 && h <= 255.0)
+                    base.paused_hops.insert(static_cast<uint8_t>(h));
+            }
+        }
+    }
     base.focus_secs = std::nullopt; // focus is applied per getState() call
     return base;
 }
@@ -66,7 +83,9 @@ static Napi::Value AddTarget(const Napi::CallbackInfo& info) {
         if (info.Length() < 1 || !info[0].IsObject())
             throw Napi::TypeError::New(env, "addTarget(options) expects an object");
         Napi::Object o = info[0].As<Napi::Object>();
-        std::string target = o.Get("target").ToString().Utf8Value();
+        if (!o.Has("target") || !o.Get("target").IsString())
+            throw Napi::TypeError::New(env, "addTarget: 'target' must be a string");
+        std::string target = o.Get("target").As<Napi::String>().Utf8Value();
         if (target.empty() || target.size() > 255)
             throw Napi::TypeError::New(env, "addTarget: invalid target");
         uint64_t id = mgr().add(target, settings_from_obj(o));
@@ -96,30 +115,52 @@ static Napi::Value UpdateTarget(const Napi::CallbackInfo& info) {
 }
 
 static Napi::Value PauseTarget(const Napi::CallbackInfo& info) {
-    mgr().pause(static_cast<uint64_t>(info[0].ToNumber().Int64Value()), info[1].ToBoolean().Value());
-    return info.Env().Undefined();
+    Napi::Env env = info.Env();
+    try {
+        if (info.Length() < 1 || !info[0].IsNumber())
+            throw Napi::TypeError::New(env, "pauseTarget(id, on) expects a numeric id");
+        mgr().pause(static_cast<uint64_t>(info[0].As<Napi::Number>().Int64Value()),
+                    info.Length() > 1 && info[1].ToBoolean().Value());
+        return env.Undefined();
+    } catch (const Napi::Error&) { throw; }
+    catch (const std::exception& e) { throw Napi::Error::New(env, std::string("pauseTarget failed: ") + e.what()); }
 }
 static Napi::Value StopTarget(const Napi::CallbackInfo& info) {
-    mgr().stop(static_cast<uint64_t>(info[0].ToNumber().Int64Value()));
-    return info.Env().Undefined();
+    Napi::Env env = info.Env();
+    try {
+        if (info.Length() < 1 || !info[0].IsNumber())
+            throw Napi::TypeError::New(env, "stopTarget(id) expects a numeric id");
+        mgr().stop(static_cast<uint64_t>(info[0].As<Napi::Number>().Int64Value()));
+        return env.Undefined();
+    } catch (const Napi::Error&) { throw; }
+    catch (const std::exception& e) { throw Napi::Error::New(env, std::string("stopTarget failed: ") + e.what()); }
 }
 static Napi::Value RemoveTarget(const Napi::CallbackInfo& info) {
-    mgr().remove(static_cast<uint64_t>(info[0].ToNumber().Int64Value()));
-    return info.Env().Undefined();
+    Napi::Env env = info.Env();
+    try {
+        if (info.Length() < 1 || !info[0].IsNumber())
+            throw Napi::TypeError::New(env, "removeTarget(id) expects a numeric id");
+        mgr().remove(static_cast<uint64_t>(info[0].As<Napi::Number>().Int64Value()));
+        return env.Undefined();
+    } catch (const Napi::Error&) { throw; }
+    catch (const std::exception& e) { throw Napi::Error::New(env, std::string("removeTarget failed: ") + e.what()); }
 }
 
 static Napi::Value ListInterfaces(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    auto ifs = list_interfaces();
-    Napi::Array arr = Napi::Array::New(env, ifs.size());
-    for (size_t i = 0; i < ifs.size(); ++i) {
-        Napi::Object o = Napi::Object::New(env);
-        o.Set("name", ifs[i].name);
-        o.Set("address", ifs[i].address);
-        o.Set("v6", ifs[i].v6);
-        arr.Set(i, o);
-    }
-    return arr;
+    try {
+        auto ifs = list_interfaces();
+        Napi::Array arr = Napi::Array::New(env, ifs.size());
+        for (size_t i = 0; i < ifs.size(); ++i) {
+            Napi::Object o = Napi::Object::New(env);
+            o.Set("name", ifs[i].name);
+            o.Set("address", ifs[i].address);
+            o.Set("v6", ifs[i].v6);
+            arr.Set(i, o);
+        }
+        return arr;
+    } catch (const Napi::Error&) { throw; }
+    catch (const std::exception& e) { throw Napi::Error::New(env, std::string("listInterfaces failed: ") + e.what()); }
 }
 
 // Building the JSON snapshot (stats + downsampled series for every hop of

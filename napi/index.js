@@ -5,6 +5,10 @@ try { addon = require('./build/Release/netpulse.node') }
 catch (_) { addon = require('./build/netpulse.node') }
 
 module.exports = {
+  // Build tag of the compiled native engine (see NETPULSE_ENGINE_BUILD in
+  // napi.cpp). Forwarded so the app / logs can verify the addon was recompiled.
+  engineBuild: addon.engineBuild,
+  getEngineBuild: () => (addon.getEngineBuild ? addon.getEngineBuild() : addon.engineBuild),
   addTarget: (opts) => addon.addTarget(opts),
   updateTarget: (id, opts) => addon.updateTarget(id, opts),
   pauseTarget: (id, on) => addon.pauseTarget(id, !!on),

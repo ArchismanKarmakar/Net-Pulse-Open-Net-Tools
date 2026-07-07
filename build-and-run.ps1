@@ -25,6 +25,11 @@ Write-Host "[3/4] Building the C++ engine as a Node-API addon for Electron $elec
 # (e.g. core/include/netpulse/manager.hpp) can be missed by an incremental build,
 # which silently leaves the OLD engine in place. A clean rebuild guarantees the
 # addon reflects the current source every time.
+# Defensive: if an OLD copy was extracted over, a stale binding.gyp / build dir
+# can make npm run node-gyp (which forces C++17). Remove them so only the
+# CMake.js (C++20) build is used.
+Remove-Item -Force "$root\napi\binding.gyp" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "$root\napi\build" -ErrorAction SilentlyContinue
 Push-Location "$root\napi"; npm install; npx cmake-js rebuild --runtime electron --runtime-version $electronVer; Pop-Location
 $addon = Get-ChildItem -Path "$root\napi\build" -Recurse -Filter *.node -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $addon) { Write-Error "Native addon (.node) was NOT produced — the engine did not build. Fix the C++ build errors above before running."; exit 1 }

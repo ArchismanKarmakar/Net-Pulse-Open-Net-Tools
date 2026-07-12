@@ -75,7 +75,6 @@ public:
 
 private:
     uint16_t next_seq();
-    void resolve_some_hostnames();
     Snapshot snapshot(bool running, std::vector<NewPoint> new_points) const;
 
     struct InFlight {

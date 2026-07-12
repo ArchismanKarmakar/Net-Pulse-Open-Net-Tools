@@ -1,5 +1,45 @@
 # Changelog
 
+
+## 0.8.0 — direct-echo measurement, global pacer, shared-hop pub/sub, DNS pool
+
+- **Direct-echo hop measurement (fixes "healthy hop shows heavy loss under
+  traceroute").** Measuring a hop by eliciting its ICMP Time-Exceeded (the
+  traceroute way) measures the wrong thing: generating a Time-Exceeded is
+  control-plane work that every router rate-limits hard, so a hop that
+  answers a standalone `ping` at 0%% loss can read 30-100%% loss purely from
+  that rate limit — while the destination, reached with a full-TTL echo and
+  answered with a (non-rate-limited) Echo Reply, stays clean. Once a hop's
+  IP is discovered, the engine now pings that IP directly (`TTL=255`,
+  exactly what `ping <hop-ip>` does) instead of continuing to elicit its
+  Time-Exceeded. A hop that never answers a direct ping after 4 tries is
+  marked echo-silent and falls back to legacy probing (its rate-limit loss
+  is then real and unavoidable, same as `mtr`/`tracert` would show). A rare
+  (45s) legacy re-probe still runs per hop so a mid-session route change is
+  never missed just because direct-echo stopped eliciting Time-Exceeded.
+- **Global send pacer.** A per-target token bucket alone bounds one target;
+  with N targets the *aggregate* rate onto a hop they all share is N times
+  that, which blows past a router's own ICMP rate limit long before N gets
+  large. Added a process-global token bucket that every send must also
+  satisfy — the rate scales with active target count but is hard-capped, so
+  the aggregate can never exceed a safe ceiling no matter how many targets
+  run concurrently.
+- **Shared-hop pub/sub cache.** All targets on the same egress traverse the
+  same early hops; there's no reason for 100 targets to each probe the
+  router once per interval. Whichever session already has a fresh real
+  reply for a given hop publishes it; every other session adopts that
+  sample and skips its own send for that round. Gated to public IPs only —
+  a private/CGNAT address is only unambiguous within one routing domain, so
+  two targets could otherwise attribute one physical device's RTT to a
+  completely different device behind a different NAT/VRF boundary.
+- **6-worker reverse-DNS pool.** Reverse DNS now runs on 6 background
+  workers against a shared, deduplicated queue/cache instead of one, so a
+  single slow/hanging PTR lookup (a node that lets a query sit until its own
+  multi-second timeout) can no longer stall every other pending hostname
+  behind it. Also now resolves LAN/private hops, not just public ones, so a
+  home router's own PTR record (e.g. `RT-XXXX.home.arpa`) is shown — the
+  gap that started this whole investigation.
+
 ## 0.7.6 — fix multi-target shared-hop loss (reply misdirection)
 
 - **Root cause found:** with multiple targets, each runs its own raw ICMP socket, but the OS

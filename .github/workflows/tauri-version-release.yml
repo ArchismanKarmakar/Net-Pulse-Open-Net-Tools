@@ -51,7 +51,7 @@ jobs:
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
 
       # tauri.conf.json's version is the one that actually drives installer
       # filenames/bundle metadata, but Cargo.toml and package.json drifting

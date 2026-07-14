@@ -1,6 +1,6 @@
 {
   "name": "netpulse-native",
-  "version": "0.7.1",
+  "version": "0.8.1",
   "description": "Net Pulse — Open Net Tools C++ path-latency engine as a CMake.js Node-API addon (in-process, no port)",
   "main": "index.js",
   "scripts": {

@@ -6,7 +6,13 @@
       "Bash(./build/Debug/netpulse_tests.exe)",
       "Bash(echo \"EXIT: $?\")",
       "Bash(npm --version)",
-      "Bash(node -p \"require\\('./electron/node_modules/electron/package.json'\\).version\")"
+      "Bash(node -p \"require\\('./electron/node_modules/electron/package.json'\\).version\")",
+      "Bash(node -e ' *)",
+      "Bash(npm run *)",
+      "Bash(python3 -c \"import yaml,sys; yaml.safe_load\\(open\\('.github/workflows/release.yml'\\)\\); yaml.safe_load\\(open\\('.github/workflows/ci.yml'\\)\\); print\\('YAML OK'\\)\")",
+      "Bash(python -c \"import yaml,sys; yaml.safe_load\\(open\\('.github/workflows/release.yml'\\)\\); yaml.safe_load\\(open\\('.github/workflows/ci.yml'\\)\\); print\\('YAML OK'\\)\")",
+      "Bash(npm ls *)",
+      "Read(//c//**)"
     ]
   }
 }

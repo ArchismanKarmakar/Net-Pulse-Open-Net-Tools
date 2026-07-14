@@ -2,6 +2,7 @@
 // focus-window statistics. IPv4 and IPv6. Mirrors the verified Rust core.
 #pragma once
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -9,7 +10,9 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <shared_mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "netpulse/icmp.hpp"
@@ -38,6 +41,65 @@ struct NewPoint {
     double ts;
     std::optional<double> rtt;
 };
+
+// Bounded route-discovery window: while the destination hasn't been located,
+// probe only up to kDiscoveryWindow hops past the deepest already-resolved
+// hop (see the discovery-cadence comment in session.cpp for why). Exposed
+// here (not file-local to session.cpp) so compute_max_hop() below — and its
+// unit test — can be shared between the real probe loop and tests/test_core.cpp
+// without duplicating the constant.
+constexpr int kDiscoveryWindow = 3;
+// A CONFIRMED routing loop (see the loop-auditor comment in session.cpp)
+// freezes the fast discovery window at the loop boundary instead of letting
+// it keep sliding out to max_hops chasing the loop's repeating replies. Only
+// this many hops past the boundary stay in scope — enough to notice if the
+// loop clears, not enough to reopen the "ghost train" the freeze exists to
+// prevent.
+constexpr int kLoopAuditWindow = 1;
+
+// The max_hop decision run()'s discovery loop makes every round — factored
+// out as a pure function (rather than left inline) so it's independently
+// unit-testable (tests/test_core.cpp) without a live socket. Once the real
+// destination hop is known, the path is exactly 1..dest_hop. Otherwise the
+// window slides out from `frontier` UNLESS a routing loop is confirmed
+// (loop_at_hop has a value), in which case it freezes at the loop boundary
+// instead (see kLoopAuditWindow).
+uint8_t compute_max_hop(std::optional<uint8_t> dest_hop, std::optional<uint8_t> loop_at_hop,
+                        uint8_t frontier, uint8_t max_hops);
+
+// Public/private address classification — mirrors web/src/bgp.js's
+// isPublicIp() exactly. Exposed here (external linkage, defined in
+// session.cpp) so both the real probe loop and tests/test_core.cpp can call
+// it, and so the shared-hop cache gate below is independently testable. See
+// the full rationale in session.cpp next to SharedHopTable.
+bool is_public_ip(const std::string& ip);
+
+// Shared-hop cross-target cache (see the full design rationale in
+// session.cpp, right above these types' definitions there). Declared here —
+// not file-local to session.cpp — purely so tests/test_core.cpp can construct
+// its own local SharedHopTable and exercise shared_publish_to/
+// shared_adopt_from directly, without touching the process-global singleton
+// the real probe loop uses (session.cpp's internal-linkage g_shared()).
+struct SharedSample {
+    double ts = 0;                // epoch seconds of the published reply
+    double rtt = 0;                // ms
+    uint64_t owner_session_id = 0; // publishing Session::id_ (adopt only from a DIFFERENT session)
+    uint8_t hop = 0;                // the publisher's hop index for this sample, for attribution/debugging
+    std::string predecessor;        // the publisher's predecessor address (or "SRC"), redundant with the key but kept for a future debug surface
+};
+struct SharedHopTable {
+    std::shared_mutex mtx; // multiple concurrent adopters (readers) never block each other; publish (writer) is exclusive
+    std::unordered_map<std::string, SharedSample> map; // key: source_addr "\x1f" predecessor "\x1f" responder_ip
+};
+// Publish a real measurement. No-op for private/CGNAT or empty `ip` (see
+// is_public_ip) — those are never cross-target-cached.
+void shared_publish_to(SharedHopTable& sh, const std::string& src, const std::string& predecessor,
+                       const std::string& ip, double ts, double rtt, uint64_t owner_session_id, uint8_t hop);
+// Returns a fresh (<= max_age old), different-owner sample's rtt for this
+// exact (source, predecessor, responder) edge, if one exists. std::nullopt
+// for private/CGNAT/empty `ip`, no entry, same owner, or a stale entry.
+std::optional<double> shared_adopt_from(SharedHopTable& sh, const std::string& src, const std::string& predecessor,
+                                        const std::string& ip, uint64_t self_session_id, double now, double max_age);
 
 struct Snapshot {
     std::string target;
@@ -73,6 +135,13 @@ public:
     void update_settings(const Settings& s);
     Settings settings_snapshot() const;
 
+    // Internal plumbing for the process-global RX dispatcher (see
+    // rx_dispatch_loop / PooledSocket in session.cpp) — not intended for
+    // external callers. Public only because the dispatcher is a free function
+    // living outside this class and needs to reach a session's inbox by ICMP
+    // id; mirrors resolve() already being public "for tests" in spirit.
+    static void dispatch_incoming(const Incoming& inc);
+
 private:
     uint16_t next_seq();
     Snapshot snapshot(bool running, std::vector<NewPoint> new_points) const;
@@ -98,6 +167,11 @@ private:
     std::optional<std::string> resolved_v4_;
     std::optional<std::string> resolved_v6_;
     uint16_t icmp_id_;
+    // Fixed per-session IPv4 checksum-pin target (Paris-traceroute-style ECMP
+    // flow pinning — see build_echo()'s doc comment in icmp.hpp and the
+    // loop-auditor comment in session.cpp for the full rationale). Ignored
+    // for IPv6 sends (kernel owns the ICMPv6 checksum).
+    uint16_t paris_checksum_target_;
     uint16_t seq_ = 0;
     std::map<uint8_t, HopStats> hops_;
     std::map<uint16_t, InFlight> inflight_;
@@ -105,17 +179,17 @@ private:
     std::optional<uint8_t> dest_hop_; // hop index of the destination, once reached
     uint8_t max_hop_seen_ = 0;        // furthest hop that has ever responded
 
-    // Cross-session reply routing. On Windows, when several targets each open a
-    // raw ICMP socket, inbound ICMP replies are often delivered to only ONE of
-    // the sockets, so a reply for target B can arrive on target A's socket and
-    // be discarded (wrong id) — leaving B's shared hops (router/BNG) at high
-    // loss even though the replies came back. To fix this, every session
-    // registers its ICMP id in a process-global table; a session that receives a
-    // reply not addressed to it hands it to the owning session's inbox, which
-    // that session drains on its own thread (so hops_ stays single-threaded).
+    // Every reply this session ever sees arrives here, pushed by the shared RX
+    // dispatcher thread (Session::dispatch_incoming, session.cpp) after a
+    // process-global registry lookup by ICMP id — this session's own run()
+    // never reads a socket directly (see PooledSocket/acquire_pooled_socket),
+    // only drains inbox_, so hops_ stays single-threaded (only run()'s own
+    // thread ever touches it). inbox_cv_ lets run() block on an empty inbox
+    // with a timeout instead of polling, waking immediately the instant the
+    // dispatcher delivers something.
     std::mutex inbox_mtx_;
+    std::condition_variable inbox_cv_;
     std::deque<Incoming> inbox_;
-    void route_reply_(const Incoming& inc); // deliver a foreign reply to its owner
 };
 
 } // namespace netpulse

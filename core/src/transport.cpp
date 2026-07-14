@@ -4,6 +4,8 @@
 
 #include <cstring>
 #include <chrono>
+#include <map>
+#include <memory>
 #include <thread>
 
 #ifdef _WIN32
@@ -91,9 +93,16 @@ void Prober::set_nonblocking() {
 #endif
 }
 
-bool Prober::send(const std::string& ip, uint8_t ttl, uint16_t id, uint16_t seq, size_t payload) {
+bool Prober::send(const std::string& ip, uint8_t ttl, uint16_t id, uint16_t seq, size_t payload,
+                  std::optional<uint16_t> pin_checksum) {
     if (fd_ < 0) return false;
     int fd = static_cast<int>(fd_);
+    // Serializes {setsockopt TTL, sendto} — this socket may be shared by many
+    // target threads at once (see the class comment in transport.hpp); TTL is
+    // socket-level state, not a per-packet parameter, so two concurrent
+    // sends with different TTLs could otherwise interleave and one probe
+    // would silently go out with the WRONG TTL.
+    std::lock_guard<std::mutex> lk(send_mtx_);
 
     if (family_ == Family::V4) {
         int t = ttl;
@@ -101,7 +110,7 @@ bool Prober::send(const std::string& ip, uint8_t ttl, uint16_t id, uint16_t seq,
         sockaddr_in dst{};
         dst.sin_family = AF_INET;
         if (inet_pton(AF_INET, ip.c_str(), &dst.sin_addr) != 1) return false;
-        auto pkt = build_echo(Family::V4, id, seq, payload);
+        auto pkt = build_echo(Family::V4, id, seq, payload, pin_checksum);
         return sendto(fd, reinterpret_cast<const char*>(pkt.data()), static_cast<int>(pkt.size()), 0,
                       reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) >= 0;
     } else {
@@ -116,52 +125,78 @@ bool Prober::send(const std::string& ip, uint8_t ttl, uint16_t id, uint16_t seq,
     }
 }
 
-std::vector<Incoming> Prober::drain(double deadline_secs) {
+std::vector<Incoming> Prober::drain_ready() {
     std::vector<Incoming> out;
     if (fd_ < 0) return out;
     int fd = static_cast<int>(fd_);
     uint8_t buf[1500];
 
+    // Non-blocking: the shared RX dispatcher already knows (via its own
+    // select() over every pooled socket) that this fd is readable RIGHT NOW —
+    // this just drains whatever's queued and returns, no waiting here.
     for (;;) {
-        double remaining = deadline_secs - now_secs();
-        if (remaining <= 0) break;
-
-        // Block on the socket until a packet is ready or the deadline passes.
-        // select() wakes the instant data arrives (interrupt-driven), so we are
-        // not subject to the OS sleep-timer granularity (~15.6 ms on Windows)
-        // that would otherwise inflate every measured RTT.
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(static_cast<unsigned>(fd), &rfds);
-        struct timeval tv;
-        tv.tv_sec = static_cast<long>(remaining);
-        tv.tv_usec = static_cast<long>((remaining - tv.tv_sec) * 1e6);
-        int sel = select(fd + 1, &rfds, nullptr, nullptr, &tv);
-        if (sel <= 0) break; // 0 = deadline reached, <0 = error
-
-        // Read every datagram currently queued, timestamping each on arrival.
-        for (;;) {
-            sockaddr_storage src{};
-            socklen_t slen = sizeof(src);
-            long n = recvfrom(fd, reinterpret_cast<char*>(buf), sizeof(buf), 0,
-                              reinterpret_cast<sockaddr*>(&src), &slen);
-            if (n <= 0) break;
-            double at = now_secs();
-            std::optional<ParsedReply> r = (family_ == Family::V4)
-                                               ? parse_v4(buf, static_cast<size_t>(n))
-                                               : parse_v6(buf, static_cast<size_t>(n));
-            if (r) {
-                char ipstr[INET6_ADDRSTRLEN] = {0};
-                if (src.ss_family == AF_INET) {
-                    auto* s4 = reinterpret_cast<sockaddr_in*>(&src);
-                    inet_ntop(AF_INET, &s4->sin_addr, ipstr, sizeof(ipstr));
-                } else {
-                    auto* s6 = reinterpret_cast<sockaddr_in6*>(&src);
-                    inet_ntop(AF_INET6, &s6->sin6_addr, ipstr, sizeof(ipstr));
-                }
-                out.push_back(Incoming{std::string(ipstr), *r, at});
+        sockaddr_storage src{};
+        socklen_t slen = sizeof(src);
+        long n = recvfrom(fd, reinterpret_cast<char*>(buf), sizeof(buf), 0,
+                          reinterpret_cast<sockaddr*>(&src), &slen);
+        if (n <= 0) break;
+        double at = now_secs();
+        std::optional<ParsedReply> r = (family_ == Family::V4)
+                                           ? parse_v4(buf, static_cast<size_t>(n))
+                                           : parse_v6(buf, static_cast<size_t>(n));
+        if (r) {
+            char ipstr[INET6_ADDRSTRLEN] = {0};
+            if (src.ss_family == AF_INET) {
+                auto* s4 = reinterpret_cast<sockaddr_in*>(&src);
+                inet_ntop(AF_INET, &s4->sin_addr, ipstr, sizeof(ipstr));
+            } else {
+                auto* s6 = reinterpret_cast<sockaddr_in6*>(&src);
+                inet_ntop(AF_INET6, &s6->sin6_addr, ipstr, sizeof(ipstr));
             }
+            out.push_back(Incoming{std::string(ipstr), *r, at});
         }
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Socket pool (see the doc comment on acquire_pooled_socket in transport.hpp).
+namespace {
+struct SocketPoolKey {
+    Family family;
+    bool privileged;
+    std::string source;
+    bool operator<(const SocketPoolKey& o) const {
+        if (family != o.family) return family < o.family;
+        if (privileged != o.privileged) return privileged < o.privileged;
+        return source < o.source;
+    }
+};
+struct SocketPool {
+    std::mutex mtx;
+    std::map<SocketPoolKey, std::weak_ptr<Prober>> table;
+};
+inline SocketPool& g_socket_pool() { static SocketPool* p = new SocketPool(); return *p; } // leaked singleton (process lifetime, never destroyed — same pattern as the other g_* singletons in session.cpp)
+} // namespace
+
+std::shared_ptr<Prober> acquire_pooled_socket(Family family, bool privileged, const std::string& source) {
+    SocketPoolKey key{family, privileged, source};
+    SocketPool& pool = g_socket_pool();
+    std::lock_guard<std::mutex> lk(pool.mtx);
+    std::weak_ptr<Prober>& slot = pool.table[key]; // default-constructs an already-expired weak_ptr if new
+    if (auto existing = slot.lock()) return existing;
+    auto sock = std::make_shared<Prober>(family, privileged, source);
+    slot = sock; // overwrite whatever was there (nothing, or an expired weak_ptr) — always safe under this same lock
+    return sock;
+}
+
+std::vector<std::shared_ptr<Prober>> list_active_pooled_sockets() {
+    std::vector<std::shared_ptr<Prober>> out;
+    SocketPool& pool = g_socket_pool();
+    std::lock_guard<std::mutex> lk(pool.mtx);
+    out.reserve(pool.table.size());
+    for (auto& [key, weak] : pool.table) {
+        if (auto s = weak.lock()) out.push_back(std::move(s));
     }
     return out;
 }

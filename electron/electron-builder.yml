@@ -57,12 +57,15 @@ extraResources:
 # ── Windows ────────────────────────────────────────────────────────────────
 win:
   icon: build/icon.ico
-  # publisherName must match the CN of your code-signing certificate.
-  publisherName: Archisman Karmakar
   legalTrademarks: ""
   verifyUpdateCodeSignature: true
   # Sign with SHA-256 and RFC-3161 timestamp (Authenticode best practice).
+  # publisherName (must match the CN of your code-signing certificate) and the
+  # hash/timestamp options all live under signtoolOptions in electron-builder
+  # 26.x's schema — putting publisherName directly under `win:` (an older
+  # electron-builder layout) fails schema validation on this version.
   signtoolOptions:
+    publisherName: Archisman Karmakar
     signingHashAlgorithms: ["sha256"]
     rfc3161TimeStampServer: http://timestamp.digicert.com
   target:

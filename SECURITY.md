@@ -60,7 +60,10 @@ maintainer). Do not file public issues for exploitable vulnerabilities.
 > **code signing + reputation**, not from the code being safe. An *unsigned*
 > Electron app that opens raw sockets and includes a port scanner *will* trip
 > SmartScreen and draw a few heuristic VirusTotal detections no matter how clean
-> the code is. The steps below are what actually earn trust.
+> the code is. The steps below are what actually earn trust — see
+> [`CODE_SIGNING.md`](CODE_SIGNING.md) for the full step-by-step runbook
+> (certificate types, EV vs OV tradeoffs, notarization, reputation-building,
+> and handling residual detections).
 
 ### 1. Code-sign every artifact (the single most important step)
 

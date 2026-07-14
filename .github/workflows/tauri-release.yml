@@ -20,7 +20,7 @@ name: Tauri Release
 
 on:
   push:
-    tags: ['v*']
+    tags: ['*.*.*']
   workflow_dispatch:
     inputs:
       tag:
@@ -48,8 +48,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.tag || github.ref }}
 
       - name: Setup Node
         uses: actions/setup-node@v6

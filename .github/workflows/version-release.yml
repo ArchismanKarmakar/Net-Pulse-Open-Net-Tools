@@ -26,6 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write   # create + push the tag
+      actions: write    # dispatch release.yml directly (see note below)
 
     steps:
       - name: Checkout
@@ -65,4 +66,19 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
           git push origin "${{ steps.version.outputs.tag }}"
-          echo "::notice::Pushed ${{ steps.version.outputs.tag }} — release.yml will now build and publish it."
+          echo "::notice::Pushed ${{ steps.version.outputs.tag }}."
+
+      # IMPORTANT: a tag pushed using the default GITHUB_TOKEN does NOT
+      # trigger other workflows' `on: push: tags` (GitHub blocks this
+      # specifically to prevent recursive/infinite workflow runs). The one
+      # documented exception is workflow_dispatch, so we dispatch release.yml
+      # directly instead of relying on the tag push to do it.
+      - name: Trigger release.yml for this tag
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run release.yml \
+            --ref main \
+            -f tag="${{ steps.version.outputs.tag }}"
+          echo "::notice::Dispatched release.yml for ${{ steps.version.outputs.tag }}."

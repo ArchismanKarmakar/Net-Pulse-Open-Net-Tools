@@ -88,8 +88,8 @@ mac:
   category: public.app-category.developer-tools
   hardenedRuntime: true
   gatekeeperAssess: false
-  entitlements: build/entitlements.mac.plist
-  entitlementsInherit: build/entitlements.mac.plist
+  entitlements: entitlements.mac.plist
+  entitlementsInherit: entitlements.mac.plist
   # Set env (APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID) to notarize.
   notarize: false
   target:

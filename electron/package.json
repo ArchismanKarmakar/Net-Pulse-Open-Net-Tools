@@ -1,16 +1,16 @@
 {
   "name": "net-pulse-open-net-tools-desktop",
-  "version": "0.8.3",
+  "version": "0.8.1",
   "description": "Net Pulse — Open Net Tools: cross-platform path-latency & network diagnostics desktop app (Electron + C++ Node-API engine)",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
     "dev": "NETPULSE_DEV=1 electron .",
-    "dist": "electron-builder",
-    "dist:win": "electron-builder --win",
-    "dist:mac": "electron-builder --mac",
-    "dist:linux": "electron-builder --linux",
-    "dist:dir": "electron-builder --dir"
+    "dist": "electron-builder --publish never",
+    "dist:win": "electron-builder --win --publish never",
+    "dist:mac": "electron-builder --mac --publish never",
+    "dist:linux": "electron-builder --linux --publish never",
+    "dist:dir": "electron-builder --dir --publish never"
   },
   "devDependencies": {
     "electron": "^43.0.0",

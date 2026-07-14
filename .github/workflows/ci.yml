@@ -83,6 +83,17 @@ jobs:
       # every path electron-builder.yml declares — icons, entitlements,
       # extraResources (web/dist, napi addon) — so a broken packaging config
       # fails CI on every PR instead of only being discovered at release time.
+      #
+      # electron/build/ is gitignored (local dev output dir too), so
+      # reconstruct just the icons electron-builder.yml needs from the
+      # tracked source assets in /branding before packaging.
+      - name: Prepare electron build resources
+        shell: bash
+        run: |
+          mkdir -p electron/build
+          cp branding/icon.ico electron/build/icon.ico
+          cp branding/icon.png electron/build/icon.png
+
       - name: Package (unpacked, unsigned smoke test)
         working-directory: electron
         run: npm run dist:dir

@@ -15,7 +15,7 @@
 # (expect SmartScreen/AV warnings until signed — see SECURITY.md).
 
 appId: com.archismankarmakar.netpulse.opennettools
-productName: Net Pulse — Open Net Tools
+productName: Net Pulse - Open Net Tools
 copyright: Copyright (C) 2026 Archisman Karmakar — AGPL-3.0-or-later
 
 directories:

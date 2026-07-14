@@ -84,21 +84,40 @@ jobs:
       # CODE_SIGNING.md) so this produces unsigned artifacts with no error;
       # set the secrets once a cert exists and this becomes a genuinely
       # signed build automatically.
+      # IMPORTANT: these vars must be genuinely ABSENT when no cert secret is
+      # configured, not present-but-empty. `env: APPLE_CERTIFICATE: ${{ secrets.X }}`
+      # sets APPLE_CERTIFICATE="" when the secret doesn't exist — tauri-action
+      # then still attempts `security import` with that empty blob, which
+      # fails as `SecKeychainItemImport: One or more parameters passed to a
+      # function were not valid` instead of cleanly skipping signing. Same
+      # root cause as the earlier electron-builder CSC_LINK bug — exporting
+      # conditionally via GITHUB_ENV avoids ever setting an empty secret var.
+      - name: Set signing env (only if secrets are configured)
+        shell: bash
+        run: |
+          if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" ]; then
+            echo "TAURI_SIGNING_PRIVATE_KEY=${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" >> "$GITHUB_ENV"
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" >> "$GITHUB_ENV"
+          fi
+          if [ -n "${{ secrets.APPLE_CERTIFICATE }}" ]; then
+            echo "APPLE_CERTIFICATE=${{ secrets.APPLE_CERTIFICATE }}" >> "$GITHUB_ENV"
+            echo "APPLE_CERTIFICATE_PASSWORD=${{ secrets.APPLE_CERTIFICATE_PASSWORD }}" >> "$GITHUB_ENV"
+          fi
+          if [ -n "${{ secrets.APPLE_ID }}" ]; then
+            echo "APPLE_ID=${{ secrets.APPLE_ID }}" >> "$GITHUB_ENV"
+            echo "APPLE_PASSWORD=${{ secrets.APPLE_PASSWORD }}" >> "$GITHUB_ENV"
+            echo "APPLE_TEAM_ID=${{ secrets.APPLE_TEAM_ID }}" >> "$GITHUB_ENV"
+          fi
+          if [ -n "${{ secrets.WINDOWS_CERTIFICATE }}" ]; then
+            echo "WINDOWS_CERTIFICATE=${{ secrets.WINDOWS_CERTIFICATE }}" >> "$GITHUB_ENV"
+            echo "WINDOWS_CERTIFICATE_PASSWORD=${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}" >> "$GITHUB_ENV"
+          fi
+
       - name: tauri-action build
         id: tauri-build
         uses: tauri-apps/tauri-action@v0
         with:
           projectPath: tauri-app
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
 
       - name: List produced bundle artifacts (diagnostic)
         shell: bash

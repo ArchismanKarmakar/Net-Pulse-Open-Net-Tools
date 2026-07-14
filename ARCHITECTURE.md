@@ -16,11 +16,11 @@ changes, routing loops, interface changes, and outages.
 ## 1. Process shape
 
 ```
-Electron main (main.js)
-   │  require('../napi')  — in-process, no IPC to a separate process
+Tauri webview (React UI, tauri-app/dist)
+   │  invoke('add_target', …)  — Tauri IPC, in-process
    ▼
-napi/napi.cpp  (N-API addon, netpulse.node)
-   │  owns a netpulse::Manager, one thread per target session
+tauri-app/src-tauri  (Rust host, commands.rs → ffi.rs)
+   │  cxx bridge — owns a netpulse::Manager, one thread per target session
    ▼
 core/  (this document)
    ├── Session::run()        — one thread PER TARGET (owns per-target state only)
@@ -30,8 +30,8 @@ core/  (this document)
 ```
 
 Nothing here opens a TCP/HTTP port. The only sockets are raw/datagram ICMP
-sockets used for probing. `Manager` (napi layer) is out of scope for this
-document except where it calls into `Session`.
+sockets used for probing. `Manager` (the Rust/`cxx` FFI layer) is out of scope
+for this document except where it calls into `Session`.
 
 ### Threads, precisely
 
@@ -691,6 +691,7 @@ that unit tests deliberately don't exercise.
 | `core/include/netpulse/stats.hpp` | `HopStats`/`HopStat` — rolling per-hop RTT/loss stats over the focus window. |
 | `core/include/netpulse/platform.hpp` | `ensure_winsock_ready()` — lazy, thread-safe Winsock init (see the comment in `transport.cpp` on why this replaced a namespace-scope static). |
 | `tests/test_core.cpp` | Unit tests for every externally-linked pure function above. |
-| `napi/napi.cpp` | N-API boundary: input validation/clamping, `Manager` (one `Session` thread per target), JSON snapshot marshalling. |
-| `electron/main.js` / `preload.js` | Electron shell: loads the addon, IPC surface, CSP, window hardening. |
-| `web/` | React renderer (Vite) — UI only, no engine logic. |
+| `tauri-app/src-tauri/native/netpulse_ffi.cpp` | `cxx` boundary: input validation/clamping, `Manager` (one `Session` thread per target), JSON snapshot marshalling. |
+| `tauri-app/src-tauri/src/` | Rust host: Tauri commands, IPC surface, CSP, window hardening — statically links the engine via `cxx_build`. |
+| `tauri-app/src/` | React renderer (Vite) — UI only, no engine logic. |
+| `web/` | Standalone React renderer (Vite) for the `server/`-hosted HTTP deployment target — UI only, no engine logic. |

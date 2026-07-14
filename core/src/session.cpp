@@ -1,6 +1,7 @@
 #include "netpulse/session.hpp"
 #include "netpulse/transport.hpp"
 #include "netpulse/platform.hpp"
+#include "netpulse/obfuscate.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -226,7 +227,7 @@ bool is_public_ip(const std::string& ip) {
 // Ownership is emergent and self-healing: if the owner's hop starts dropping
 // it stops publishing, the entry goes stale within ~1.5 intervals, adopters
 // fall back to real probing and see the true loss.
-constexpr const char* kSharedHopSrcSentinel = "SRC"; // predecessor placeholder for hop 1 / unresolved predecessor
+inline const char* shared_hop_src_sentinel() { return NETPULSE_OBF_STR("SRC"); } // predecessor placeholder for hop 1 / unresolved predecessor
 
 // SharedSample/SharedHopTable and the table-taking shared_publish_to /
 // shared_adopt_from have EXTERNAL linkage (declared in session.hpp), not
@@ -851,7 +852,7 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
             auto it = hops_.find(h);
             if (it != hops_.end() && it->second.address()) return *it->second.address();
         }
-        return kSharedHopSrcSentinel;
+        return shared_hop_src_sentinel();
     };
 
     while (!stop->load()) {

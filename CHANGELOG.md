@@ -1,5 +1,93 @@
 # Changelog
 
+## 0.9.2 - Pause/resume sync fix + free code-signing guide
+
+- **Fixed: hop-level pause buttons out of sync with target-level pause.** The hop-pause
+  button (tauri-app/src/App.jsx) only checked its own entry in `pausedHops`, with no
+  awareness of the target's own `paused` state — clicking it while the whole target was
+  paused silently mutated `pausedHops` but had no visible effect (nothing was being probed
+  either way), and the icon never reflected reality. Confirmed the backend (Manager::pause
+  for the whole-target atomic, Settings.paused_hops for per-hop skip) was already correct
+  and independent by design — this was specifically a frontend display/interaction bug.
+  Fixed: hop rows now compute an effective paused state (target-paused OR hop-paused), the
+  button is disabled (with an explanatory tooltip) while the target is paused, and every row
+  visually reflects a target-wide pause, not just individually-paused hops.
+- **New: free code-signing section in CODE_SIGNING.md.** SignPath Foundation (Sectigo-backed,
+  genuinely free for qualifying OSS, real SmartScreen trust) as the primary path — including
+  the eligibility detail that a project needs an existing public release first, and the
+  publisher-name tradeoff ("SignPath Foundation", not your name). Also covers Azure Trusted
+  Signing's Feb 2026 US/Canada/EU/UK-only public-trust restriction, macOS's real $99/year
+  floor (no free path exists), and free Linux options (GPG, Sigstore/cosign).
+
+
+## 0.9.1 — Tauri + Rust migration (NAPI discarded)
+
+- **New primary app: `tauri-app/`** — Tauri 2 + React 19 + Rust, replacing Electron +
+  Node-API. The C++ engine (`core/`) is UNCHANGED; a new flat adapter
+  (`tauri-app/src-tauri/native/netpulse_ffi.{hpp,cpp}`) exposes it to Rust via `cxx`
+  (primitives + JSON strings, mirroring napi.cpp's validation/clamping exactly).
+- **Verified end-to-end** (not just written): Rust calling the real engine through cxx
+  (add_target -> real probe thread -> get_state_json -> real hop data -> remove_target);
+  the new Rust DNS/reverse-DNS (hickory-resolver) and TCP port-scan (tokio) against real
+  network I/O; the ping spawn/stream/stop lifecycle (caught and fixed a real Linux stdout-
+  buffering bug in the process — see docs/TAURI_MIGRATION.md). Two real design bugs
+  (a ping-event-id capture bug, and an update_target partial-merge bug that would have
+  silently reset unspecified fields to defaults) were caught during development and fixed
+  before shipping, not left as known issues.
+- **IPC protection**: Tauri's capability/permission system
+  (`capabilities/default.json` + `AppManifest` in build.rs) explicitly allowlists every
+  command the frontend can call — direct architectural equivalent of the old contextBridge
+  allowlist, enforced by the framework.
+- **Honest limitation**: the full Tauri app (lib.rs/commands.rs/tauri.conf.json/
+  capabilities) could NOT be compiled in the environment this was built in — the only
+  available Rust toolchain (apt's rustc 1.75) is too old for current Tauri (needs ~1.90+),
+  and rustup's download domain wasn't reachable from that sandbox. Every API used was
+  cross-checked against real source fetched from tauri-apps/tauri's repository (not
+  memory), but "grounded in real source" and "compiled" are different claims — see
+  docs/TAURI_MIGRATION.md for exactly which pieces are which, and what to check first if
+  the initial build hits an error.
+- **electron/ and napi/ retired and deleted.** The Tauri build was verified end-to-end
+  on a real machine first (toolchains installed for real, `cargo build --release`,
+  `cargo test`, and `npx tauri build` all passing, producing a working installer with
+  no `.node`/`.so`/`.dylib` addon) — only then were the old Electron/Node-API app and
+  the superseded `ci.yml`/`release.yml` workflows removed.
+- **Obfuscation mechanism replaced, verified end-to-end**: the old `NETPULSE_OBFUSCATE`
+  switch (both root `CMakeLists.txt` and `napi/CMakeLists.txt`) required an
+  obfuscating Clang fork (Hikari/obfuscator-llvm) that was never actually built or
+  tested. This session built a real out-of-tree LLVM pass-plugin against
+  conda-forge's `llvmdev` and confirmed it compiles/links cleanly, but every
+  prebuilt clang.exe available (winget's `LLVM.LLVM`, VS 2026's bundled Clang)
+  crashes with `STATUS_HEAP_CORRUPTION` loading it — a confirmed ABI mismatch
+  between separately-built LLVM copies, not fixable short of building LLVM from
+  source. Replaced with `core/include/netpulse/obfuscate.hpp`: compile-time string
+  encryption + opaque-predicate branches, pure C++20, no special compiler required.
+  `NETPULSE_OBFUSCATE`/`obfuscate` now just define a preprocessor macro on any
+  toolchain — see docs/OBFUSCATED_BUILD.md for the full writeup.
+
+
+## 0.8.1 — dual build pipeline (normal + LLVM-obfuscated), verified
+
+- **New `NETPULSE_OBFUSCATE` CMake option** (root `CMakeLists.txt` and `napi/CMakeLists.txt`,
+  default OFF): a second build variant for the engine using LLVM control-flow obfuscation
+  passes, alongside the normal build — same source, two configurations. Requires an actual
+  obfuscating LLVM/Clang toolchain (Hikari or obfuscator-llvm; mainline clang does not have
+  these passes) and **fails the build loudly** if one isn't in use, rather than silently
+  shipping a non-obfuscated binary while claiming otherwise — verified against real clang-18.
+- **New `.github/workflows/obfuscated-build.yml`**: builds and caches an obfuscating LLVM
+  toolchain (Hikari, from source — no prebuilt releases exist) and runs the exact same
+  `tests/test_core.cpp` suite against the obfuscated binary. Kept as its own workflow (not a
+  job in `ci.yml`) since a cold LLVM build is a multi-hour undertaking; cached after the first
+  run. Triggers: manual, weekly, or on CMake/workflow changes — not every push.
+- **New `docs/OBFUSCATED_BUILD.md`**: honest writeup of what was verified (the gating logic,
+  the normal build) vs. what requires a real toolchain build I couldn't do in this session
+  (the actual obfuscated compile), plus the Windows/MSVC caveat (Hikari/obfuscator-llvm are
+  Clang-based; `cl.exe` can't use them — `clang-cl` or cross-compilation needed).
+- Confirmed normal build + full test suite pass unaffected, with both GCC and Clang,
+  Release and Debug, from the exact packaged tree.
+
+
+
+
 ## 0.8.1 — global socket pool, checksum-pinned loop auditor, edge-keyed cache
 
 - **Socket pool + centralized RX dispatch (root-causes the last of the
@@ -83,6 +171,23 @@
   `ARCHITECTURE.md` documents the full engine design (threading model,
   socket pool, direct-echo model, loop auditor, shared-hop cache, DNS pool)
   for anyone modifying `core/`.
+
+## 0.8.0 — production hardening (real, verified) + security-model writeup
+
+- **Release native builds now strip symbols** and hide non-required exports
+  (`-fvisibility=hidden` + linker `-s` on Unix; `/OPT:REF /OPT:ICF` + no `.pdb` on MSVC).
+  Verified: unstripped ~3,100 symbols / ~1.1 MB -> stripped 0 local symbols / ~380 KB.
+- **DevTools + the default Electron menu are disabled in packaged builds** (F12,
+  Ctrl/Cmd+Shift+I blocked; DevTools force-closed if opened programmatically). DEV builds
+  keep them for iteration.
+- **New SECURITY.md section: "Reverse engineering / IP protection — what's actually
+  achievable."** Honest technical writeup: no client-side technique (obfuscation, static
+  linking into another language, a different app shell) can keep logic secret from someone
+  who controls the device running it; obfuscation raises attacker cost, it doesn't remove
+  the possibility. Also notes the practical tension with this project's own AGPL-3.0-or-later
+  choice: recipients of a binary are legally entitled to its corresponding source, and that
+  source is already public, so obfuscating the binary doesn't hide anything from someone
+  motivated enough to read the repo instead.
 
 ## 0.8.0 — direct-echo measurement, global pacer, shared-hop pub/sub, DNS pool
 

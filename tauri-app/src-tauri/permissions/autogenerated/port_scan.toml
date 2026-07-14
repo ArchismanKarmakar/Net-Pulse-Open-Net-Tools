@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-port-scan"
+description = "Enables the port_scan command without any pre-configured scope."
+commands.allow = ["port_scan"]
+
+[[permission]]
+identifier = "deny-port-scan"
+description = "Denies the port_scan command without any pre-configured scope."
+commands.deny = ["port_scan"]

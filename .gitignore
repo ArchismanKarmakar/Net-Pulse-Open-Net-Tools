@@ -3,7 +3,11 @@ build/
 *.a
 web/node_modules
 web/dist
-electron/node_modules
-napi/build
-napi/node_modules
 .DS_Store
+
+# Tauri app — Cargo.lock IS committed (this is an application, not a library;
+# Rust convention keeps the lockfile for binaries/apps for reproducible builds).
+tauri-app/node_modules
+tauri-app/dist
+tauri-app/src-tauri/target
+tauri-app/src-tauri/gen

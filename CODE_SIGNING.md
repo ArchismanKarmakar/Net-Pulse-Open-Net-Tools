@@ -7,9 +7,100 @@ side (how the app minimizes attack surface); this document is specifically
 about the **signing/reputation** side, which is a separate concern — trust in
 OS/AV terms comes from a verifiable signing identity plus accumulated
 reputation, not from source code quality alone. Nothing here is wired up yet
-in this repository beyond the electron-builder plumbing (which already reads
-signing config from environment variables, see below) — this is the runbook
-for when a certificate is actually acquired.
+in this repository beyond the `tauri-action` plumbing in
+`.github/workflows/tauri-release.yml` (which already reads signing config from
+repository secrets, see below) — this is the runbook for when a certificate is
+actually acquired.
+
+## The free path — start here (this is what you asked for)
+
+Since Net Pulse — Open Net Tools is AGPL-3.0-or-later and publicly on GitHub,
+it genuinely qualifies for **free, real, Trusted-Root code signing** for
+Windows — not a workaround, an actual OV certificate from a CA Windows
+already trusts. Researched fresh (not from stale general knowledge, since
+pricing/eligibility for these programs changes):
+
+### Windows — SignPath Foundation (real, $0, use this)
+
+[**SignPath Foundation**](https://signpath.org/) is a nonprofit that issues
+free OV code-signing certificates to qualifying open-source projects, backed
+by **Sectigo** — a CA in the Microsoft Trusted Root Program, so it clears
+SmartScreen's "Unknown Publisher" warning for real, not a workaround. The
+private key lives on SignPath's HSM; you never handle it, which is also just
+better security practice. Signing happens automatically in CI (GitHub
+Actions) — you never sign locally.
+
+**Eligibility (confirmed current criteria):**
+- OSI-approved license — AGPL-3.0-or-later qualifies.
+- Public repository with a working, documented build pipeline (this
+  project's `.github/workflows/` already has one).
+- **The project must already have a released build** — a fresh repo with no
+  release history isn't eligible yet. **Practical implication: cut a real
+  GitHub Release first** (even unsigned), then apply.
+- Adherence to their Code of Conduct (not malicious/adware — trivially true
+  here).
+
+**How to apply:** via [signpath.io/solutions/open-source-community](https://signpath.io/solutions/open-source-community).
+Expect the application to ask for: what gets signed (the NSIS `.exe`/`.msi`
+from `tauri-app/`), your build/CI process, and — for a single-maintainer
+project — you'll list yourself as author/reviewer/approver. Processing is
+typically days to a few weeks.
+
+**The one tradeoff:** the publisher name shown in the Windows install dialog
+and SmartScreen will read **"SignPath Foundation"**, not "Archisman
+Karmakar" or "Net Pulse" — because the certificate is issued to the
+Foundation, which vouches for your repo, not to you personally. For almost
+all OSS projects (including this one) that's a completely fine trade for a
+real, trusted, $0 signature. If you specifically want *your own name* on the
+certificate, that requires a paid OV/EV cert from a CA directly (see below).
+
+**Backup option if SignPath's queue is long:** [OSSign](https://ossign.org/)
+offers the same kind of free OSS signing with similar eligibility criteria
+(OSI license, 6+ months of project activity, verifiable build pipeline) — as
+of this writing their applications are temporarily paused due to backlog, so
+check current status before relying on it as your primary path.
+
+### A geography note if you're not in the US/Canada/EU/UK
+
+**Azure Trusted Signing** (Microsoft's own ~$9.99/month service, the
+cheapest *paid* option if SignPath's free path doesn't fit) restricts its
+publicly-trusted tier, **as of February 2026, to organizations in the
+US/Canada/EU/UK and individual developers in the US/Canada only.** If you're
+applying as an individual outside those regions, this option may not
+actually be available to you regardless of budget — SignPath Foundation
+doesn't have that restriction (it's gated on the *project* being genuine
+OSS, not the maintainer's country), which makes it the more relevant free
+option either way.
+
+### macOS — there is no free path; $99/year is the real floor
+
+Unlike Windows, Apple doesn't have an OSS-sponsored free-signing program
+equivalent to SignPath. A **Developer ID** certificate that clears
+Gatekeeper for other people's Macs requires an **Apple Developer Program
+membership — $99/year**, paid directly to Apple, regardless of the app being
+open source. There's no legitimate way around this specific cost; be
+skeptical of anything claiming otherwise. Two partial options if $99/year
+isn't viable right now:
+- **Ad-hoc self-signing** (`codesign --sign -`, no Apple account needed) —
+  lets *you* run the unsigned build locally without the full Gatekeeper
+  quarantine dialog, but does **not** clear Gatekeeper for anyone you
+  distribute the app to; not a real distribution solution.
+- Document clearly (README + release notes) that macOS users will see a
+  Gatekeeper warning and need to right-click → Open the first time — an
+  honest, common practice for unsigned-but-legitimate OSS macOS apps.
+
+### Linux — no OS-level gatekeeper, but sign anyway
+
+There's no SmartScreen/Gatekeeper equivalent, but two genuinely free
+mechanisms build real trust: a detached **GPG signature** + published public
+key alongside each AppImage release (the long-standing convention), and
+increasingly, **[Sigstore](https://www.sigstore.dev/)/`cosign`** — free,
+keyless signing tied to your GitHub OIDC identity, now the de facto standard
+for npm/PyPI/container provenance. It doesn't suppress any warning dialog
+(nothing checks it automatically the way SmartScreen checks Authenticode),
+but it's a real, free, verifiable provenance signal worth adding regardless.
+
+---
 
 ## Why an unsigned build gets flagged, regardless of code quality
 
@@ -41,51 +132,44 @@ this is a CA/Microsoft policy requirement for EV, not a project choice.
 
 ### 2. Sign with the OV file-based flow (simplest)
 
-```powershell
-$env:CSC_LINK = "C:\path\to\cert.pfx"
-$env:CSC_KEY_PASSWORD = "********"
-cd electron
-npm run dist:win
-```
-
-`electron-builder` picks these up automatically — no config change needed.
-The existing `electron/electron-builder.yml` already has `signtoolOptions`
-wired (`publisherName`, `signingHashAlgorithms: ["sha256"]`,
-`rfc3161TimeStampServer`); `publisherName` **must exactly match the
-certificate's CN** (Common Name) or signing fails schema/identity checks.
+Set the certificate as repository secrets consumed by
+`.github/workflows/tauri-release.yml`'s `WINDOWS_CERTIFICATE` /
+`WINDOWS_CERTIFICATE_PASSWORD` env vars (base64-encode the `.pfx` for
+`WINDOWS_CERTIFICATE`) — `tauri-apps/tauri-action` picks these up
+automatically, no workflow change needed.
 
 ### 3. Sign with an EV cert (hardware token / cloud HSM)
 
-EV certs can't be pointed to via `CSC_LINK` (there's no exportable private
-key file). Two practical paths:
+EV certs can't be pointed to via a plain certificate secret (there's no
+exportable private key file). Two practical paths:
 
 - **Cloud HSM signing service** (recommended — no physical dongle to manage
   on a CI runner): Azure Trusted Signing or DigiCert KeyLocker both provide a
-  `signtool`-compatible CLI/plugin. Configure electron-builder's
-  [custom sign hook](https://www.electron.build/configuration/win#custom-sign)
-  to invoke that CLI instead of the default signtool invocation.
+  `signtool`-compatible CLI/plugin. Tauri's bundler supports a
+  [custom sign command](https://v2.tauri.app/distribute/sign/windows/) to
+  invoke that CLI instead of the default signtool invocation.
 - **Physical USB HSM token**: sign on the machine the token is plugged into,
   using the CA's own signing tool (usually a `signtool.exe`-compatible
-  wrapper) either as electron-builder's sign hook or as a manual post-build
-  step run on the same machine, before uploading the release artifact.
+  wrapper) as a manual post-build step, before uploading the release
+  artifact.
 
 ### 4. Verify the signature
 
 ```powershell
-signtool verify /pa "release\Net Pulse — Open Net Tools Setup 0.8.1.exe"
+signtool verify /pa "Net Pulse — Open Net Tools_0.9.1_x64-setup.exe"
 ```
 
 `/pa` uses the default Authenticode policy (matches what Windows actually
 checks). A clean run prints `Successfully verified`.
 
-### 5. RFC 3161 timestamping (already configured)
+### 5. RFC 3161 timestamping
 
-`electron-builder.yml` already sets
-`rfc3161TimeStampServer: http://timestamp.digicert.com`. This embeds a
-trusted timestamp in the signature so the binary **remains valid after the
-certificate itself expires** — without it, every signed binary from a given
-cert silently becomes "unsigned" the day the cert expires, which is a much
-worse trust regression than never having signed at all. Don't remove this.
+Tauri's Windows signing invokes `signtool` with a timestamp server
+automatically when signing is configured. This embeds a trusted timestamp in
+the signature so the binary **remains valid after the certificate itself
+expires** — without it, every signed binary from a given cert silently
+becomes "unsigned" the day the cert expires, which is a much worse trust
+regression than never having signed at all.
 
 ---
 
@@ -101,35 +185,30 @@ worse trust regression than never having signed at all. Don't remove this.
 
 ### 2. Sign + notarize
 
-```bash
-export CSC_LINK=DeveloperID.p12
-export CSC_KEY_PASSWORD=****
-export APPLE_ID=you@example.com
-export APPLE_APP_SPECIFIC_PASSWORD=****
-export APPLE_TEAM_ID=XXXXXXXXXX
+Set the following as repository secrets, consumed by
+`.github/workflows/tauri-release.yml`'s `env:` block for the `tauri-action`
+step (`APPLE_CERTIFICATE` is the base64-encoded `.p12`):
+
+```
+APPLE_CERTIFICATE=<base64 .p12>
+APPLE_CERTIFICATE_PASSWORD=****
+APPLE_ID=you@example.com
+APPLE_PASSWORD=****            # app-specific password, not the real Apple ID password
+APPLE_TEAM_ID=XXXXXXXXXX
 ```
 
-Then set `mac.notarize: true` in `electron/electron-builder.yml` (currently
-`false` — flip it once the above env vars are actually available) and run:
-
-```bash
-cd electron
-npm run dist:mac
-```
-
-electron-builder submits the signed app to Apple's notary service, polls for
-the result, and **staples** the notarization ticket to the app automatically
-— no separate `xcrun notarytool` invocation needed.
+`tauri-apps/tauri-action` submits the signed app to Apple's notary service,
+polls for the result, and **staples** the notarization ticket to the app
+automatically — no separate `xcrun notarytool` invocation needed, and no
+workflow change beyond having the secrets set.
 
 ### 3. Why notarization specifically (not just signing)
 
 **Gatekeeper blocks an app that is signed but not notarized** just as hard as
 one that's fully unsigned — signing alone proves who built it, notarization
-is Apple's own automated malware scan confirming they've checked it.
-Hardened runtime + the entitlements files already present in this repo
-(`build/entitlements.mac.plist`, referenced by
-`entitlements`/`entitlementsInherit` in `electron-builder.yml`) are required
-inputs to notarization; they're already configured.
+is Apple's own automated malware scan confirming they've checked it. Tauri's
+bundler applies hardened runtime automatically for macOS bundles; notarization
+just needs the secrets above to be present.
 
 ### 4. Verify
 
@@ -168,11 +247,10 @@ provenance":
   resets the reputation clock to zero.
 - **Distribute from one consistent, HTTPS origin** — GitHub Releases — with
   checksums, rather than mirrors of unknown provenance.
-- **Never pack/obfuscate the binary** (no UPX). `electron-builder.yml`
-  already sets `compression: normal` and never packs — packers are one of
-  the single biggest AV false-positive triggers, because legitimate
-  compressors and malware droppers use the exact same technique to hide
-  payload bytes from static scanners.
+- **Never pack the native binary** (no UPX). Tauri's bundler does not pack —
+  packers are one of the single biggest AV false-positive triggers, because
+  legitimate compressors and malware droppers use the exact same technique to
+  hide payload bytes from static scanners.
 
 ## Handling residual VirusTotal detections after signing
 
@@ -194,13 +272,14 @@ includes a port scanner, signed or not.
 
 ## Checklist
 
-- [ ] `web` built, `napi` built for the target Electron ABI.
-- [ ] Windows: OV or EV certificate acquired; `CSC_LINK`/`CSC_KEY_PASSWORD`
-      set (OV) or HSM sign hook configured (EV).
-- [ ] macOS: Developer ID cert + Apple Developer account; notarization env
-      vars set; `mac.notarize: true` flipped in `electron-builder.yml`.
-- [ ] `npm run dist:win` / `dist:mac` / `dist:linux` produced signed
-      artifacts.
+- [ ] `tauri-app` builds cleanly (`npx tauri build`).
+- [ ] Windows: OV or EV certificate acquired; `WINDOWS_CERTIFICATE`/
+      `WINDOWS_CERTIFICATE_PASSWORD` secrets set (OV), or HSM sign command
+      configured (EV).
+- [ ] macOS: Developer ID cert + Apple Developer account; `APPLE_CERTIFICATE`,
+      `APPLE_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_PASSWORD`,
+      `APPLE_TEAM_ID` secrets set.
+- [ ] `tauri-release.yml` run produced signed artifacts for each OS.
 - [ ] Signature verified (`signtool verify /pa`, `spctl -a -vv`).
 - [ ] `SHA256SUMS` published and GPG-signed.
 - [ ] Signed artifact scanned on VirusTotal; false-positive reports filed for

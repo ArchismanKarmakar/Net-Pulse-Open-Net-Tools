@@ -1,0 +1,197 @@
+name: Tauri Release
+
+# Builds signed-if-possible, checksummed, and PUBLICLY ATTESTED installers for
+# Windows / macOS / Linux from a single tag push, and publishes them as a
+# GitHub Release. Replaces the old Electron-builder-based release.yml.
+# Reuses the same "make users feel safe with zero signing budget" plan from
+# CODE_SIGNING.md's interim section:
+#   1. The build is fully automated and public (this file) — anyone can read
+#      exactly what compiled a given artifact instead of trusting a claim.
+#   2. Every artifact gets a GitHub-issued build-provenance attestation
+#      (actions/attest-build-provenance) — a free, cryptographically verifiable
+#      statement of "this exact file was built by this exact workflow run from
+#      this exact commit," checkable with `gh attestation verify` even before
+#      any paid code-signing certificate exists.
+#   3. A SHA256SUMS manifest is published alongside the installers so anyone
+#      can confirm their download is byte-identical to what CI produced.
+#   4. If the Tauri-equivalent signing secrets are ever added later (once a
+#      certificate is obtained), tauri-action picks them up automatically —
+#      see the `env:` block below, which is a no-op today (unset secrets).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)build a release for (defaults to the ref that triggered this run)'
+        required: false
+
+permissions:
+  contents: write        # create the GitHub Release and upload assets
+  id-token: write         # required for keyless build-provenance attestation
+  attestations: write     # required to publish build-provenance attestation
+
+concurrency:
+  group: tauri-release-${{ github.ref }}
+  cancel-in-progress: false   # never cancel a release build mid-way through publishing
+
+jobs:
+  build:
+    name: build installer (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - name: Install Linux webview + packaging deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev file
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tauri-app/src-tauri
+
+      - name: Install frontend deps
+        working-directory: tauri-app
+        run: npm ci
+
+      # ---- Package + sign-if-possible ------------------------------------
+      # tauri-action builds the frontend, the release Rust binary, and the
+      # installer(s) for the current OS in one step. Signing env vars are
+      # unset today (no certificate/keys yet — see CODE_SIGNING.md) so this
+      # produces unsigned artifacts with no error; set the secrets once a
+      # cert exists and this becomes a genuinely signed build automatically.
+      - name: tauri-action build
+        id: tauri-build
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: tauri-app
+          tagName: ${{ inputs.tag || github.ref_name }}
+          releaseId: ''
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+
+      - name: List produced bundle artifacts (diagnostic)
+        shell: bash
+        run: find tauri-app/src-tauri/target/release/bundle -maxdepth 2 -type f | sort
+
+      # Only ship actual installers/archives, not intermediate unpacked-app
+      # directories or debug metadata.
+      - name: Collect installer files
+        shell: bash
+        run: |
+          mkdir -p collected
+          shopt -s nullglob
+          find tauri-app/src-tauri/target/release/bundle \
+            \( -name '*.exe' -o -name '*.msi' -o -name '*.dmg' -o -name '*.app.tar.gz' \
+               -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) \
+            -type f -exec cp -v {} collected/ \;
+          ls -la collected
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}-installer
+          path: collected/*
+          if-no-files-found: error
+
+  publish:
+    name: checksum, attest, and publish release
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      # Step-level `if:` conditions can't reference `secrets.*` directly
+      # (GitHub Actions doesn't expose the secrets context there) — mirror
+      # the one bit we need ("is a key configured") into a plain job env var
+      # instead, decided once at job level where `secrets.*` IS accessible.
+      HAS_GPG_KEY: ${{ secrets.RELEASE_GPG_PRIVATE_KEY != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download all installer artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          pattern: '*-installer'
+          merge-multiple: true
+
+      - name: List downloaded artifacts (diagnostic)
+        run: ls -la release/
+
+      - name: Generate SHA256SUMS.txt
+        run: node .github/scripts/checksums.mjs release release/SHA256SUMS.txt
+
+      - name: GPG-sign SHA256SUMS.txt (only if a signing key secret is configured)
+        if: ${{ env.HAS_GPG_KEY == 'true' }}
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
+        run: |
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+              --armor --detach-sign --output release/SHA256SUMS.txt.asc release/SHA256SUMS.txt
+
+      # Free, GitHub-native "who built this" proof — a cryptographically
+      # verifiable statement tying every published file to this exact
+      # workflow run and commit SHA. Doesn't require any certificate; this is
+      # the "let users verify the exact code that compiled the binary" ask.
+      - name: Generate build provenance attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: 'release/*'
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: Net Pulse — Open Net Tools ${{ inputs.tag || github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            release/*
+          body: |
+            **Unsigned build notice:** this project does not yet have a paid
+            code-signing certificate (Windows Authenticode / Apple Developer
+            ID) — see [`CODE_SIGNING.md`](https://github.com/${{ github.repository }}/blob/main/CODE_SIGNING.md)
+            for why, and for the plan to add one. Windows SmartScreen and
+            macOS Gatekeeper will show a warning on first run; this is
+            expected for an unsigned free/open-source app and is not a
+            statement about the app's safety.
+
+            To verify what you downloaded:
+            - **Checksums:** compare against `SHA256SUMS.txt` in this release.
+            - **Build provenance:** every file here carries a GitHub
+              attestation proving it was built by this exact public workflow
+              run from this exact commit — verify with:
+              `gh attestation verify <downloaded-file> --owner ${{ github.repository_owner }}`
+            - **Source:** this entire build is reproducible from the public
+              workflow at `.github/workflows/tauri-release.yml` in this repository.

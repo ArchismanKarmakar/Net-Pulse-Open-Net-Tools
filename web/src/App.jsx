@@ -1331,11 +1331,14 @@ export default function App() {
                           const prevAvg = i > 0 ? sel.hops[i - 1].avg : null
                           const nextAvg = i < sel.hops.length - 1 ? sel.hops[i + 1].avg : null
                           const hopPaused = (sel.config?.pausedHops || []).includes(h.hop)
+                          const targetPaused = !!sel.paused
+                          const effPaused = targetPaused || hopPaused
                           return (
-                            <tr key={h.hop} className={(h.hop === selHop ? 'selrow' : '') + (hopPaused ? ' hoppaused' : '')} onClick={() => setSelHop(h.hop)}>
+                            <tr key={h.hop} className={(h.hop === selHop ? 'selrow' : '') + (effPaused ? ' hoppaused' : '')} onClick={() => setSelHop(h.hop)}>
                               <td>
-                                <button className="hop-pause" title={hopPaused ? 'Resume probing this hop' : 'Pause probing this hop (reduce load)'}
-                                  onClick={(e) => { e.stopPropagation(); toggleHopPause(h.hop) }}>{hopPaused ? '▶' : '⏸'}</button>
+                                <button className="hop-pause" disabled={targetPaused}
+                                  title={targetPaused ? 'Target is paused — resume the target to control individual hops' : (hopPaused ? 'Resume probing this hop' : 'Pause probing this hop (reduce load)')}
+                                  onClick={(e) => { e.stopPropagation(); if (!targetPaused) toggleHopPause(h.hop) }}>{effPaused ? '▶' : '⏸'}</button>
                                 <span className={'hopdot st-' + hopStatus(h)} title={hopStatus(h)} />{h.hop}{h.is_dest ? ' ◀' : ''}
                               </td>
                               <td><div className="plbar"><span style={{ width: `${Math.min(100, h.loss)}%` }} /></div><i className={h.loss > 0 ? 'loss' : ''}>{h.loss.toFixed(0)}</i></td>

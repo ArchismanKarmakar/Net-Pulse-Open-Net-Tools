@@ -1,0 +1,21 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Net Pulse's complete IPC surface. Every command the frontend can invoke is named explicitly here — nothing else is reachable, mirroring the old Electron contextBridge allowlist (see preload.js in the legacy electron/ app) but enforced by Tauri's own permission system instead of a hand-written bridge object. No built-in Tauri capabilities (fs, shell, http, dialog, etc.) are granted — this app doesn't need any of them; every network operation goes through the app's own commands below, not a generic plugin.",
+  "windows": ["main"],
+  "permissions": [
+    "allow-add-target",
+    "allow-update-target",
+    "allow-pause-target",
+    "allow-stop-target",
+    "allow-remove-target",
+    "allow-get-state",
+    "allow-list-interfaces",
+    "allow-engine-build",
+    "allow-dns-lookup",
+    "allow-reverse-lookup",
+    "allow-port-scan",
+    "allow-ping-start",
+    "allow-ping-stop"
+  ]
+}

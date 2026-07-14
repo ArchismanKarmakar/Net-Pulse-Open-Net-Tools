@@ -7,10 +7,11 @@ modify any of their source; it links/bundles them as-is per their licenses.
 
 | Component | License | Role |
 |---|---|---|
-| [Electron](https://www.electronjs.org/) | MIT | Desktop app shell |
-| [Node.js](https://nodejs.org/) | MIT | JS runtime embedded in Electron |
-| [node-addon-api](https://github.com/nodejs/node-addon-api) | MIT | C++ wrapper for Node-API, used by `napi/` |
-| [CMake.js](https://github.com/cmake-js/cmake-js) | MIT | Builds the native addon, Node-version-independent |
+| [Tauri](https://tauri.app/) | MIT/Apache-2.0 | Desktop app shell (Rust host + OS WebView) |
+| [Rust](https://www.rust-lang.org/) | MIT/Apache-2.0 | Language/runtime for the desktop host |
+| [cxx](https://cxx.rs/) | MIT/Apache-2.0 | Safe C++↔Rust FFI bridge, statically links `core/` into the Rust binary |
+| [tokio](https://tokio.rs/) | MIT | Async runtime, used by the port scanner |
+| [hickory-resolver](https://github.com/hickory-dns/hickory-dns) | MIT/Apache-2.0 | DNS/reverse-DNS resolution |
 | [React](https://react.dev/) | MIT | UI library |
 | [Recharts](https://recharts.org/) | MIT | Charting library (the RTT/latency graph) |
 | [Tailwind CSS](https://tailwindcss.com/) | MIT | Utility CSS framework, compiled at build time (no runtime dependency) |

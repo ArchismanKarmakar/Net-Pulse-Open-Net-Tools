@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ping-stop"
+description = "Enables the ping_stop command without any pre-configured scope."
+commands.allow = ["ping_stop"]
+
+[[permission]]
+identifier = "deny-ping-stop"
+description = "Denies the ping_stop command without any pre-configured scope."
+commands.deny = ["ping_stop"]

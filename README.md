@@ -17,44 +17,21 @@
   <a href="https://github.com/sponsors/ArchismanKarmakar">Sponsor</a>
 </p>
 
-> ### ⚠️ Upgrading? Extract into a CLEAN folder
-> Do **not** unzip a new release *over* an old one. Extraction doesn't delete
-> files that were removed in the new version — most importantly `napi/binding.gyp`.
-> If a stale `napi/binding.gyp` is present, `npm install` in `napi/` will run
-> **node-gyp** (which forces **C++17** and shows `overriding '/std:c++20' with
-> '/std:c++17'`) instead of the CMake.js **C++20** build. This project no longer
-> ships `binding.gyp`; if you see node-gyp run, delete `napi/binding.gyp` and
-> `napi/build/` (or just run `build-and-run.ps1`, which cleans them for you).
->
-> The deprecation warnings during `npm install` in `electron/` (`inflight`,
-> `glob@7`, `rimraf@2`, `boolean`) come from **electron-builder's** own
-> dependency tree — they are **dev-only build tooling, not shipped in the app**,
-> and don't affect the signed binary. They'll clear as electron-builder updates
-> upstream; don't `npm audit fix --force` (it pulls breaking majors).
+> ### 🦀 Now on Tauri + Rust + React (the C++ engine is unchanged)
+> The desktop shell moved from Electron/Node-API to **Tauri + Rust**, calling
+> the *same* C++ probe engine through a `cxx` bridge — statically linked into
+> the Rust binary, no `.node` addon. See [`tauri-app/`](tauri-app/) and
+> [`docs/TAURI_MIGRATION.md`](docs/TAURI_MIGRATION.md) for what's built and
+> exactly how to build it. The old Electron/Node-API app (`electron/`, `napi/`)
+> has been **retired** now that the Tauri build is verified working
+> end-to-end — see `CHANGELOG.md` for the migration record.
 
-
-> **Running the app:** Net Pulse is an **Electron desktop app**. Run it from a
-> terminal, **not** from VS Code's C++ *Debug/Play* button.
->
-> One-shot: **`./build-and-run.ps1`** (Windows) or **`./build-and-run.sh`**
-> (Linux/macOS) from the project root. For real ICMP probing, use an
-> **Administrator** terminal (Windows) or grant `cap_net_raw` (Linux).
->
-> **In VS Code:** open the Run and Debug panel (Ctrl+Shift+D) and pick
-> **"Net Pulse: Launch app (Electron)"** from the dropdown, then press ▶. This
-> builds everything and launches the real app. Do **not** use the default C++
-> "Debug"/▶ button in the status bar — CMake Tools auto-selects
-> `netpulse_tests` as its target (the only executable this CMake project
-> builds), so that button runs the **unit tests**, not the app. If you see it
-> print `ALL TESTS PASSED` and exit with code `0`, that is a passing test
-> suite, not a crash — exit code 0 means success on every OS.
->
 > **The C++ CMake project is NOT the app.** It builds only the engine library
 > (`netpulse_core`) and its unit tests (`netpulse_tests`). If you press VS Code's
 > Debug button it will build and run `netpulse_tests.exe`, which prints
 > `ALL TESTS PASSED` and exits with code 0. A console test finishing and closing
 > its window in a flash is **success, not a crash** — that's the tests doing
-> their job. The actual app lives in `electron/` + `napi/` (below).
+> their job. The actual app lives in `tauri-app/` (below).
 
 
 A cross-platform **desktop** path-latency monitor (PingPlotter / mtr style):
@@ -64,18 +41,20 @@ config, per-hop ASN/BGP, alerts, exports, light & dark themes.
 Each target in the sidebar shows a **two-lamp status signal** (target + path) —
 see [Status lamps](#status-lamps) below for what the colours mean.
 
-Net Pulse — Open Net Tools is a **native desktop app** — Electron shell + a C++ engine compiled as
-an in-process **Node-API addon**. There is **no web server, no localhost port,
-and no WebSocket**. The renderer talks to the engine only over Electron IPC,
-exactly like a Qt app talks to its backend.
+Net Pulse — Open Net Tools is a **native desktop app** — a Tauri shell (Rust
+host) + the same C++ engine, statically linked into the Rust binary via a
+`cxx` bridge (no `.node`/shared-library addon shipped separately). There is
+**no web server, no localhost port, and no WebSocket**. The renderer talks to
+the engine only over Tauri's own `invoke` IPC, exactly like a Qt app talks to
+its backend.
 
 ```
 ┌─────────────────────────────────────────────┐
-│ Electron renderer (React UI, web/dist)        │  file://  — no HTTP
-│   window.netpulse.*  ──IPC──┐                 │
+│ Tauri webview (React UI, tauri-app/dist)      │  OS webview — no HTTP
+│   invoke('add_target', …)  ──IPC──┐           │
 ├─────────────────────────────┼─────────────────┤
-│ Electron main (main.js)     ▼                 │
-│   require('../napi')  →  netpulse.node         │  in-process
+│ Rust host (tauri-app/src-tauri)  ▼            │
+│   commands.rs → ffi.rs (cxx bridge)            │  in-process, statically linked
 ├───────────────────────────────────────────────┤
 │ C++ engine (core/)  — ICMP codec, transport,   │  background threads
 │ continuous probing, per-hop stats, JSON state  │  raw sockets
@@ -86,98 +65,37 @@ exactly like a Qt app talks to its backend.
 
 | Path        | What                                                                 |
 |-------------|----------------------------------------------------------------------|
-| `core/`     | The engine (header-only API in `core/include/netpulse/`). Pure C++17. |
-| `napi/`     | Node-API addon (CMake.js) wrapping the engine. Builds `netpulse.node`. |
-| `electron/` | Desktop shell: `main.js` (loads the addon, IPC), `preload.js`.         |
-| `web/`      | React renderer (Vite). Built to `web/dist`, loaded over `file://`.     |
+| `core/`     | The engine (header-only API in `core/include/netpulse/`). Pure C++20. |
+| `tauri-app/` | Desktop app: Rust host (`src-tauri/`, `cxx` bridge to `core/`) + React renderer (Vite). |
+| `web/`      | Standalone React renderer (Vite), served over HTTP by `server/` — a separate deployment target, not used by `tauri-app/`. |
+| `server/`   | Optional HTTP server (`server/main.cpp`) that serves `web/dist` for a browser-based deployment. |
 | `tests/`    | C++ unit tests for the engine.                                        |
 | `CMakeLists.txt` | Builds the core library + unit tests (for engine development).   |
 
 ## Prerequisites
 
-- **Node.js 20+ LTS** and npm (the project targets active-LTS Node — 20 or 22).
-- **CMake** 3.15+ on your **PATH** — CMake.js does *not* bundle it.
-  - Easiest: install from <https://cmake.org/download/> and tick **"Add CMake to
-    the system PATH"**, then open a **new** terminal and check `cmake --version`.
-  - Or use the CMake that ships with Visual Studio by launching
-    **"Developer PowerShell for VS"** (it puts VS's CMake on PATH).
-- A **C++20 compiler**
-  - Windows: Visual Studio Build Tools / VS 2022+ — *"Desktop development with C++"*
-  - Linux: `build-essential` (GCC 10+/Clang 12+); macOS: Xcode command-line tools
-- The addon is built with **CMake.js** only (no node-gyp), so it is **independent
-  of the Node.js version** and rebuildable for Electron's ABI.
-
-> `npm install` in `napi/` only fetches dependencies — it does **not** build the
-> addon. You build it explicitly (below), after CMake is on your PATH.
+- **Rust** (current stable, via [rustup](https://rustup.rs) — not your distro's
+  package manager; see `tauri-app/src-tauri/Cargo.toml`'s `rust-version`).
+- **Node.js 20.19+** and npm, for the React renderer.
+- **CMake** 3.15+ on your **PATH** (for engine development / `ctest` — the
+  Tauri build itself invokes the C++ compiler directly via `cxx_build`, not
+  through this CMake project).
+- A **C++20 compiler** (MSVC / GCC 10+ / Clang 12+).
+- **Linux only:** `libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev`.
 
 ## Build & run
 
-### 1. Native engine (Node-API addon)
-
 ```bash
-cd napi
-npm install                  # fetches node-addon-api + cmake-js only (no build)
-npm run build:electron       # builds netpulse.node for the INSTALLED Electron's ABI
-# (or `npm run build` to build for plain Node, e.g. for the test in index.js)
-```
-
-`build:electron` auto-detects the Electron version installed in `../electron`
-(via `build-electron.js`) — nothing is hard-coded, so upgrading Electron just
-works. Install Electron first (`cd electron && npm install`) so it can be found.
-Both `build` scripts do a **clean** rebuild (`cmake-js rebuild`) so a header-only
-engine change is never missed.
-
-### 2. Renderer
-
-```bash
-cd web
+cd tauri-app
 npm install
-npm run build          # → web/dist (assets are relative, for file:// loading)
+npx tauri dev      # launches the app with hot-reload
+# or:
+npx tauri build    # produces a real installer (NSIS/AppImage/dmg per OS)
 ```
 
-### 3. Desktop app
-
-```bash
-cd electron
-npm install            # electron
-npm start              # launches the app (loads the addon; no server/port)
-```
-
-On launch the engine logs its build tag, e.g.
-`[Net Pulse] native engine loaded — build <tag>` and `[Net Pulse] engine build: <tag>`.
-If `engine build:` shows a real tag (not `unknown`), the freshly-built addon is
-loaded. `unknown` means the addon wasn't rebuilt (or an old `.node` is on disk).
-
-### 4. Distributable installers (signed)
-
-Build order matters: build the UI and the addon (for the target Electron ABI)
-first, then package.
-
-```bash
-cd web    && npm install && npm run build            # UI → web/dist
-cd ../napi && npm install && npm run build:electron  # addon → napi/build/Release/*.node
-cd ../electron && npm install && npm run dist        # → ../release/ (installer)
-```
-
-`electron/electron-builder.yml` produces an NSIS installer (Windows), dmg/zip
-(macOS), and AppImage/deb (Linux). **Code signing** is wired via environment
-variables (`CSC_LINK`/`CSC_KEY_PASSWORD`, plus Apple notarization vars on macOS)
-so no secret is stored in the repo. For OS/AV trust and a clean VirusTotal
-result you **must sign** the artifacts — see [`SECURITY.md`](SECURITY.md), which
-covers signing, notarization, reputation, and handling AV false positives. The
-config never packs/obfuscates binaries (a common false-positive trigger). For
-a full step-by-step signing runbook (certificate types, EV vs OV, macOS
-notarization, and building AV/SmartScreen reputation over time), see
-[`CODE_SIGNING.md`](CODE_SIGNING.md).
-
-Dev mode (hot-reload UI from Vite while still using the native engine):
-
-```bash
-# terminal 1
-cd web && npm run dev          # vite on :5173 (UI only — no /api server)
-# terminal 2
-cd electron && npm run dev     # NETPULSE_DEV=1 electron .  (loads :5173 + addon)
-```
+See [`docs/TAURI_MIGRATION.md`](docs/TAURI_MIGRATION.md) for the full
+architecture writeup, and [`docs/OBFUSCATED_BUILD.md`](docs/OBFUSCATED_BUILD.md)
+for the optional `--features obfuscate` hardened build variant.
 
 ### Raw sockets / privileges
 
@@ -185,29 +103,11 @@ ICMP probing needs raw-socket privileges:
 
 - **Windows:** run the app **as Administrator**.
 - **Linux:** either run elevated, or grant the capability once:
-  `sudo setcap cap_net_raw+ep $(which electron)` (or the packaged binary).
+  `sudo setcap cap_net_raw+ep $(which netpulse)` (the installed binary).
   Alternatively use **unprivileged datagram ICMP** by unchecking **Raw** when
   adding a target (works without admin on most Linux/macOS for plain ping).
 
-## Troubleshooting (Windows)
-
-**`cmake-js` → "CMake is not installed. Install CMake."**
-CMake.js found Visual Studio but not a `cmake` executable. Install CMake and add
-it to PATH (or use *Developer PowerShell for VS*), open a new terminal, confirm
-`cmake --version`, then `cd napi && npm run build:electron`. Note `npm install`
-no longer triggers the build, so a missing CMake won't break `npm i`.
-
-**`npm i` in `electron/` → `EBUSY: resource busy or locked … default_app.asar`**
-A file lock during Electron's unpack — almost always because the project is in
-**`Downloads`/OneDrive** (sync + antivirus lock files mid-rename) or an Electron
-process is still running. Fix:
-1. Move the project out of `Downloads` to a non-synced path, e.g. `C:\dev\NetPulse`.
-2. Close any running `electron.exe`/`node.exe` (Task Manager).
-3. `rmdir /s /q electron\node_modules` and `npm cache clean --force`.
-4. (Optional) pause OneDrive sync / add a Defender exclusion for the folder.
-5. Retry `npm install`.
-
-## Engine development (no Node needed)
+## Engine development (no Node/Rust needed)
 
 ```bash
 cmake -S . -B build
@@ -215,40 +115,22 @@ cmake --build build
 ctest --test-dir build      # runs the C++ unit tests
 ```
 
-## Packaging (electron-builder, sketch)
-
-Bundle `web/dist`, the Electron files, and the **Electron-ABI** addon
-(`napi/build/Release/netpulse.node` + `napi/index.js`). Mark `napi` as
-`asarUnpack` so the `.node` can be `dlopen`ed:
-
-```jsonc
-"build": {
-  "files": ["electron/**", "web/dist/**", "napi/index.js"],
-  "asarUnpack": ["napi/**"],
-  "extraResources": ["napi/build/Release/netpulse.node"]
-}
-```
-
 ## Security
 
 - **No network surface from the app itself.** No HTTP server, no open port, no
   WebSocket — the only sockets opened are the ICMP probe sockets.
-- **Hardened renderer:** `contextIsolation: true`, `nodeIntegration: false`,
-  `sandbox: true`. The renderer reaches the engine only through a minimal,
-  audited IPC surface exposed by `preload.js` as `window.netpulse`.
-- **Content-Security-Policy** is set in the main process: `default-src 'self'`,
-  `script-src 'self'` (no remote scripts, no `eval`), `connect-src 'self'
-  https:` (only for the optional BGP/RDAP/DoH lookups), `object-src 'none'`.
-- **In-app navigation is blocked**; external links (looking-glass, PeeringDB,
-  RIPEstat) open in the OS browser.
-- **Addon input validation:** every value crossing the JS↔C++ boundary is
-  range-clamped (probe 0.01–3600 s, timeout 0–3600 s, payload 0–1472 B,
-  max-hops 1–64) and the target string is length-checked; bad input throws a JS
-  error instead of reaching the engine. No shell is ever invoked, so there is no
-  command-injection surface.
-- Native-addon guidance followed per
-  <https://snyk.io/blog/nodejs-add-on-extensions/> (validate at the boundary,
-  no untrusted input to native parsing, keep the C++ surface small).
+- **Narrow IPC surface:** every command the frontend can call is listed in
+  exactly two places that must match — `invoke_handler` in `lib.rs` and
+  `capabilities/default.json`'s `permissions` array. No filesystem, shell, or
+  HTTP plugin is enabled; every network operation goes through this app's own
+  named commands. See [`SECURITY.md`](SECURITY.md) for the full writeup.
+- **Content-Security-Policy** (`tauri.conf.json`): `default-src 'self'`,
+  `script-src 'self'` (no remote scripts, no `eval`), `object-src 'none'`,
+  `frame-ancestors 'none'`.
+- **Input validation:** every value crossing the Rust↔C++ boundary and every
+  host string passed to a tool command is range-clamped/allowlist-validated;
+  no shell is ever invoked (ping is spawned via argv, never a shell string), so
+  there is no command-injection surface.
 
 ## Status lamps
 
@@ -322,8 +204,8 @@ updated to the actual responder).
 
 The UI is built with **Tailwind CSS**, compiled at build time in `web/` via
 PostCSS (`npm run build`). This has **zero effect on packaging**: the output
-is one static `.css` file in `web/dist`, exactly like the hand-written CSS it
-replaced — Tailwind never ships in the Electron bundle, only its compiled
+is one static `.css` file in `dist`, exactly like the hand-written CSS it
+replaced — Tailwind never ships in the app bundle, only its compiled
 output does. Theme colors (light/dark) are still driven by CSS variables in
 `src/styles.css`, with Tailwind utilities reading from them, so the existing
 `data-theme` toggle keeps working unchanged. No web fonts are bundled or
@@ -371,6 +253,6 @@ The app is organized into tabs across the top:
   hosts you own or are authorized to test.
 
 The Ping, DNS, and Port Scanner tools run in the desktop app (they use the OS
-network stack via the Electron main process); they are unavailable in a plain
-browser dev server.
+network stack via the Rust host); they are unavailable in a plain browser dev
+server.
 

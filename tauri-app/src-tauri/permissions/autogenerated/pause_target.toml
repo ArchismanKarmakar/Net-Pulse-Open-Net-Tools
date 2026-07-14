@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pause-target"
+description = "Enables the pause_target command without any pre-configured scope."
+commands.allow = ["pause_target"]
+
+[[permission]]
+identifier = "deny-pause-target"
+description = "Denies the pause_target command without any pre-configured scope."
+commands.deny = ["pause_target"]

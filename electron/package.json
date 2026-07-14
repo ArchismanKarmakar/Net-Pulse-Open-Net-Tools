@@ -17,7 +17,10 @@
     "electron-builder": "^26.15.3"
   },
   "license": "AGPL-3.0-or-later",
-  "author": "Archisman Karmakar",
+  "author": {
+    "name": "Archisman Karmakar",
+    "email": "ArchismanKarmakar@users.noreply.github.com"
+  },
   "productName": "Net Pulse - Open Net Tools",
   "engines": {
     "node": ">=20.19"

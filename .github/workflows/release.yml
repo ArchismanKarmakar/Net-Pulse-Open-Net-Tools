@@ -103,19 +103,36 @@ jobs:
       # searching the runner's local keychain/cert store for a signing
       # identity it will never find in CI — without this, macOS builds in
       # particular can fail outright instead of falling back to unsigned.
+      #
+      # IMPORTANT: these vars must be genuinely ABSENT when no cert secret is
+      # configured, not present-but-empty. `env: CSC_LINK: ${{ secrets.X }}`
+      # sets CSC_LINK="" when the secret doesn't exist — electron-builder's
+      # macOS signing path then does path.resolve('') on that empty string,
+      # which Node.js resolves to the current working directory, and fails
+      # trying to stat that directory as a signing certificate file. Exporting
+      # conditionally via GITHUB_ENV avoids ever setting an empty CSC_LINK.
+      - name: Set signing env (only if secrets are configured)
+        shell: bash
+        run: |
+          if [ -n "${{ secrets.CSC_LINK }}" ]; then
+            echo "CSC_IDENTITY_AUTO_DISCOVERY=true" >> "$GITHUB_ENV"
+            echo "CSC_LINK=${{ secrets.CSC_LINK }}" >> "$GITHUB_ENV"
+            echo "CSC_KEY_PASSWORD=${{ secrets.CSC_KEY_PASSWORD }}" >> "$GITHUB_ENV"
+          else
+            echo "CSC_IDENTITY_AUTO_DISCOVERY=false" >> "$GITHUB_ENV"
+          fi
+          if [ -n "${{ secrets.APPLE_ID }}" ]; then
+            echo "APPLE_ID=${{ secrets.APPLE_ID }}" >> "$GITHUB_ENV"
+            echo "APPLE_APP_SPECIFIC_PASSWORD=${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}" >> "$GITHUB_ENV"
+            echo "APPLE_TEAM_ID=${{ secrets.APPLE_TEAM_ID }}" >> "$GITHUB_ENV"
+          fi
+
       # If CSC_LINK/CSC_KEY_PASSWORD secrets are configured in the repo (once
-      # a certificate exists — see CODE_SIGNING.md) they override this and
+      # a certificate exists — see CODE_SIGNING.md) they're picked up above and
       # the build becomes genuinely signed with no other change needed here.
       - name: Package installer
         working-directory: electron
         run: npm run ${{ matrix.dist_script }}
-        env:
-          CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.CSC_LINK != '' && 'true' || 'false' }}
-          CSC_LINK: ${{ secrets.CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
       - name: List produced artifacts (diagnostic)
         shell: bash

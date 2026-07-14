@@ -1,0 +1,68 @@
+name: Version Release
+
+# Watches electron/package.json's "version" field. Whenever a push to main
+# changes it to a version that hasn't been released yet, this workflow tags
+# the commit (vX.Y.Z) and pushes the tag — nothing else. release.yml already
+# triggers on any `v*` tag push, so that's the entire hand-off: this workflow
+# never builds or publishes anything itself.
+#
+# Usage: bump "version" in electron/package.json, commit, push/merge to main.
+# That's it — no manual `git tag` / `git push origin vX.Y.Z` needed anymore.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'electron/package.json'
+  workflow_dispatch: {}   # manual re-run, e.g. if a tag push failed
+
+concurrency:
+  group: version-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Tag release version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create + push the tag
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full tag history to check for duplicates
+
+      - name: Read version from electron/package.json
+        id: version
+        run: |
+          VERSION=$(node -p "require('./electron/package.json').version")
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$VERSION' in electron/package.json is not a valid semver version"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether this version was already released
+        id: check
+        run: |
+          if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip (tag already exists)
+        if: steps.check.outputs.exists == 'true'
+        run: |
+          echo "::notice::${{ steps.version.outputs.tag }} already exists — nothing to do. Bump the version in electron/package.json to release again."
+
+      - name: Create and push tag
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+          echo "::notice::Pushed ${{ steps.version.outputs.tag }} — release.yml will now build and publish it."

@@ -2,35 +2,37 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "Net Pulse: Build engine (Node-API addon)",
-      "type": "shell",
-      "windows": { "command": "npm install; npx cmake-js rebuild --runtime electron --runtime-version $(node -p \"require('../electron/node_modules/electron/package.json').version\")" },
-      "linux":   { "command": "npm install && npx cmake-js rebuild --runtime electron --runtime-version \"$(node -p \"require('../electron/node_modules/electron/package.json').version\")\"" },
-      "options": { "cwd": "${workspaceFolder}/napi" },
-      "problemMatcher": []
-    },
-    {
-      "label": "Net Pulse: Build UI",
-      "type": "shell",
-      "command": "npm install && npm run build",
-      "options": { "cwd": "${workspaceFolder}/web" },
-      "problemMatcher": []
-    },
-    {
-      "label": "Net Pulse: Install Electron",
+      "label": "Net Pulse: Install tauri-app dependencies",
       "type": "shell",
       "command": "npm install",
-      "options": { "cwd": "${workspaceFolder}/electron" },
+      "options": { "cwd": "${workspaceFolder}/tauri-app" },
       "problemMatcher": []
     },
     {
-      "label": "Net Pulse: Run app",
+      "label": "Net Pulse: Run app (Tauri dev)",
       "type": "shell",
-      "command": "npm start",
-      "options": { "cwd": "${workspaceFolder}/electron" },
-      "dependsOn": ["Net Pulse: Install Electron", "Net Pulse: Build UI", "Net Pulse: Build engine (Node-API addon)"],
+      "command": "npx tauri dev",
+      "options": { "cwd": "${workspaceFolder}/tauri-app" },
+      "dependsOn": ["Net Pulse: Install tauri-app dependencies"],
       "dependsOrder": "sequence",
+      "isBackground": true,
       "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": {
+        "pattern": { "regexp": "^never-matches$" },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "Compiling|Running",
+          "endsPattern": "Finished|error\\["
+        }
+      }
+    },
+    {
+      "label": "Net Pulse: Build app (Tauri release installer)",
+      "type": "shell",
+      "command": "npx tauri build",
+      "options": { "cwd": "${workspaceFolder}/tauri-app" },
+      "dependsOn": ["Net Pulse: Install tauri-app dependencies"],
+      "dependsOrder": "sequence",
       "problemMatcher": []
     },
     {

@@ -1,0 +1,55 @@
+[package]
+name = "netpulse"
+version = "0.9.2"
+description = "Net Pulse — Open Net Tools: path-latency & network diagnostics (Tauri + Rust host, C++ probe engine)"
+authors = ["Archisman Karmakar"]
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/ArchismanKarmakar/Net-Pulse-Open-Net-Tools"
+edition = "2021"
+# NOTE: Tauri 2's own templates currently declare rust-version = "1.90" (verified
+# against the official template as of this writing — see docs/TAURI_MIGRATION.md).
+# Ubuntu 24.04's `apt install rustc` ships 1.75, which is too old — install a
+# current toolchain via rustup (https://rustup.rs), not your distro's package
+# manager, before building this.
+rust-version = "1.90"
+
+[lib]
+name = "netpulse_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6", features = [] }
+cxx-build = "1.0.197"
+
+[dependencies]
+tauri = { version = "2.11", features = ["tray-icon"] }
+tauri-plugin-log = "2.8"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+cxx = "1.0.197"
+tokio = { version = "1.52", features = ["rt-multi-thread", "net", "time", "process", "io-util", "sync"] }
+hickory-resolver = "0.26.1"
+
+[profile.release]
+# Real, verified-approach hardening for the Rust side (see SECURITY.md):
+# strip symbols, prefer size (smaller = less to disassemble "for free"),
+# panic=abort removes unwinding tables/landing pads from the binary.
+strip = true
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[features]
+# Mirrors NETPULSE_OBFUSCATE in the C++ CMake config. This feature doesn't
+# change any Rust code — it's read by build.rs, which defines
+# NETPULSE_OBFUSCATE when compiling the engine via cxx_build, turning on
+# core/include/netpulse/obfuscate.hpp's source-level obfuscation (string
+# encryption + opaque predicates). See docs/OBFUSCATED_BUILD.md. Obfuscating
+# the THIN Rust shell isn't the point (it holds no engine logic); obfuscating
+# the statically-linked C++ engine it calls into is — and this works with
+# whatever compiler cxx_build already picked, no special toolchain needed.
+obfuscate = []
+
+[dev-dependencies]
+tauri = { version = "2.11", features = ["test"] }

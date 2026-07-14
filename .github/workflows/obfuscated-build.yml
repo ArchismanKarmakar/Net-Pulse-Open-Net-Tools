@@ -1,0 +1,106 @@
+name: Obfuscated build (engine)
+
+# Builds and tests the SECOND build variant — the C++ engine compiled with
+# NETPULSE_OBFUSCATE=ON (source-level string encryption + opaque predicates,
+# core/include/netpulse/obfuscate.hpp) — separately from the normal build in
+# tauri-ci.yml. See docs/OBFUSCATED_BUILD.md for what this does and does not
+# achieve, and SECURITY.md's "Reverse engineering / IP protection" section for
+# why this is a raise-the-cost measure, not a guarantee.
+#
+# An out-of-tree LLVM pass-plugin approach (ollvm/Hikari-style IR passes) was
+# tried first and abandoned — every prebuilt clang toolchain available in
+# testing crashed with a heap-corruption ABI mismatch when loading a
+# separately-built plugin (see docs/OBFUSCATED_BUILD.md for the full
+# writeup). What ships instead needs NO special toolchain and NO from-source
+# LLVM build — any C++20 compiler (MSVC, GCC, Clang) on any of the three
+# runners below builds it directly, so this workflow runs on the same OS
+# matrix as the normal build, just as its own separate job/workflow so a
+# broken obfuscated variant doesn't block normal PRs.
+#
+# The functional correctness bar for the obfuscated binary is the SAME unit
+# test suite the normal build runs (tests/test_core.cpp) — obfuscation must be
+# behavior-preserving, so "does it still pass every test" is the right
+# acceptance check, not a separate obfuscation-specific test. Same bar applies
+# to the Tauri/Rust side via `cargo build --features obfuscate`.
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '0 3 * * 1'   # weekly (Monday 03:00 UTC) safety net
+  push:
+    paths:
+      - 'CMakeLists.txt'
+      - 'core/include/netpulse/obfuscate.hpp'
+      - 'tauri-app/src-tauri/build.rs'
+      - 'tauri-app/src-tauri/Cargo.toml'
+      - '.github/workflows/obfuscated-build.yml'
+      - 'docs/OBFUSCATED_BUILD.md'
+  pull_request:
+    paths:
+      - 'CMakeLists.txt'
+      - 'core/include/netpulse/obfuscate.hpp'
+      - 'tauri-app/src-tauri/build.rs'
+      - '.github/workflows/obfuscated-build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: obfuscated-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine:
+    name: Engine (obfuscated, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Configure (NETPULSE_OBFUSCATE=ON)
+        run: cmake -S . -B build-obf -DCMAKE_BUILD_TYPE=Release -DNETPULSE_OBFUSCATE=ON
+
+      - name: Build
+        run: cmake --build build-obf --config Release
+
+      # Same acceptance bar as the normal build: obfuscation must not change
+      # behavior, so the SAME test suite must pass unmodified.
+      - name: Run unit tests against the obfuscated binary
+        run: ctest --test-dir build-obf -C Release --output-on-failure
+
+  rust-shell:
+    name: Tauri/Rust shell (obfuscated engine, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Linux webview deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libayatana-appindicator3-dev libxdo-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tauri-app/src-tauri
+
+      - name: cargo check --features obfuscate
+        working-directory: tauri-app/src-tauri
+        run: cargo check --features obfuscate
+
+      - name: cargo build --release --features obfuscate
+        working-directory: tauri-app/src-tauri
+        run: cargo build --release --features obfuscate

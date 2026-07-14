@@ -1,0 +1,105 @@
+name: Tauri Version Release
+
+# Watches tauri-app/src-tauri/tauri.conf.json's "version" field. Whenever a
+# push to main changes it to a version that hasn't been released yet, this
+# workflow tags the commit (vX.Y.Z) and directly dispatches tauri-release.yml
+# for that tag.
+#
+# Why dispatch instead of just pushing the tag: a tag pushed using the
+# default GITHUB_TOKEN does NOT trigger other workflows' `on: push: tags`
+# (GitHub blocks this specifically to prevent recursive/infinite workflow
+# runs). workflow_dispatch is the documented exception, so we call it
+# directly instead of relying on the tag push alone.
+#
+# Usage: bump "version" in tauri-app/src-tauri/tauri.conf.json (and keep
+# tauri-app/package.json + tauri-app/src-tauri/Cargo.toml in sync — see the
+# "Check version consistency" step below, which fails fast if they drift),
+# commit, push/merge to main. No manual `git tag` / `git push origin vX.Y.Z`
+# needed.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tauri-app/src-tauri/tauri.conf.json'
+  workflow_dispatch: {}   # manual re-run, e.g. if a tag push failed
+
+concurrency:
+  group: tauri-version-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Tag release version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create + push the tag
+      actions: write    # dispatch tauri-release.yml directly
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # need full tag history to check for duplicates
+
+      - name: Read version from tauri.conf.json
+        id: version
+        run: |
+          VERSION=$(node -p "require('./tauri-app/src-tauri/tauri.conf.json').version")
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$VERSION' in tauri.conf.json is not a valid semver version"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      # tauri.conf.json's version is the one that actually drives installer
+      # filenames/bundle metadata, but Cargo.toml and package.json drifting
+      # from it silently is exactly what happened before this workflow
+      # existed (0.9.1 vs 0.9.2) — fail loudly instead of releasing a
+      # mismatched crate version.
+      - name: Check version consistency across Cargo.toml / package.json
+        run: |
+          CARGO_VERSION=$(grep -m1 '^version' tauri-app/src-tauri/Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          PKG_VERSION=$(node -p "require('./tauri-app/package.json').version")
+          if [ "$CARGO_VERSION" != "${{ steps.version.outputs.version }}" ]; then
+            echo "::error::Cargo.toml version ($CARGO_VERSION) does not match tauri.conf.json (${{ steps.version.outputs.version }})"
+            exit 1
+          fi
+          if [ "$PKG_VERSION" != "${{ steps.version.outputs.version }}" ]; then
+            echo "::error::tauri-app/package.json version ($PKG_VERSION) does not match tauri.conf.json (${{ steps.version.outputs.version }})"
+            exit 1
+          fi
+
+      - name: Check whether this version was already released
+        id: check
+        run: |
+          if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip (tag already exists)
+        if: steps.check.outputs.exists == 'true'
+        run: |
+          echo "::notice::${{ steps.version.outputs.tag }} already exists — nothing to do. Bump the version in tauri.conf.json to release again."
+
+      - name: Create and push tag
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+          echo "::notice::Pushed ${{ steps.version.outputs.tag }}."
+
+      - name: Trigger tauri-release.yml for this tag
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run tauri-release.yml \
+            --ref main \
+            -f tag="${{ steps.version.outputs.tag }}"
+          echo "::notice::Dispatched tauri-release.yml for ${{ steps.version.outputs.tag }}."

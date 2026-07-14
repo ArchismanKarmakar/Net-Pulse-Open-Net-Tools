@@ -1,0 +1,51 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Net Pulse - Open Net Tools",
+  "version": "0.9.2",
+  "identifier": "com.archismankarmakar.netpulse.opennettools",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Net Pulse — Open Net Tools",
+        "width": 1340,
+        "height": 880,
+        "minWidth": 900,
+        "minHeight": 600,
+        "backgroundColor": "#0e1116"
+      }
+    ],
+    "security": {
+      "csp": {
+        "default-src": "'self'",
+        "script-src": "'self'",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' data: asset: http://asset.localhost",
+        "connect-src": "'self' ipc: http://ipc.localhost https:",
+        "object-src": "'none'",
+        "base-uri": "'self'",
+        "frame-ancestors": "'none'"
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "appimage", "dmg"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "publisher": "Archisman Karmakar",
+    "copyright": "Copyright © 2026 Archisman Karmakar — AGPL-3.0-or-later",
+    "category": "Utility"
+  }
+}

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-reverse-lookup"
+description = "Enables the reverse_lookup command without any pre-configured scope."
+commands.allow = ["reverse_lookup"]
+
+[[permission]]
+identifier = "deny-reverse-lookup"
+description = "Denies the reverse_lookup command without any pre-configured scope."
+commands.deny = ["reverse_lookup"]

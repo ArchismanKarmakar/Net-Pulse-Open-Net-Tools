@@ -1331,6 +1331,16 @@ export default function App() {
                           const prevAvg = i > 0 ? sel.hops[i - 1].avg : null
                           const nextAvg = i < sel.hops.length - 1 ? sel.hops[i + 1].avg : null
                           const hopPaused = (sel.config?.pausedHops || []).includes(h.hop)
+                          // Global/per-target pause (sel.paused) and per-hop pause
+                          // (pausedHops) are independent backend mechanisms — pausing
+                          // the whole target stops ALL probing regardless of which
+                          // hops are individually paused, so a hop's pause button
+                          // must reflect the EFFECTIVE state (paused for either
+                          // reason), not just its own pausedHops membership. Without
+                          // this, toggling an individual hop while the target is
+                          // globally paused looked broken: the click did mutate
+                          // pausedHops, but nothing visibly changed (nothing was being
+                          // probed either way), and the icon didn't match reality.
                           const targetPaused = !!sel.paused
                           const effPaused = targetPaused || hopPaused
                           return (

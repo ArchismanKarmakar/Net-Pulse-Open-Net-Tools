@@ -2,17 +2,14 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Net Pulse: Launch app (Electron)",
-      "type": "node",
-      "request": "launch",
-      "cwd": "${workspaceFolder}/electron",
-      "runtimeExecutable": "${workspaceFolder}/electron/node_modules/.bin/electron",
-      "windows": { "runtimeExecutable": "${workspaceFolder}/electron/node_modules/.bin/electron.cmd" },
-      "args": ["."],
-      "preLaunchTask": "Net Pulse: Run app",
-      "outputCapture": "std"
-    },
-    {
+      // Tauri's dev process is a Rust binary embedding the OS webview, not a
+      // Node process — there's no plain "node" launch config that can attach
+      // to it. Use Terminal > Run Task > "Net Pulse: Run app (Tauri dev)"
+      // (or `cd tauri-app && npx tauri dev`) to run the actual app; this repo
+      // intentionally has no F5 launch entry for it. If you have the
+      // CodeLLDB extension installed, you can debug the compiled Rust binary
+      // directly by attaching to `tauri-app/src-tauri/target/debug/netpulse.exe`
+      // after `npx tauri dev` has started it.
       "name": "Net Pulse: C++ unit tests (Debug)",
       "type": "cppvsdbg",
       "request": "launch",

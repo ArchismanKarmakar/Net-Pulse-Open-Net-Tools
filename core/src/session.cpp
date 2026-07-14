@@ -3,14 +3,18 @@
 #include "netpulse/platform.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <condition_variable>
+#include <cstdio>
 #include <memory>
 #include <chrono>
 #include <cstring>
 #include <deque>
+#include <shared_mutex>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #ifdef _WIN32
 #  ifndef NOMINMAX
@@ -27,33 +31,42 @@
 namespace netpulse {
 
 // ---------------------------------------------------------------------------
-// Cross-session reply registry (fixes multi-target shared-hop loss).
+// Cross-session reply registry.
 //
-// Each target runs on its own thread with its own raw ICMP socket. On Windows
-// especially, inbound ICMP is frequently delivered to just ONE of those sockets
-// rather than copied to all of them, so a reply meant for target B lands on
-// target A's socket, where it's discarded because the ICMP id isn't A's. The
-// owning session then never sees its reply and its shared hops (home router,
-// ISP BNG, common intermediates) read as high/100% loss even though the router
-// answered — exactly the "0% for one target, 89% for another on the SAME hop"
-// symptom.
+// Historically (before the socket pool below), each target ran its own raw
+// ICMP socket, and Windows would often deliver an inbound reply to only ONE
+// of those sockets rather than copying it to all — so a reply meant for
+// target B could land on target A's socket and be silently discarded (wrong
+// ICMP id), leaving B's shared hops (home router, ISP BNG, common
+// intermediates) reading high/100% loss even though the router answered.
 //
-// The registry maps each session's unique ICMP id -> Session*. A session that
-// drains a reply whose id isn't its own routes it to the owning session's inbox
-// (below), so every reply is processed by exactly the right session regardless
-// of which socket the OS happened to hand it to.
+// The socket pool (see PooledSocket/acquire_pooled_socket below) removes the
+// ROOT CAUSE: targets sharing a (family, source_addr, privileged) combo now
+// share the exact same socket, read by exactly one RX dispatcher thread — so
+// there's no more "which socket did the OS hand it to" ambiguity to begin
+// with. This registry is what the dispatcher uses to find the right owner:
+// it maps each session's unique ICMP id -> Session*, and every incoming reply
+// (regardless of which pooled socket it arrived on) is looked up here and
+// pushed directly into the OWNING session's inbox — the only way any session
+// ever receives a reply now; sessions no longer read sockets themselves.
 namespace {
 std::mutex g_reg_mtx;
 std::map<uint16_t, Session*> g_registry;
 } // namespace
 
-void Session::route_reply_(const Incoming& inc) {
+// Called ONLY by the shared RX dispatcher thread (see rx_dispatch_loop below),
+// for every reply read off any pooled socket. Public (not private) solely
+// because the dispatcher is a free function living outside the Session class
+// — mirrors resolve() already being public "for tests" in spirit: internal
+// plumbing exposed out of necessity, not meant for general callers.
+void Session::dispatch_incoming(const Incoming& inc) {
     std::lock_guard<std::mutex> lk(g_reg_mtx);
     auto it = g_registry.find(inc.reply.id);
-    if (it != g_registry.end() && it->second && it->second != this) {
-        std::lock_guard<std::mutex> ib(it->second->inbox_mtx_);
-        it->second->inbox_.push_back(inc);
-    }
+    if (it == g_registry.end() || !it->second) return; // no current owner (removed target, or a stray/duplicate packet) — safe to drop
+    Session* owner = it->second;
+    std::lock_guard<std::mutex> ib(owner->inbox_mtx_);
+    owner->inbox_.push_back(inc);
+    owner->inbox_cv_.notify_one(); // wake owner's run() if it's waiting on an empty inbox
 }
 
 Session::~Session() {
@@ -135,6 +148,37 @@ struct PacerMembership {
 } // namespace
 
 // ---------------------------------------------------------------------------
+// Public/private address classification — mirrors web/src/bgp.js's
+// isPublicIp() exactly (same exclusion ranges), so the engine and the UI agree
+// on what counts as "public." Used below to gate shared-hop caching: see the
+// rationale in the SharedHopTable comment for why only public IPs are safe to
+// cross-target-cache. External linkage (declared in session.hpp), not inside
+// the anonymous namespace below, specifically so tests/test_core.cpp can call
+// it and the table-taking shared_publish_to/shared_adopt_from directly.
+bool is_public_ip(const std::string& ip) {
+    if (ip.empty() || ip == "*") return false;
+    if (ip.find(':') != std::string::npos) {
+        std::string lo = ip;
+        for (char& c : lo) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (lo == "::1" || lo == "::") return false;
+        if (lo.rfind("fe8", 0) == 0 || lo.rfind("fe9", 0) == 0 ||
+            lo.rfind("fea", 0) == 0 || lo.rfind("feb", 0) == 0) return false; // fe80::/10
+        if (lo.rfind("fc", 0) == 0 || lo.rfind("fd", 0) == 0) return false;   // fc00::/7 ULA
+        return true;
+    }
+    unsigned a = 256, b = 256, c = 256, d = 256;
+    if (std::sscanf(ip.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) != 4) return false;
+    if (a > 255 || b > 255 || c > 255 || d > 255) return false;
+    if (a == 10 || a == 127 || a == 0) return false;
+    if (a == 169 && b == 254) return false;
+    if (a == 172 && b >= 16 && b <= 31) return false;
+    if (a == 192 && b == 168) return false;
+    if (a == 100 && b >= 64 && b <= 127) return false; // CGNAT 100.64/10
+    if (a >= 224) return false; // multicast / reserved
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Shared-hop publish/subscribe (the actual fix for router/intermediate loss).
 //
 // The pacer above bounds the TOTAL send rate, but the honest fix for a hop that
@@ -147,49 +191,85 @@ struct PacerMembership {
 // total instead of one per target -> genuine 0% loss on the shared hop even at
 // 0.5s * 100 targets.
 //
-// Keyed by (source_addr, responder IP) so targets bound to different egress
-// interfaces/VPNs don't share each other's paths. Only REAL replies are ever
-// published (never fabricated loss), and adoption only happens in steady state
-// (hop address known, not during route discovery) using a sample fresher than
-// ~1.5 intervals. Ownership is emergent and self-healing: if the owner's hop
-// starts dropping it stops publishing, the entry goes stale within ~1.5
-// intervals, adopters fall back to real probing and see the true loss.
-namespace {
-struct SharedSample {
-    double ts = 0;       // epoch seconds of the published reply
-    double rtt = 0;      // ms
-    const void* owner = nullptr; // publishing Session* (adopt only from a DIFFERENT owner)
-};
-struct SharedHopTable {
-    std::mutex mtx;
-    std::unordered_map<std::string, SharedSample> map; // key: source_addr "\x1f" ip
-};
-inline SharedHopTable& g_shared() { static SharedHopTable* t = new SharedHopTable(); return *t; } // leaked singleton (see g_pacer note)
+// PUBLIC IPs ONLY. A private/CGNAT address (192.168.x, 10.x, 100.64/10, …) is
+// only unambiguous WITHIN one routing domain — the same private IP can be two
+// entirely different physical devices behind different VRFs/NAT boundaries, so
+// blindly sharing a measurement for one across targets can silently attribute
+// one device's RTT to a completely different device. A public IP has no such
+// ambiguity (globally unique by the internet's own addressing invariant), so
+// cross-target sharing is always safe for it. Private hops (including the
+// user's own home router) are still measured — direct-echo still applies, no
+// rate-limit risk there since it never elicits a control-plane Time-Exceeded —
+// just never cross-target-cached. See is_public_ip() above.
+//
+// Keyed by (source_addr, PREDECESSOR hop address, responder IP) — not just
+// (source_addr, responder IP). Keying on the node alone conflates two
+// different real situations: "the same physical router, reached the same way"
+// (safe to share) vs. "the same public IP is visible from two genuinely
+// different upstream path segments" (e.g. two regional edges converging on a
+// shared core node, or genuine ECMP path variance — see the loop-auditor
+// comment below for why probe-seq-driven ECMP variance is itself mitigated).
+// Keying on the edge (predecessor -> responder) means targets that share the
+// same path prefix still collapse onto one cache entry (the common, valuable
+// case), while targets reaching the same node via a different predecessor get
+// their own entry instead of silently overwriting each other's real numbers.
+// If there's no lower hop yet (this IS hop 1) or the predecessor hasn't
+// resolved, the predecessor component is the literal sentinel "SRC" — this
+// hop is, from the network's perspective, directly reachable from our source.
+//
+// Every entry is attributed (owner session id, hop, predecessor) so a future
+// debug surface can show exactly which target/path a cached sample came from,
+// not just its value. Only REAL replies are ever published (never fabricated
+// loss), and adoption only happens in steady state (hop address known, not
+// during route discovery) using a sample fresher than ~1.5 intervals.
+// Ownership is emergent and self-healing: if the owner's hop starts dropping
+// it stops publishing, the entry goes stale within ~1.5 intervals, adopters
+// fall back to real probing and see the true loss.
+constexpr const char* kSharedHopSrcSentinel = "SRC"; // predecessor placeholder for hop 1 / unresolved predecessor
 
-inline std::string shared_key(const std::string& src, const std::string& ip) {
+// SharedSample/SharedHopTable and the table-taking shared_publish_to /
+// shared_adopt_from have EXTERNAL linkage (declared in session.hpp), not
+// inside the anonymous namespace below, specifically so tests/test_core.cpp
+// can construct its own local SharedHopTable and exercise these directly —
+// never the process-global singleton, so tests can't pollute each other or a
+// real running session. g_shared()/shared_key()/the no-table-argument
+// shared_publish()/shared_adopt() wrappers stay internal-linkage below since
+// only the real probe loop in this file needs the process-global singleton.
+inline std::string shared_key(const std::string& src, const std::string& predecessor, const std::string& ip) {
     std::string k;
-    k.reserve(src.size() + 1 + ip.size());
-    k += src; k += '\x1f'; k += ip;
+    k.reserve(src.size() + predecessor.size() + ip.size() + 2);
+    k += src; k += '\x1f'; k += predecessor; k += '\x1f'; k += ip;
     return k;
 }
-void shared_publish(const std::string& src, const std::string& ip, double ts, double rtt, const void* owner) {
-    if (ip.empty()) return;
-    SharedHopTable& sh = g_shared();
-    std::lock_guard<std::mutex> lk(sh.mtx);
-    sh.map[shared_key(src, ip)] = SharedSample{ts, rtt, owner};
+void shared_publish_to(SharedHopTable& sh, const std::string& src, const std::string& predecessor,
+                       const std::string& ip, double ts, double rtt, uint64_t owner_session_id, uint8_t hop) {
+    if (ip.empty() || !is_public_ip(ip)) return; // private/CGNAT hops are never cross-target-cached (see rationale above)
+    std::unique_lock<std::shared_mutex> lk(sh.mtx);
+    sh.map[shared_key(src, predecessor, ip)] = SharedSample{ts, rtt, owner_session_id, hop, predecessor};
 }
-// If another session has a fresh reply for this hop IP, return its rtt (ms).
-std::optional<double> shared_adopt(const std::string& src, const std::string& ip,
-                                   const void* self, double now, double max_age) {
-    if (ip.empty()) return std::nullopt;
-    SharedHopTable& sh = g_shared();
-    std::lock_guard<std::mutex> lk(sh.mtx);
-    auto it = sh.map.find(shared_key(src, ip));
+std::optional<double> shared_adopt_from(SharedHopTable& sh, const std::string& src, const std::string& predecessor,
+                                        const std::string& ip, uint64_t self_session_id, double now, double max_age) {
+    if (ip.empty() || !is_public_ip(ip)) return std::nullopt; // private/CGNAT hops always probe for real, never adopt
+    std::shared_lock<std::shared_mutex> lk(sh.mtx);
+    auto it = sh.map.find(shared_key(src, predecessor, ip));
     if (it == sh.map.end()) return std::nullopt;
     const SharedSample& s = it->second;
-    if (s.owner == self) return std::nullopt;          // we're the owner — probe for real
-    if (now - s.ts > max_age) return std::nullopt;      // stale — fall back to real probing
+    if (s.owner_session_id == self_session_id) return std::nullopt; // we're the owner — probe for real
+    if (now - s.ts > max_age) return std::nullopt;                  // stale — fall back to real probing
     return s.rtt;
+}
+
+namespace {
+inline SharedHopTable& g_shared() { static SharedHopTable* t = new SharedHopTable(); return *t; } // leaked singleton (see g_pacer note)
+
+void shared_publish(const std::string& src, const std::string& predecessor, const std::string& ip,
+                    double ts, double rtt, uint64_t owner_session_id, uint8_t hop) {
+    shared_publish_to(g_shared(), src, predecessor, ip, ts, rtt, owner_session_id, hop);
+}
+// If another session has a fresh reply for this exact (source, predecessor, responder) edge, return its rtt (ms).
+std::optional<double> shared_adopt(const std::string& src, const std::string& predecessor, const std::string& ip,
+                                   uint64_t self_session_id, double now, double max_age) {
+    return shared_adopt_from(g_shared(), src, predecessor, ip, self_session_id, now, max_age);
 }
 } // namespace
 
@@ -198,7 +278,7 @@ std::optional<double> shared_adopt(const std::string& src, const std::string& ip
 //
 // getnameinfo() blocks — often for seconds on a hop with no PTR record or a slow
 // resolver — so it must never run on a probe thread (that would stall probe
-// scheduling and inflate RTTs). Instead a single background thread services a
+// scheduling and inflate RTTs). Instead a POOL of background threads services a
 // shared work queue and fills a shared cache; every session enqueues the IPs it
 // sees and later reads the cache to set hop.hostname. One resolver for the whole
 // process also dedups identical IPs across all targets (the router is resolved
@@ -207,22 +287,32 @@ std::optional<double> shared_adopt(const std::string& src, const std::string& ip
 // so a home router with a PTR in its own dnsmasq (e.g. RT-BE86U-4528.home.arpa)
 // gets named — exactly what Windows `tracert` shows and NetPulse previously did
 // not.
+//
+// Pool size kWorkerCount, not a single thread: with 100+ targets, a single
+// slow/hanging PTR lookup (a node that drops DNS queries and lets the request
+// sit until the resolver's own timeout, often 5s+) would otherwise serialize
+// EVERY other pending hostname behind it — 6 workers mean at most 6 outstanding
+// slow lookups stall at once, and the rest of the queue keeps draining. std::
+// condition_variable::wait() with a predicate is safe with multiple waiters —
+// each is independently woken and re-checks the queue — so no change to the
+// synchronization strategy is needed, only how many worker() loops run it.
 namespace {
 struct RdnsResolver {
+    static constexpr int kWorkerCount = 6;
     std::mutex mtx;
     std::condition_variable cv;
     std::deque<std::string> queue;
     std::unordered_set<std::string> queued;             // in queue or in flight (dedup)
     std::unordered_map<std::string, std::string> cache; // ip -> hostname ("" = looked up, no PTR)
-    std::thread th;
     bool started = false;
 
     void ensure_started() {
         std::lock_guard<std::mutex> lk(mtx);
         if (started) return;
         started = true;
-        th = std::thread([this] { worker(); });
-        th.detach(); // process-lifetime resolver; no join needed
+        for (int i = 0; i < kWorkerCount; ++i) {
+            std::thread(&RdnsResolver::worker, this).detach(); // process-lifetime pool; no join needed
+        }
     }
     // Enqueue an IP for resolution if we haven't seen it yet.
     void enqueue(const std::string& ip) {
@@ -287,6 +377,73 @@ struct RdnsResolver {
 inline RdnsResolver& g_rdns() { static RdnsResolver* r = new RdnsResolver(); return *r; }
 } // namespace
 
+// ---------------------------------------------------------------------------
+// Shared RX dispatcher (Pillar 1: the counterpart to the socket pool in
+// transport.cpp). Exactly one background thread for the whole process reads
+// EVERY pooled socket — no session ever calls recvfrom() itself anymore.
+//
+// Each iteration: snapshot the currently-alive pooled sockets
+// (list_active_pooled_sockets(), transport.cpp), select() across all of their
+// fds at once with a short timeout, and for every fd that's readable, drain
+// it (Prober::drain_ready(), non-blocking — select() already proved it's
+// readable) and hand each parsed reply to Session::dispatch_incoming(), which
+// looks the ICMP id up in the SAME registry the old per-session
+// route_reply_() used and pushes it straight into the owning session's inbox.
+//
+// The short (100ms) select timeout — rather than an unbounded wait — is what
+// lets this loop notice a BRAND NEW pooled socket (e.g. the first target to
+// use a not-yet-seen interface/family/privilege combo) promptly: the fd set
+// is rebuilt from a fresh snapshot every iteration, so a new socket is picked
+// up on the next iteration at the latest, ~100ms of extra latency on just its
+// very first reply — inconsequential, and self-corrects immediately after.
+namespace {
+struct RxDispatcher {
+    std::atomic<bool> started{false};
+
+    void ensure_started() {
+        bool expected = false;
+        if (started.compare_exchange_strong(expected, true)) {
+            std::thread(&RxDispatcher::run, this).detach(); // process-lifetime; no join needed
+        }
+    }
+
+    void run() {
+        ensure_winsock_ready();
+        for (;;) {
+            std::vector<std::shared_ptr<Prober>> socks = list_active_pooled_sockets();
+            if (socks.empty()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            long long maxfd = -1;
+            for (auto& s : socks) {
+                long long fd = s->fd();
+                if (fd < 0) continue;
+                FD_SET(static_cast<unsigned>(fd), &rfds);
+                if (fd > maxfd) maxfd = fd;
+            }
+            if (maxfd < 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            struct timeval tv;
+            tv.tv_sec = 0;
+            tv.tv_usec = 100000; // 100ms — see class comment for why this bounds new-socket pickup latency
+            int sel = select(static_cast<int>(maxfd) + 1, &rfds, nullptr, nullptr, &tv);
+            if (sel <= 0) continue; // timeout (0) or a transient error (<0) — just re-snapshot and try again
+            for (auto& s : socks) {
+                long long fd = s->fd();
+                if (fd < 0 || !FD_ISSET(static_cast<unsigned>(fd), &rfds)) continue;
+                for (const auto& inc : s->drain_ready()) Session::dispatch_incoming(inc);
+            }
+        }
+    }
+};
+inline RxDispatcher& g_rx() { static RxDispatcher* d = new RxDispatcher(); return *d; } // leaked singleton (see g_pacer note above)
+} // namespace
+
 // Delay between successive hops' FIRST probe, so a fresh session ramps up
 // gradually instead of bursting every hop's packet in the same instant. This
 // is the same idea as PingPlotter's "Packet Send Delay" (Options > Engine).
@@ -338,7 +495,7 @@ constexpr double kSendStaggerSecs = 0.01;
 // second instead of kDiscoveryDropCount·interval. The first-probe stagger
 // (kSendStaggerSecs) still applies, so the very first round ramps rather than
 // firing simultaneously.
-constexpr double kDiscoveryInterval = 0.20; // s — desired retry cadence for UNANSWERED hops while discovering
+constexpr double kDiscoveryInterval = 0.35; // s — desired retry cadence for UNANSWERED hops while discovering (gentle enough to avoid tripping carrier/ISP control-plane rate limiters on the Time-Exceeded burst)
 constexpr int    kDiscoveryTries    = 5;    // fast attempts an unanswered hop gets before it's treated as a non-responder and backed off to the steady interval (stops `*` hops hogging the paced budget)
 constexpr double kDestSettleSecs    = 1.0;  // s — keep fast cadence this long after the destination first answers
 constexpr double kMaxProbeRate      = 30.0; // probes/sec — GLOBAL hard cap on ICMP sends (<= the app's own all-hops steady rate; keeps traffic ping-like, never a flood)
@@ -353,9 +510,55 @@ constexpr double kProbeBurst        = 4.0;  // max tokens — small burst allowa
 // whole focus window — which is exactly why an IPv6 hostname target flashed
 // 100% loss at startup while IPv4 (whose destination doesn't rate-limit) did
 // not. Walking outward means only ~one probe reaches the destination around the
-// moment it's found, so it isn't hammered.
-constexpr int    kDiscoveryWindow   = 3;    // hops probed beyond the resolved frontier while discovering (small = gentler burst on rate-limiting IPv6 dests)
+// moment it's found, so it isn't hammered. (kDiscoveryWindow itself now lives
+// in session.hpp, alongside kLoopAuditWindow and compute_max_hop() — see there.)
 constexpr int    kFrontierProbes    = 2;    // sends after which an as-yet-unanswered hop still lets the window advance past it
+
+// --- Routing-loop auditor ---------------------------------------------------
+// A dead/flapping WAN link can make a local device (home router, ISP CGNAT)
+// answer TTL-limited discovery probes at MANY TTLs at once — the packet keeps
+// bouncing between a couple of real routers, incrementing TTL each cycle,
+// until it finally expires locally. Left unhandled, the discovery window
+// (kDiscoveryWindow above) can't tell this apart from genuine forward
+// progress — every "hop" answers, so it keeps sliding all the way to
+// max_hops, and once each of those duplicate-IP hops is "answered" it
+// independently starts its own full-rate direct-echo stream to the SAME 1-2
+// looping devices (the shared-hop cache can't dedupe this: two hops within
+// the SAME session pinging the same IP aren't a cross-target case, they're a
+// same-session cascade). This is the "ghost train" a bad link produces.
+//
+// Detection: whenever a hop resolves via a genuine legacy (TTL-elicited)
+// reply, scan the hops already known at LOWER TTLs for the same address. A
+// match means the path has folded back on itself.
+//
+// The realistic false-positive source for this isn't random coincidence —
+// it's ECMP path variance, the well-documented artifact "Paris traceroute"
+// (Augustin et al., 2006) was built to fix: routers load-balancing across
+// parallel equal-cost links hash each packet's flow fields (often including
+// the ICMP checksum) to pick a branch, so probes to different TTLs — which
+// carry different `seq`, hence different checksums — can genuinely take
+// different physical paths and land on the SAME real shared router at two
+// different hop counts, with no loop at all. build_echo()'s checksum pinning
+// (see icmp.hpp) removes this at the root for IPv4 by making every probe in a
+// session present the same checksum, so ECMP always picks the same path.
+// IPv6 doesn't need it: RFC 6438 mandates IPv6 ECMP hash the Flow Label
+// instead. As a backstop for whatever variance remains (or a router that
+// ignores the convention), a duplicate must be seen on TWO independent
+// replies (loop_confirm below) before it's treated as a real loop — a
+// transient coincidence won't repeat, a real loop will, every time.
+//
+// Response, once confirmed: NEVER a hard stop (silent discovery must stay
+// alive so a route change or recovery is still noticed — see kLoopAuditSecs).
+// Instead, compute_max_hop() (session.hpp) freezes the FAST discovery window
+// right at the loop boundary (+kLoopAuditWindow, currently just 1 hop) instead
+// of letting it keep sliding to max_hops chasing the cycle — this alone kills
+// the cascading direct-echo storm, since hops beyond the freeze are simply
+// never in scope for try_send() at all. The loop boundary hop itself (and the
+// one audit hop past it) are forced to slow (kLoopAuditSecs), legacy-only
+// probing — never direct-echo, so they never open their own redundant stream
+// to the looping IP. The moment either position's reply comes back WITHOUT a
+// duplicate, the loop clears itself — no timer, driven entirely by the reply.
+constexpr double kLoopAuditSecs = 8.0; // s — backoff cadence for hops at/beyond a confirmed loop boundary (user-specified 5-10s range)
 
 // --- Direct-echo hop measurement (the fix for "intermediate hops show loss") -
 // A traceroute-style probe measures hop h by sending an Echo to the DESTINATION
@@ -373,7 +576,7 @@ constexpr int    kFrontierProbes    = 2;    // sends after which an as-yet-unans
 // discovery but does NOT answer a direct ping is detected after kEchoTestTries
 // misses and falls back to TTL-limited probing (its rate-limit loss is then
 // unavoidable — the same thing traceroute/mtr show for such a hop).
-constexpr uint8_t kDirectEchoTtl = 64; // full TTL for a direct hop ping (every real path is far shorter)
+constexpr uint8_t kDirectEchoTtl = 255; // max TTL for a direct hop ping — maximum survivability, always valid regardless of real path length
 constexpr int     kEchoTestTries = 4;  // direct misses (with no direct reply yet) before a hop is deemed echo-silent
 
 // Once a hop switches to direct-echo, its own TTL-elicited Time-Exceeded is no
@@ -388,6 +591,18 @@ constexpr int     kEchoTestTries = 4;  // direct misses (with no direct reply ye
 // its whole point is to independently re-verify what's actually there.
 constexpr double kHopRecheckSecs = 45.0;
 
+// Declared in session.hpp (external linkage, not in an anonymous namespace)
+// specifically so tests/test_core.cpp can call it directly without a live
+// socket — see the doc comment there for the full contract.
+uint8_t compute_max_hop(std::optional<uint8_t> dest_hop, std::optional<uint8_t> loop_at_hop,
+                        uint8_t frontier, uint8_t max_hops) {
+    if (dest_hop) return *dest_hop;
+    int window_top = loop_at_hop ? (static_cast<int>(*loop_at_hop) + kLoopAuditWindow)
+                                  : (static_cast<int>(frontier) + kDiscoveryWindow);
+    int capped = std::min<int>(static_cast<int>(max_hops), window_top);
+    return static_cast<uint8_t>(capped < 1 ? 1 : capped);
+}
+
 Session::Session(uint64_t id, std::string target, Settings settings)
     : id_(id), target_(std::move(target)), settings_(std::move(settings)) {
     // Per-target-unique ICMP identifier. Every raw ICMP socket in the process
@@ -396,6 +611,15 @@ Session::Session(uint64_t id, std::string target, Settings settings)
     // concurrent targets (so one target can't match/consume another's replies)
     // while matching the long-proven v19 behaviour.
     icmp_id_ = static_cast<uint16_t>((static_cast<uint64_t>(now_secs())) ^ id_ ^ 0x4242u);
+    // A different, independent constant derivation from the same inputs as
+    // icmp_id_ (distinct XOR mask) — the two just need to both be stable for
+    // the session's lifetime, not related to each other. 0xFFFF is avoided
+    // only for tidiness (0 and 0xFFFF are the same one's-complement "zero" so
+    // it wouldn't actually break the pinning invariant either way — see the
+    // build_echo derivation notes — but a checksum field that's never all-1s
+    // looks less like an anomaly to a casual packet-capture read).
+    paris_checksum_target_ = static_cast<uint16_t>((static_cast<uint64_t>(now_secs())) ^ id_ ^ 0xC5A5u);
+    if (paris_checksum_target_ == 0xFFFFu) paris_checksum_target_ = 0x0000u;
 }
 
 uint16_t Session::next_seq() {
@@ -472,6 +696,7 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
     { std::lock_guard<std::mutex> lk(g_reg_mtx); g_registry[icmp_id_] = this; } // enable cross-session reply routing
     PacerMembership pacer_membership; // count this target toward the global pacer's scaled rate (RAII: leaves on any return)
     g_rdns().ensure_started();        // spin up the shared reverse-DNS resolver on first target
+    g_rx().ensure_started();          // spin up the shared RX dispatcher on first target (see its class comment)
 
     // Decide and validate the effective probing family using both DNS results
     // and the local system's usable interfaces. If the user explicitly chose
@@ -548,13 +773,19 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
         }
     }
 
-    auto make_prober = [&]() {
+    // Acquire (never own outright) a SHARED pooled socket for this exact
+    // (family, privileged, source_addr) combo — see acquire_pooled_socket's
+    // doc comment (transport.hpp) and the RxDispatcher comment above for the
+    // full Pillar 1 design. `sock` keeps it alive for as long as this session
+    // needs it; releasing/reacquiring (on rebuild, below) works exactly like
+    // the old make_prober()/prober did, just shared instead of exclusive.
+    auto acquire_sock = [&]() {
         Settings s = settings_snapshot();
-        return std::make_unique<Prober>(*family_, s.privileged, s.source_addr);
+        return acquire_pooled_socket(*family_, s.privileged, s.source_addr);
     };
-    auto prober = make_prober();
-    if (!prober->ok()) {
-        error_ = prober->error();
+    auto sock = acquire_sock();
+    if (!sock->ok()) {
+        error_ = sock->error();
         on_update(snapshot(false, {}));
         return;
     }
@@ -580,10 +811,46 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
     std::map<uint8_t, int>  echo_miss;       // consecutive direct-ping misses while still unconfirmed (drives the echo_silent decision)
     std::map<uint8_t, double> hop_recheck_at; // last time this hop got a legacy TTL-elicited re-confirm probe (see kHopRecheckSecs)
 
+    // Routing-loop auditor state (see the comment block above near
+    // kLoopAuditSecs for the full rationale). loop_at_hop: the confirmed loop
+    // boundary, if any — compute_max_hop() freezes the discovery window here.
+    // loop_error: whether `error_` currently holds OUR message, so clearing it
+    // on self-heal never clobbers an unrelated error set elsewhere. loop_confirm:
+    // two-strikes counter per (higher hop, lower/duplicated hop) pair — a
+    // single sighting is not enough to freeze (see the ECMP false-positive
+    // discussion above); it takes two independent replies confirming the same
+    // pair.
+    std::optional<uint8_t> loop_at_hop;
+    bool loop_error = false;
+    std::map<std::pair<uint8_t, uint8_t>, int> loop_confirm;
+
     auto ensure_hop = [&](uint8_t h) -> HopStats& {
         auto it = hops_.find(h);
         if (it == hops_.end()) it = hops_.emplace(h, HopStats(h)).first;
         return it->second;
+    };
+    // Predecessor address for the shared-hop cache key (see the SharedHopTable
+    // comment above for why the edge, not just the node, is what's keyed on).
+    // Walk backward from hop-1 down to hop 1 and use the NEAREST hop that has
+    // actually resolved — not just hop-1 directly. Many real routers never
+    // answer a TTL-limited probe at all (silently forward without generating
+    // Time-Exceeded) while still forwarding fine, so hop-1 being unresolved
+    // ("*") does NOT mean the whole predecessor chain is unknown — hop-2 (or
+    // further back) may well be resolved and is the correct, stable
+    // predecessor to key on. Only fall back to the "SRC" sentinel once NO
+    // hop below this one has resolved (from the network's perspective this
+    // hop is then indistinguishable from being directly reachable from our
+    // own source). Without this, a route whose hop-1 happens to be silent
+    // would get a DIFFERENT (sentinel-based) key than the exact same route
+    // once hop-1 starts answering, splitting what should be one stable cache
+    // entry into two, and — worse — coincidentally colliding with another
+    // target whose OWN hop-1 is silent for a completely different reason.
+    auto predecessor_of = [&](uint8_t hop) -> std::string {
+        for (uint8_t h = hop; h-- > 1;) { // h = hop-1, hop-2, ..., 1
+            auto it = hops_.find(h);
+            if (it != hops_.end() && it->second.address()) return *it->second.address();
+        }
+        return kSharedHopSrcSentinel;
     };
 
     while (!stop->load()) {
@@ -595,18 +862,25 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
             settings_dirty_ = false;
         }
         if (rebuild) {
-            // Attempt to re-resolve and recreate the prober. If this transiently
-            // fails (DNS or prober), keep the session running (don't return) so
-            // the UI spinner and discovery state remain visible; retry shortly.
+            // Attempt to re-resolve and re-acquire a pooled socket for the
+            // (possibly new) family/source/privileged combo. If this
+            // transiently fails (DNS or socket), keep the session running
+            // (don't return) so the UI spinner and discovery state remain
+            // visible; retry shortly. Dropping the old `sock` shared_ptr here
+            // (via reassignment below) releases this session's share of the
+            // OLD pooled socket — if no other session still uses that exact
+            // combo, the pool's entry for it goes stale and its underlying
+            // socket closes, same lifecycle as the old make_prober() had, just
+            // shared instead of exclusive.
             resolve(); // family may have changed → re-pick dest/family
             if (!dest_ || !family_) {
                 // leave the previous state intact, surface a running snapshot
                 on_update(snapshot(true, {}));
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
             } else {
-                prober = make_prober();
-                if (!prober->ok()) {
-                    error_ = prober->error();
+                sock = acquire_sock();
+                if (!sock->ok()) {
+                    error_ = sock->error();
                     on_update(snapshot(true, {}));
                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 } else {
@@ -626,6 +900,9 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
                     echo_silent.clear();
                     echo_miss.clear();
                     hop_recheck_at.clear();
+                    loop_at_hop.reset();
+                    loop_error = false;
+                    loop_confirm.clear();
                 }
             }
         }
@@ -642,23 +919,20 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
         // hard timeout.
         double timeout = s.timeout > 0.0 ? s.timeout : std::max(interval, 1.0);
         // Probe range. Once the destination is known we probe exactly 1..dest.
-        // While still discovering, use a sliding window (see kDiscoveryWindow):
-        // only probe up to kDiscoveryWindow hops past the deepest already-resolved
-        // hop, so we walk out to the destination instead of blasting every TTL at
-        // it at once (which is what a rate-limiting IPv6 endpoint drops en masse).
-        uint8_t max_hop;
-        if (dest_hop_) {
-            max_hop = *dest_hop_;
-        } else {
-            uint8_t frontier = 0;
-            for (const auto& [h, cnt] : tries) {
-                bool resolved = last_reply_at.count(h) > 0 || cnt >= kFrontierProbes;
-                if (resolved && h > frontier) frontier = h;
-            }
-            int window_top = static_cast<int>(frontier) + kDiscoveryWindow;
-            int capped = std::min<int>(static_cast<int>(s.max_hops), window_top);
-            max_hop = static_cast<uint8_t>(capped < 1 ? 1 : capped);
+        // While still discovering, use a sliding window (see kDiscoveryWindow
+        // in session.hpp): only probe up to kDiscoveryWindow hops past the
+        // deepest already-resolved hop, so we walk out to the destination
+        // instead of blasting every TTL at it at once (which is what a
+        // rate-limiting IPv6 endpoint drops en masse) — UNLESS a routing loop
+        // is confirmed (loop_at_hop), in which case the window instead freezes
+        // at the loop boundary (see the loop-auditor comment near
+        // kLoopAuditSecs, and compute_max_hop() in session.hpp).
+        uint8_t frontier = 0;
+        for (const auto& [h, cnt] : tries) {
+            bool resolved = last_reply_at.count(h) > 0 || cnt >= kFrontierProbes;
+            if (resolved && h > frontier) frontier = h;
         }
+        uint8_t max_hop = compute_max_hop(dest_hop_, loop_at_hop, frontier, s.max_hops);
         double now = now_secs();
 
         // Per-target token-bucket pacer. Refill toward kMaxProbeRate (capped at
@@ -709,18 +983,31 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
                 double& recheck_at = hop_recheck_at[ttl];
                 bool due_recheck = have_addr && (now - recheck_at >= kHopRecheckSecs);
 
+                // A confirmed routing loop (see the loop-auditor comment near
+                // kLoopAuditSecs) forces this hop into slow, legacy-only,
+                // never-adopted probing — covers both the loop boundary hop
+                // itself and the one audit hop past it (the only two
+                // positions compute_max_hop() keeps in scope while a loop is
+                // active). Never a hard stop: this hop keeps getting a real
+                // probe every kLoopAuditSecs, so a recovery is always noticed.
+                bool loop_audit = loop_at_hop && ttl >= *loop_at_hop;
+
                 // Shared-hop adoption: if another target on the same egress
                 // already has a fresh real reply for this exact hop IP, adopt
                 // it as our own sample and DON'T send. This is what stops N
                 // targets from each probing the shared router/BNG every
                 // interval — the hop sees ~one probe total instead of N.
                 bool adopted = false;
-                if (have_addr && !due_recheck) {
+                if (have_addr && !due_recheck && !loop_audit) {
                     // Freshness bound: a shared sample older than ~1.5 intervals
                     // is ignored, so if the owner stops answering (hop actually
                     // dropping) we fall back to real probing within one interval
                     // and surface the true loss — self-healing, not sticky.
-                    auto shared = shared_adopt(s.source_addr, hip, this, now, interval * 1.5 + 0.05);
+                    // Keyed on the edge (predecessor -> this hop's IP), not just
+                    // the IP, so two targets that reach the same public node via
+                    // different upstream paths get independent measurements
+                    // instead of silently overwriting each other's real numbers.
+                    auto shared = shared_adopt(s.source_addr, predecessor_of(ttl), hip, id_, now, interval * 1.5 + 0.05);
                     if (shared) {
                         hops_.find(ttl)->second.push(now, *shared);
                         buffer.push_back(NewPoint{ttl, now, *shared});
@@ -735,9 +1022,12 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
                 // loss, see kDirectEchoTtl above): once a hop's IP is known and
                 // it hasn't proven echo-silent, ping that IP directly full-TTL
                 // instead of eliciting a Time-Exceeded via *dest_. A due
-                // recheck temporarily forces the legacy TTL-limited style so
-                // the hop's identity gets independently reconfirmed.
-                bool use_direct = have_addr && !echo_silent.count(ttl) && !due_recheck;
+                // recheck, or an active loop audit, temporarily forces the
+                // legacy TTL-limited style instead — for loop_audit, this is
+                // what stops a confirmed-duplicate hop from opening its own
+                // redundant direct-echo stream to the same looping IP another
+                // hop (or another session) is already pinging.
+                bool use_direct = have_addr && !echo_silent.count(ttl) && !due_recheck && !loop_audit;
 
                 // A real send needs BOTH a per-target token AND a global pacer
                 // token, so neither one target nor the whole process can exceed
@@ -745,15 +1035,18 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
                 // available; refund it if the send itself fails.
                 if (tokens >= 1.0 && g_pacer().try_take(now)) {
                     uint16_t seq = next_seq();
-                    bool sent = use_direct ? prober->send(hip, kDirectEchoTtl, icmp_id_, seq, s.payload_size)
-                                           : prober->send(*dest_, ttl, icmp_id_, seq, s.payload_size);
+                    // pin_checksum only affects IPv4 sends (build_echo ignores
+                    // it for V6); passing it unconditionally is harmless and
+                    // avoids an extra family branch here.
+                    bool sent = use_direct ? sock->send(hip, kDirectEchoTtl, icmp_id_, seq, s.payload_size, paris_checksum_target_)
+                                           : sock->send(*dest_, ttl, icmp_id_, seq, s.payload_size, paris_checksum_target_);
                     if (!sent) {
                         // If send failed and we're unprivileged and using a
                         // large payload, try a conservative fallback once.
                         size_t fallback = 1432;
                         if (!s.privileged && s.payload_size > fallback) {
-                            sent = use_direct ? prober->send(hip, kDirectEchoTtl, icmp_id_, seq, fallback)
-                                              : prober->send(*dest_, ttl, icmp_id_, seq, fallback);
+                            sent = use_direct ? sock->send(hip, kDirectEchoTtl, icmp_id_, seq, fallback, paris_checksum_target_)
+                                              : sock->send(*dest_, ttl, icmp_id_, seq, fallback, paris_checksum_target_);
                         }
                     }
                     if (sent) {
@@ -773,10 +1066,17 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
                     // hop only for its first kDiscoveryTries attempts (after
                     // that it's a non-responder — back off to the steady
                     // interval so it stops consuming the paced budget). Every
-                    // other case uses the configured interval.
-                    bool fast = have_addr ? settling
-                                          : (discovering && tries[ttl] < kDiscoveryTries);
-                    nx = now + (fast ? (std::min)(interval, kDiscoveryInterval) : interval);
+                    // other case uses the configured interval — EXCEPT a
+                    // confirmed loop-audit hop, which always uses the slow
+                    // kLoopAuditSecs backoff regardless of any of that, so a
+                    // stuck tail costs near-zero load without ever going silent.
+                    if (loop_audit) {
+                        nx = now + kLoopAuditSecs;
+                    } else {
+                        bool fast = have_addr ? settling
+                                              : (discovering && tries[ttl] < kDiscoveryTries);
+                        nx = now + (fast ? (std::min)(interval, kDiscoveryInterval) : interval);
+                    }
                 } else {
                     due_but_paced_out = true; // no token this round; retry once one refills
                 }
@@ -811,20 +1111,31 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
         double stale_ceiling = (std::max)(timeout * 2.0, 2.0); // seconds
         // Optional runtime debug tracing: enable by setting NETPULSE_DEBUG=1
         static bool debug_enabled = !!getenv("NETPULSE_DEBUG");
-        // Gather replies from our own socket AND our inbox — replies that other
-        // targets' sockets received on our behalf and routed here (see the
-        // cross-session registry note above). Draining both keeps every reply
-        // going to the correct session regardless of which socket the OS chose.
-        std::vector<Incoming> replies = prober->drain(now + slice);
+        // Every reply this session will ever see arrives via inbox_, pushed by
+        // the shared RX dispatcher thread (Session::dispatch_incoming) after a
+        // registry lookup by ICMP id — this thread never reads a socket
+        // itself (see PooledSocket/acquire_pooled_socket, transport.hpp).
+        // Block on inbox_cv_ up to `slice` seconds, waking immediately the
+        // instant the dispatcher delivers something (interrupt-driven, same
+        // low-jitter property the old direct select() on our own socket had),
+        // then drain whatever's queued.
+        std::vector<Incoming> replies;
         {
-            std::lock_guard<std::mutex> lk(inbox_mtx_);
+            std::unique_lock<std::mutex> lk(inbox_mtx_);
+            if (inbox_.empty()) {
+                inbox_cv_.wait_for(lk, std::chrono::duration<double>(slice), [this] { return !inbox_.empty(); });
+            }
+            replies.reserve(inbox_.size());
             while (!inbox_.empty()) { replies.push_back(std::move(inbox_.front())); inbox_.pop_front(); }
         }
         for (const auto& inc : replies) {
             if (debug_enabled) {
                 fprintf(stderr, "[netpulse] reply seq=%u kind=%d from=%s\n", inc.reply.seq, int(inc.reply.kind), inc.from.c_str());
             }
-            if (inc.reply.id != icmp_id_) { route_reply_(inc); continue; } // not ours — hand to the owning session
+            // inbox_ only ever holds replies the dispatcher already matched to
+            // OUR icmp_id_ (see Session::dispatch_incoming) — this is now just
+            // a defensive sanity check, not a live routing path.
+            if (inc.reply.id != icmp_id_) continue;
             auto it = pending.find(inc.reply.seq);
             if (it == pending.end()) continue;
             uint8_t hop = it->second.hop;
@@ -859,7 +1170,7 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
                     ensure_hop(hop).push(inc.at, rtt);
                     buffer.push_back(NewPoint{hop, inc.at, rtt});
                     last_reply_at[hop] = inc.at;
-                    shared_publish(s.source_addr, inc.from, inc.at, rtt, this);
+                    shared_publish(s.source_addr, predecessor_of(hop), inc.from, inc.at, rtt, id_, hop);
                     echo_ok[hop] = true;
                     echo_miss[hop] = 0;
                     pending.erase(it);
@@ -909,11 +1220,55 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
             buffer.push_back(NewPoint{hop, inc.at, rtt});
             last_reply_at[hop] = inc.at; // a genuine transit/echo reply landed at this hop
             hop_recheck_at[hop] = inc.at; // this legacy reply IS a fresh identity re-confirmation
+
+            // Routing-loop detection + two-strikes confirmation + self-heal
+            // (see the loop-auditor comment block above kLoopAuditSecs for the
+            // full rationale). Runs on every genuine legacy reply — this
+            // doubles as continuous re-validation, which is what makes
+            // recovery self-driving below, with no separate timer.
+            {
+                std::optional<uint8_t> dup_at;
+                for (const auto& [h, hstat] : hops_) {
+                    if (h >= hop) break; // hops_ iterates in increasing key order; only LOWER hops count
+                    if (hstat.address() && *hstat.address() == inc.from) { dup_at = h; break; }
+                }
+                if (dup_at) {
+                    int& n = loop_confirm[std::make_pair(hop, *dup_at)];
+                    ++n;
+                    if (n >= 2) {
+                        // Confirmed on two INDEPENDENT replies — a transient
+                        // ECMP-hash coincidence wouldn't repeat, a real loop
+                        // does, every time (see build_echo's checksum pinning,
+                        // which removes the common IPv4 cause of this at the
+                        // root; this counter is the backstop for the rest).
+                        if (!loop_at_hop || hop < *loop_at_hop) loop_at_hop = hop;
+                        if (!error_ || loop_error) {
+                            error_ = "Possible routing loop: hop " + std::to_string(hop) +
+                                    " repeats the address seen at hop " + std::to_string(*dup_at);
+                            loop_error = true;
+                        }
+                    }
+                } else if (loop_at_hop && hop >= *loop_at_hop) {
+                    // Self-heal: a CLEAN reply at or beyond the current loop
+                    // boundary — the frozen hop itself, or the one audit hop
+                    // past it, the only positions compute_max_hop() keeps in
+                    // scope while a loop is active — means the duplicate is
+                    // gone. Deliberately scoped to hop >= *loop_at_hop: an
+                    // unrelated EARLIER hop's routine 45s recheck coming back
+                    // clean (as it always will, since it was never part of the
+                    // duplicate) proves nothing about the actual loop boundary
+                    // and must NOT clear it prematurely.
+                    loop_at_hop.reset();
+                    loop_confirm.clear();
+                    if (loop_error) { error_.reset(); loop_error = false; }
+                }
+            }
             // Publish this real measurement so other targets that traverse the
-            // same hop IP can adopt it instead of probing that hop themselves
-            // (see shared_adopt in try_send). Only genuine replies are published
-            // — never a loss — so adoption can only ever copy a real sample.
-            shared_publish(s.source_addr, inc.from, inc.at, rtt, this);
+            // same (predecessor -> this hop IP) edge can adopt it instead of
+            // probing that hop themselves (see shared_adopt in try_send). Only
+            // genuine replies are published — never a loss — so adoption can
+            // only ever copy a real sample.
+            shared_publish(s.source_addr, predecessor_of(hop), inc.from, inc.at, rtt, id_, hop);
             if (hop > max_hop_seen_) max_hop_seen_ = hop;
             // Queue this hop's IP for background reverse-DNS the first time we
             // see it (the resolver dedups, so this is cheap to call repeatedly).
@@ -936,6 +1291,15 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
                 if (debug_enabled) fprintf(stderr, "[netpulse] set dest_hop=%u dest_ip=%s\n", (unsigned)*dest_hop_, inc.from.c_str());
                 if (dest_ && inc.from != *dest_) {
                     dest_ = inc.from; // prefer the actual replying address for display
+                }
+                // The loop auditor only matters while the real destination is
+                // still unknown (compute_max_hop only consults it in that
+                // branch) — once genuinely reached, it's moot; clear it so a
+                // stale loop message doesn't linger in `error_`.
+                if (loop_at_hop) {
+                    loop_at_hop.reset();
+                    loop_confirm.clear();
+                    if (loop_error) { error_.reset(); loop_error = false; }
                 }
             }
             pending.erase(it);

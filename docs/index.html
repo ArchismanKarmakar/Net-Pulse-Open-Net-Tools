@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Net Pulse — Open Net Tools</title>
+<meta name="description" content="A free, open-source (AGPL-3.0) desktop path-latency monitor for Windows, macOS, and Linux — continuous per-hop ping + traceroute, IPv4 and IPv6, PingPlotter/mtr style." />
+<meta property="og:title" content="Net Pulse — Open Net Tools" />
+<meta property="og:description" content="Free, open-source PingPlotter/mtr-style path monitoring. No telemetry, no account, no cloud." />
+<meta property="og:image" content="assets/icon_512.png" />
+<meta property="og:type" content="website" />
+<link rel="icon" href="assets/icon_512.png" />
+<style>
+  :root {
+    --bg: #0a1120;
+    --bg2: #0c1524;
+    --fg: #eaf6f8;
+    --muted: #9fb3c8;
+    --cyan: #22d3ee;
+    --teal: #38e0d6;
+    --blue: #4f7cff;
+    --card: #101b30;
+    --border: rgba(34, 211, 238, 0.16);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: radial-gradient(1200px 800px at 80% -10%, #12213c 0%, var(--bg) 55%), var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+  }
+  a { color: var(--cyan); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 24px; }
+  header.hero { padding: 72px 0 40px; text-align: center; }
+  .logo { width: 96px; height: 96px; margin-bottom: 20px; filter: drop-shadow(0 0 24px rgba(34,211,238,0.25)); }
+  h1 {
+    font-size: clamp(2rem, 5vw, 3.2rem);
+    margin: 0 0 12px;
+    background: linear-gradient(90deg, var(--cyan), var(--teal) 55%, var(--blue));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    letter-spacing: -0.02em;
+  }
+  .tagline { font-size: 1.15rem; color: var(--muted); max-width: 640px; margin: 0 auto 28px; }
+  .cta { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; margin-bottom: 8px; }
+  .btn {
+    display: inline-block; padding: 12px 22px; border-radius: 10px; font-weight: 600;
+    border: 1px solid var(--border);
+  }
+  .btn.primary { background: linear-gradient(90deg, var(--cyan), var(--blue)); color: #05121a; border: none; }
+  .btn.primary:hover { text-decoration: none; filter: brightness(1.08); }
+  .btn.ghost { color: var(--fg); background: var(--card); }
+  .btn.ghost:hover { text-decoration: none; border-color: var(--cyan); }
+  section { padding: 40px 0; border-top: 1px solid var(--border); }
+  h2 { font-size: 1.5rem; margin: 0 0 20px; color: var(--fg); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 16px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 20px; }
+  .card h3 { margin: 0 0 8px; font-size: 1.05rem; color: var(--cyan); }
+  .card p { margin: 0; color: var(--muted); font-size: 0.95rem; }
+  .lamp-table { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
+  .lamp-table th, .lamp-table td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+  .lamp-table th { color: var(--muted); font-weight: 600; }
+  pre {
+    background: #060c17; border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px; overflow-x: auto; font-size: 0.85rem; color: #d9ecef;
+  }
+  code { color: #7de3ff; }
+  footer { padding: 40px 0 60px; text-align: center; color: var(--muted); font-size: 0.9rem; }
+  .badges { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin: 18px 0; }
+  .badges img { height: 20px; }
+  .platforms { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; color: var(--muted); font-size: 0.9rem; margin-top: 10px; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="hero">
+      <img class="logo" src="assets/icon_512.png" alt="Net Pulse logo" />
+      <h1>Net Pulse — Open Net Tools</h1>
+      <p class="tagline">
+        A free, open-source path-latency monitor for your desktop — continuous
+        per-hop ping + traceroute, IPv4 and IPv6, live config, per-hop ASN/BGP,
+        alerts and exports. PingPlotter / mtr style, without the price tag or
+        the phone-home telemetry.
+      </p>
+      <div class="badges">
+        <img src="https://img.shields.io/badge/license-AGPL--3.0--or--later-22d3ee" alt="AGPL-3.0-or-later" />
+        <img src="https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-4f7cff" alt="Platforms" />
+        <img src="https://img.shields.io/badge/telemetry-none-38e0d6" alt="No telemetry" />
+      </div>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/ArchismanKarmakar/Net-Pulse-Open-Net-Tools/releases">Download latest release</a>
+        <a class="btn ghost" href="https://github.com/ArchismanKarmakar/Net-Pulse-Open-Net-Tools">View source on GitHub</a>
+        <a class="btn ghost" href="https://github.com/sponsors/ArchismanKarmakar">♥ Sponsor</a>
+      </div>
+      <div class="platforms">Windows (NSIS installer) · macOS (dmg / zip, Intel + Apple Silicon) · Linux (AppImage / deb)</div>
+    </header>
+
+    <section>
+      <h2>Why Net Pulse</h2>
+      <div class="grid">
+        <div class="card">
+          <h3>Every hop, not just the last one</h3>
+          <p>Continuous per-hop ping fused with traceroute, so you can see exactly which hop on the path is dropping packets or adding latency — not just whether the destination itself is up.</p>
+        </div>
+        <div class="card">
+          <h3>Actually accurate, at scale</h3>
+          <p>A direct-echo measurement model, a global send pacer, and a shared-hop cache mean running many targets at once never manufactures fake packet loss on a shared router or ISP hop. See <a href="https://github.com/ArchismanKarmakar/Net-Pulse-Open-Net-Tools/blob/main/ARCHITECTURE.md">ARCHITECTURE.md</a> for the full engineering writeup.</p>
+        </div>
+        <div class="card">
+          <h3>IPv4 and IPv6</h3>
+          <p>Full dual-stack support, including sane fallback behavior when a hostname only has one address family or your link only has one usable egress.</p>
+        </div>
+        <div class="card">
+          <h3>No telemetry, ever</h3>
+          <p>No analytics, no crash reporter, no account, no cloud. Every diagnostic runs locally against hosts you choose. See the <a href="https://github.com/ArchismanKarmakar/Net-Pulse-Open-Net-Tools/blob/main/PRIVACY_POLICY.md">privacy policy</a>.</p>
+        </div>
+        <div class="card">
+          <h3>Per-hop ASN / BGP context</h3>
+          <p>See which network owns each hop along the path, with looking-glass links out to PeeringDB / RIPEstat for deeper digging.</p>
+        </div>
+        <div class="card">
+          <h3>More than MTR</h3>
+          <p>Bundled Ping, DNS Lookup (forward + reverse), and a bounded TCP port scanner, all in the same desktop app.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Status at a glance</h2>
+      <p style="color:var(--muted); margin-top:-8px;">Each target shows a two-lamp signal — the left lamp is the destination's own health, the right lamp is the health of the route leading to it.</p>
+      <table class="lamp-table">
+        <thead><tr><th>Lamp</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td>🟢 Green</td><td>Healthy — low latency, no loss.</td></tr>
+          <tr><td>🟡 Yellow</td><td>Elevated latency or minor loss.</td></tr>
+          <tr><td>🟠 Orange</td><td>Degraded — noticeably lossy or slow.</td></tr>
+          <tr><td>🔴 Red</td><td>Unreachable, or severely degraded.</td></tr>
+          <tr><td>🔵 Cyan (pulsing)</td><td>Route discovery in progress.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Get started</h2>
+      <pre><code># Download a signed installer from GitHub Releases, or build from source:
+git clone https://github.com/ArchismanKarmakar/Net-Pulse-Open-Net-Tools.git
+cd Net-Pulse-Open-Net-Tools
+./build-and-run.ps1   # Windows
+./build-and-run.sh    # Linux / macOS</code></pre>
+      <p>Full build instructions, prerequisites, and troubleshooting live in the <a href="https://github.com/ArchismanKarmakar/Net-Pulse-Open-Net-Tools#readme">README</a>.</p>
+    </section>
+
+    <section>
+      <h2>Support the project</h2>
+      <p>
+        Net Pulse — Open Net Tools is free, open source (AGPL-3.0-or-later),
+        and built and maintained independently. If it's useful to you,
+        consider <a href="https://github.com/sponsors/ArchismanKarmakar">sponsoring on GitHub</a>
+        — it directly funds continued development, a code-signing certificate
+        (so releases stop tripping SmartScreen/AV warnings), and testing
+        infrastructure.
+      </p>
+    </section>
+
+    <footer>
+      <p>
+        "PingPlotter" and "mtr" are referenced only for behavioral comparison
+        and are trademarks of their respective owners; Net Pulse — Open Net
+        Tools is an independent project. © 2026 Archisman Karmakar —
+        licensed AGPL-3.0-or-later.
+      </p>
+      <p>
+        <a href="https://github.com/ArchismanKarmakar/Net-Pulse-Open-Net-Tools/blob/main/PRIVACY_POLICY.md">Privacy Policy</a>
+        · <a href="https://github.com/ArchismanKarmakar/Net-Pulse-Open-Net-Tools/blob/main/SECURITY.md">Security</a>
+        · <a href="https://github.com/ArchismanKarmakar/Net-Pulse-Open-Net-Tools/blob/main/LICENSE">License</a>
+      </p>
+    </footer>
+  </div>
+</body>
+</html>

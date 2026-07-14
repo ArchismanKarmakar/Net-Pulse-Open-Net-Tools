@@ -2,6 +2,21 @@
 
 <p align="center"><img src="branding/logo.svg" width="96" height="96" alt="Net Pulse — Open Net Tools logo" /></p>
 
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--or--later-22d3ee" alt="AGPL-3.0-or-later" /></a>
+  <img src="https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-4f7cff" alt="Platforms" />
+  <img src="https://img.shields.io/badge/telemetry-none-38e0d6" alt="No telemetry" />
+  <a href="https://github.com/sponsors/ArchismanKarmakar"><img src="https://img.shields.io/badge/sponsor-%E2%99%A5-ff69b4" alt="Sponsor on GitHub" /></a>
+</p>
+
+<p align="center">
+  <a href="https://archismankarmakar.github.io/Net-Pulse-Open-Net-Tools/">Project site</a> ·
+  <a href="ARCHITECTURE.md">Architecture</a> ·
+  <a href="SECURITY.md">Security</a> ·
+  <a href="PRIVACY_POLICY.md">Privacy policy</a> ·
+  <a href="https://github.com/sponsors/ArchismanKarmakar">Sponsor</a>
+</p>
+
 > ### ⚠️ Upgrading? Extract into a CLEAN folder
 > Do **not** unzip a new release *over* an old one. Extraction doesn't delete
 > files that were removed in the new version — most importantly `napi/binding.gyp`.
@@ -150,7 +165,10 @@ variables (`CSC_LINK`/`CSC_KEY_PASSWORD`, plus Apple notarization vars on macOS)
 so no secret is stored in the repo. For OS/AV trust and a clean VirusTotal
 result you **must sign** the artifacts — see [`SECURITY.md`](SECURITY.md), which
 covers signing, notarization, reputation, and handling AV false positives. The
-config never packs/obfuscates binaries (a common false-positive trigger).
+config never packs/obfuscates binaries (a common false-positive trigger). For
+a full step-by-step signing runbook (certificate types, EV vs OV, macOS
+notarization, and building AV/SmartScreen reputation over time), see
+[`CODE_SIGNING.md`](CODE_SIGNING.md).
 
 Dev mode (hot-reload UI from Vite while still using the native engine):
 
@@ -311,6 +329,21 @@ output does. Theme colors (light/dark) are still driven by CSS variables in
 `data-theme` toggle keeps working unchanged. No web fonts are bundled or
 fetched — the UI uses the OS's system font stack, which keeps licensing and
 the CSP (`connect-src 'self' https:`) simple.
+
+## Support the project
+
+Net Pulse — Open Net Tools is free, open source, and independently developed.
+If it's useful to you, consider
+[sponsoring on GitHub](https://github.com/sponsors/ArchismanKarmakar) — it
+directly funds continued development, a code-signing certificate (see
+[`SECURITY.md`](SECURITY.md) for why that matters for clean AV/SmartScreen
+results), and testing infrastructure.
+
+## Architecture
+
+For the engine's design, low-level threading model, and the reasoning behind
+the socket pool / direct-echo measurement / shared-hop cache / loop auditor,
+see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## License
 

@@ -1,5 +1,88 @@
 # Changelog
 
+## 0.8.1 — global socket pool, checksum-pinned loop auditor, edge-keyed cache
+
+- **Socket pool + centralized RX dispatch (root-causes the last of the
+  shared-hop loss, at any target count).** Every session used to own an
+  exclusive raw socket; on Windows an inbound ICMP reply is not guaranteed
+  to be delivered to every raw socket that could accept it, so a reply for
+  target B could still land on target A's socket and be silently dropped
+  even after 0.7.6's reply-routing fix, if it never reached a socket that
+  knew to route it. Fixed at the root: sessions no longer own sockets.
+  `acquire_pooled_socket(family, privileged, source_addr)` hands out one
+  shared, ref-counted socket per distinct combination (typically 1-2 for the
+  whole process; a genuinely multi-homed/VPN setup still gets its own socket
+  per distinct interface, unchanged from before). A single background
+  `RxDispatcher` thread `select()`s across every pooled socket and is now
+  the *only* code that ever calls `recvfrom()`; every parsed reply is looked
+  up by ICMP id in the existing global registry and pushed straight into
+  the owning session's inbox. Verified: 1 target and 100 targets both hold
+  ~0%% loss on shared early hops (router, ISP BNG) with no dependency on
+  which socket the OS happened to deliver a reply to.
+- **Fixed a real TX race exposed by socket sharing.** `IP_TTL` /
+  `IPV6_UNICAST_HOPS` is socket-level state set via `setsockopt()`
+  immediately before `sendto()`, not a per-packet parameter — with multiple
+  target threads now sending on the same pooled socket, two concurrent sends
+  could interleave `{set TTL A} {set TTL B} {send, now carrying the wrong
+  TTL}` and silently corrupt a probe's hop count. Fixed with a per-socket
+  mutex wrapping exactly that `{setsockopt, sendto}` pair.
+- **Paris-traceroute checksum pinning (removes a false-positive source at
+  the root, not just papering over it with a heuristic).** Investigated why
+  the same public IP could legitimately appear at two different hop depths
+  with no real routing loop: routers load-balancing across equal-cost links
+  (ECMP) often hash on the ICMP checksum to pick a branch, and this engine's
+  probes to different TTLs carry different `seq` (hence different
+  checksums), so they could genuinely take different physical paths and
+  land on the same shared router at two different hop counts. `build_echo()`
+  now optionally pins every IPv4 probe in a session to the same fixed
+  checksum (solved algebraically via RFC 1071 one's-complement arithmetic,
+  written into 2 reserved payload bytes), so ECMP always routes every probe
+  in a session down the same path — this class of false "loop" simply can't
+  happen anymore on IPv4. IPv6 doesn't need it: RFC 6438 mandates IPv6 ECMP
+  hash the Flow Label instead of the ICMP payload.
+- **Topological loop auditor, backoff instead of a hard stop.** A dead or
+  flapping WAN link can make one local device answer discovery probes at
+  many TTLs at once (the packet bounces between a couple of real routers
+  until it expires locally); left unhandled, every one of those hops starts
+  its own full-rate direct-echo stream to the same 1-2 devices — a "ghost
+  train." The engine now scans for a lower-hop address duplicate on every
+  genuine reply, requires **two independent** confirmations before treating
+  it as a real loop (a transient ECMP coincidence won't repeat; a real loop
+  will, every time — this is the backstop for whatever variance checksum
+  pinning doesn't remove), and, once confirmed, narrows the fast discovery
+  window to the loop boundary +1 hop instead of sliding it out to
+  `max_hops`. This is a deliberate **backoff, not a stop**: the boundary hop
+  keeps getting one real, slow (~8s) legacy probe forever, so a route change
+  or link recovery is always noticed and the window re-opens automatically
+  the moment a clean reply arrives — never a silent freeze.
+- **Edge-attributed shared-hop cache key.** The cross-target cache (0.8.0)
+  keyed only on `(source, responder IP)`, which conflated "the same router,
+  reached the same way" (safe to share) with "the same public IP visible
+  from two genuinely different upstream paths" (should NOT silently
+  overwrite each other's real numbers). The key is now
+  `(source, predecessor hop's address, responder IP)` — targets sharing the
+  same path prefix still collapse onto one entry (the common, valuable
+  case), while targets reaching the same node via a different predecessor
+  now get independent measurements. `predecessor_of()` walks backward
+  through however many lower hops are unresolved to find the *nearest
+  actually-resolved* hop, rather than only checking hop-1 directly — many
+  real routers silently forward without ever answering a TTL-limited probe,
+  so a silent hop-1 does not mean the whole predecessor chain is unknown,
+  and treating it as unknown would incorrectly split one stable route's
+  cache entry in two. `SharedHopTable`'s lock is now a `std::shared_mutex`
+  (concurrent adopters never block each other on a read-mostly table), and
+  entries are attributed by `Session::id_` (a stable, never-reused counter)
+  instead of a raw, address-reuse-fragile `const void*`.
+- **Fixed `npm run dist`.** electron-builder 26.x's schema requires
+  `publisherName` nested under `win.signtoolOptions`, not directly under
+  `win:` — an older layout that failed schema validation and blocked every
+  signed installer build. Corrected in `electron/electron-builder.yml`;
+  verified end-to-end (signed NSIS installer + blockmap produced).
+- **Added `ARCHITECTURE.md`, `PRIVACY_POLICY.md`, `CODE_SIGNING.md`, and
+  `.github/FUNDING.yml`**, plus a GitHub Pages project site under `docs/`.
+  `ARCHITECTURE.md` documents the full engine design (threading model,
+  socket pool, direct-echo model, loop auditor, shared-hop cache, DNS pool)
+  for anyone modifying `core/`.
 
 ## 0.8.0 — direct-echo measurement, global pacer, shared-hop pub/sub, DNS pool
 

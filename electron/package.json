@@ -1,6 +1,6 @@
 {
   "name": "net-pulse-open-net-tools-desktop",
-  "version": "0.7.1",
+  "version": "0.8.1",
   "description": "Net Pulse — Open Net Tools: cross-platform path-latency & network diagnostics desktop app (Electron + C++ Node-API engine)",
   "main": "main.js",
   "scripts": {

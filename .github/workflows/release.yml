@@ -85,6 +85,19 @@ jobs:
         working-directory: napi
         run: npm run build:electron
 
+      # ---- Prepare electron-builder's buildResources dir ------------------
+      # electron/build/ is intentionally gitignored (it's also where local
+      # dev builds dump other output), so the icons + entitlements that live
+      # there locally never reach the runner via checkout. Reconstruct just
+      # the files electron-builder.yml actually needs, straight from the
+      # already-tracked, canonical source assets in /branding.
+      - name: Prepare electron build resources
+        shell: bash
+        run: |
+          mkdir -p electron/build
+          cp branding/icon.ico electron/build/icon.ico
+          cp branding/icon.png electron/build/icon.png
+
       # ---- Package + sign-if-possible ------------------------------------
       # CSC_IDENTITY_AUTO_DISCOVERY=false stops electron-builder from
       # searching the runner's local keychain/cert store for a signing

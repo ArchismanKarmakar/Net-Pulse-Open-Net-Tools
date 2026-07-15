@@ -10,9 +10,19 @@ import process from 'node:process'
 const host = process.env.TAURI_DEV_HOST
 
 // Conservative options only — no debugProtection/selfDefending (both rely on
-// eval-like Function-constructor tricks that tauri.conf.json's CSP
-// (script-src 'self', no unsafe-eval) already blocks, so enabling them would
-// just break the app at runtime for no benefit).
+// eval-like Function-constructor tricks that could trip CSP depending on
+// configuration, so leaving them off avoids that risk entirely).
+//
+// autoExcludeNodeModules is NOT optional here: without it, the obfuscator
+// (control-flow flattening + identifier renaming) runs over React, ReactDOM,
+// Recharts, D3, and @tauri-apps/api along with the app's own code, since
+// Vite bundles everything into one chunk by default. Those libraries were
+// never designed to survive obfuscation — this was confirmed to corrupt
+// internal Map/Set-based logic, crashing every production build on launch
+// with "Cannot read properties of undefined (reading 'has')" while `tauri
+// dev` (which never runs this plugin — apply: 'build' only) worked fine.
+// This splits node_modules into its own unobfuscated chunk; only the app's
+// own src/ files get obfuscated, which was the actual point all along.
 export default defineConfig(() => ({
   plugins: [
     react(),
@@ -20,6 +30,7 @@ export default defineConfig(() => ({
       apply: 'build',
       enable: true,
       log: false,
+      autoExcludeNodeModules: true,
       options: {
         compact: true,
         controlFlowFlattening: true,

@@ -1311,7 +1311,17 @@ export default function App() {
 
               {sel.error ? (
                 <div className="loading">
-                  <div className="loading-text" style={{ color: 'var(--danger)' }}>⚠ {sel.error}</div>
+                  <div style={{ fontSize: 40, lineHeight: 1 }}>⚠️</div>
+                  <div className="loading-text" style={{ color: 'var(--danger)', fontSize: 18, fontWeight: 600, marginTop: 10 }}>
+                    {sel.error}
+                  </div>
+                  {/needs? admin|need admin\/root/i.test(sel.error) && (
+                    <div className="loading-sub" style={{ maxWidth: 480, textAlign: 'center', marginTop: 6 }}>
+                      Raw ICMP sockets need Administrator rights on Windows (root on macOS/Linux).
+                      Relaunch Net Pulse as Administrator, or edit this target's config and
+                      turn off <b>Raw</b> — the unprivileged mode works without elevation.
+                    </div>
+                  )}
                 </div>
               ) : (
                 <>

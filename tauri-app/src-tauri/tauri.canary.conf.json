@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Net Pulse - Open Net Tools (Canary)",
+  "identifier": "com.archismankarmakar.netpulse.opennettools.canary",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Net Pulse — Open Net Tools [CANARY TEST BUILD — DEVTOOLS ENABLED]",
+        "width": 1340,
+        "height": 880,
+        "minWidth": 900,
+        "minHeight": 600,
+        "backgroundColor": "#0e1116"
+      }
+    ]
+  },
+  "bundle": {
+    "publisher": "Archisman Karmakar (Canary/Test Build — not for distribution)"
+  }
+}

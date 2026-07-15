@@ -1,0 +1,116 @@
+name: Tauri Canary Build
+
+# Manual-only, devtools-enabled test build for chasing production-only bugs
+# (CSP violations, minified/obfuscated-bundle issues, anything that only
+# shows up in a packaged install and not `tauri dev`) — see the CSP
+# unsafe-eval bug this was built for as the motivating example.
+#
+# Deliberately NOT triggered by push or tag: this must never be confused with
+# a real release. Output is a workflow artifact (download from the run page),
+# never a GitHub Release, and never touches the normal version-release /
+# tauri-release pipeline.
+#
+# The resulting installer:
+#   - Has devtools enabled (right-click Inspect / F12) — the normal release
+#     build does NOT have this (see Cargo.toml's `canary` feature).
+#   - Is named/identified separately ("... (Canary)", .canary identifier) so
+#     it installs SIDE BY SIDE with a real install instead of overwriting it.
+#   - Has "[CANARY TEST BUILD]" in the window title so nobody mistakes a
+#     screenshot of it for the real app.
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: 'Which OS to build for'
+        required: true
+        default: 'windows-latest'
+        type: choice
+        options:
+          - windows-latest
+          - macos-latest
+          - ubuntu-latest
+          - all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tauri-canary-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: canary build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: >-
+          ${{ github.event.inputs.os == 'all'
+              && fromJSON('["windows-latest","macos-latest","ubuntu-latest"]')
+              || fromJSON(format('["{0}"]', github.event.inputs.os)) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - name: Install Linux webview + packaging deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libayatana-appindicator3-dev libxdo-dev file
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tauri-app/src-tauri
+          key: canary
+
+      - name: Install frontend deps
+        working-directory: tauri-app
+        run: npm ci
+
+      - name: Install Tauri CLI
+        working-directory: tauri-app
+        run: npm install --no-save @tauri-apps/cli
+
+      # --features canary → Cargo.toml's `canary = ["tauri/devtools"]`
+      # --config tauri.canary.conf.json → merged over the base config:
+      #   distinct productName/identifier/window title, same CSP/behavior
+      #   otherwise, so this build reproduces prod bugs faithfully while
+      #   still being inspectable.
+      - name: tauri build (canary — devtools enabled)
+        working-directory: tauri-app
+        run: npx tauri build --features canary --config src-tauri/tauri.canary.conf.json
+
+      - name: List produced bundle artifacts (diagnostic)
+        shell: bash
+        run: find tauri-app/src-tauri/target/release/bundle -maxdepth 2 -type f | sort
+
+      - name: Collect installer files
+        shell: bash
+        run: |
+          mkdir -p collected
+          shopt -s nullglob
+          find tauri-app/src-tauri/target/release/bundle \
+            \( -name '*.exe' -o -name '*.msi' -o -name '*.dmg' -o -name '*.app.tar.gz' \
+               -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) \
+            -type f -exec cp -v {} collected/ \;
+          ls -la collected
+
+      - name: Upload canary installer (artifact only — no Release is created)
+        uses: actions/upload-artifact@v4
+        with:
+          name: netpulse-canary-${{ matrix.os }}
+          path: collected/*
+          if-no-files-found: error
+          retention-days: 14

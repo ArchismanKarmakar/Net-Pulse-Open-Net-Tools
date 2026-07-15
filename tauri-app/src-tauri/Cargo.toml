@@ -51,5 +51,15 @@ panic = "abort"
 # whatever compiler cxx_build already picked, no special toolchain needed.
 obfuscate = []
 
+# Enables devtools (right-click Inspect / F12) ONLY when explicitly built with
+# `--features canary`. The normal release build never gets this — end users
+# should not have a devtools entry point baked into what they install. Use
+# tauri-canary-build.yml (or `cargo tauri build --features canary --config
+# src-tauri/tauri.canary.conf.json` locally) to produce a separately-named,
+# devtools-enabled test build for debugging exactly this class of
+# production-only bug (CSP, minified/obfuscated-bundle issues, etc.) without
+# ever shipping devtools to real users.
+canary = ["tauri/devtools"]
+
 [dev-dependencies]
 tauri = { version = "2.11", features = ["test"] }

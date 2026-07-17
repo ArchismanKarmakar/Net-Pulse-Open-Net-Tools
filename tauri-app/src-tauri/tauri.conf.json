@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Net Pulse - Open Net Tools",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "identifier": "com.archismankarmakar.netpulse.opennettools",
   "build": {
     "frontendDist": "../dist",

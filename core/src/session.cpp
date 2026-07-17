@@ -1181,6 +1181,26 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
             }
             bool from_dest = dest_ && inc.from == *dest_;
 
+            // The destination may have moved FARTHER away since it was first
+            // confirmed — e.g. a VPN/WARP tunnel that shortened the visible
+            // path got turned off, so the real distance is now longer than
+            // dest_hop_. compute_max_hop() caps the probe range at dest_hop_
+            // once set, so without this check the window would stay frozen at
+            // the stale (VPN-era) hop count forever: the periodic legacy
+            // recheck at dest_hop_ (kHopRecheckSecs) would keep landing on an
+            // intermediate router instead of the destination, that router's
+            // address would silently overwrite the hop while it's still
+            // flagged is_dest, and every hop beyond the old dest_hop_ would
+            // never be probed again. A genuine Time-Exceeded at exactly
+            // dest_hop_ that isn't from the destination is exactly that
+            // signal — un-freeze discovery so the window can slide out to the
+            // real, longer path.
+            if (dest_hop_ && hop == *dest_hop_ && inc.reply.kind == ReplyKind::TimeExceeded) {
+                dest_hop_.reset();
+                dest_found_at = 0.0;
+                max_hop_seen_ = hop; // this position is a confirmed real intermediate hop now
+            }
+
             // ICMP *Unreachable* from something OTHER than the destination is
             // not a transit hop at this TTL — it's a router (very often your own
             // gateway / ISP CGNAT during a link outage) reporting it can't
@@ -1232,6 +1252,20 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
                 std::optional<uint8_t> dup_at;
                 for (const auto& [h, hstat] : hops_) {
                     if (h >= hop) break; // hops_ iterates in increasing key order; only LOWER hops count
+                    // An IMMEDIATELY adjacent repeat (h == hop - 1) is not a
+                    // routing loop candidate: it's the well-known MPLS/tunnel
+                    // artifact where one physical/logical router answers two
+                    // consecutive TTLs with the same address because internal
+                    // (hidden) tunnel segments don't decrement the visible
+                    // TTL — deterministic and permanent, not packets bouncing
+                    // between routers. A genuine forwarding loop folds the
+                    // path back across a real distance (>= 2 hops), so only
+                    // that case is worth the two-strikes confirmation below;
+                    // treating this as a loop candidate would falsely and
+                    // permanently freeze discovery on every such path (seen
+                    // e.g. on Google's IPv6 backbone: hop 4 and hop 5 both
+                    // answering as 2404:6800:81e2:340::1).
+                    if (h + 1 == hop) continue;
                     if (hstat.address() && *hstat.address() == inc.from) { dup_at = h; break; }
                 }
                 if (dup_at) {

@@ -1,3 +1,5 @@
+import { IconUpload } from '../icons/MaterialIcons'
+
 // Small inline network illustration — built to match the app's own dark
 // instrument-panel palette (CSS variables) rather than a bitmap asset, so it
 // themes correctly in light mode too and never blurs on HiDPI screens.
@@ -25,17 +27,18 @@ function NetworkIllustration() {
 // Quick-start shortcuts — each one performs a real action (adds a live trace
 // or switches tools) rather than being a static label, so the empty state
 // doubles as an onboarding flow.
-export default function EmptyState({ onQuickAdd, onOpenTool }) {
+export default function EmptyState({ onQuickAdd, onOpenTool, onLoadListClick }) {
   return (
     <div className="dash-empty-state">
       <NetworkIllustration />
       <div className="dash-empty-title">No targets added yet</div>
-      <div className="muted">Start network diagnostics and monitoring by adding your first target above.</div>
+      <div className="muted">Start network diagnostics and monitoring by adding your first target above — or load a previously saved list.</div>
       <div className="dash-guide-row">
         <button onClick={() => onQuickAdd('1.1.1.1')}>Guide: Trace Cloudflare (1.1.1.1)</button>
         <button onClick={() => onQuickAdd('8.8.8.8')}>Guide: Ping Google DNS (8.8.8.8)</button>
         <button onClick={() => onOpenTool('dns')}>Guide: Check DNS propagation</button>
         <button onClick={() => onOpenTool('ports')}>Open Port Scanner</button>
+        <button onClick={onLoadListClick}><IconUpload /> Load list (.npulse)</button>
       </div>
     </div>
   )

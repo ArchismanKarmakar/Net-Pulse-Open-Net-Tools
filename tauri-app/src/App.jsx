@@ -1225,6 +1225,22 @@ export default function App() {
   // rendering through an SVG foreignObject — the browser's own CSS engine
   // paints it, rather than the library re-implementing CSS color parsing —
   // so it handles this app's actual stylesheet correctly.
+  // Decodes a data: URL directly to bytes (base64 → Uint8Array) without
+  // fetch(). fetch() on a data: URL is a `connect-src` CSP check — this
+  // app's CSP (connect-src 'self' ipc: http://ipc.localhost https:)
+  // doesn't list `data:`, so fetch(dataUrl) is silently blocked by the
+  // browser's own CSP enforcement (confirmed directly from a DevTools
+  // console error, not inferred). atob() is a plain synchronous string
+  // API with no network request involved, so no CSP category applies to
+  // it — this is the correct way to turn a data: URL into bytes inside a
+  // CSP'd app, not a workaround.
+  const dataUrlToBytes = (dataUrl) => {
+    const base64 = dataUrl.slice(dataUrl.indexOf(',') + 1)
+    const binary = atob(base64)
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+    return bytes
+  }
   const exportHopsTablePng = async () => {
     if (!sel) return
     if (!hopTableRef.current) {
@@ -1253,8 +1269,7 @@ export default function App() {
         toPng(hopTableRef.current, { backgroundColor: '#0e1116', pixelRatio: 2, skipFonts: true }),
         new Promise((_, reject) => setTimeout(() => reject(new Error('Timed out capturing the hop table as an image (this can happen on some Windows systems if WebView2 needs updating).')), 12000)),
       ])
-      const res = await fetch(dataUrl)
-      const bytes = new Uint8Array(await res.arrayBuffer())
+      const bytes = dataUrlToBytes(dataUrl)
       await saveViaDialog(`netpulse_traceroute_${sanitizeFilename(sel.name)}.png`, [{ name: 'PNG image', extensions: ['png'] }], bytes)
     } catch (e) {
       await showModal({ title: 'Export failed', message: String(e?.message || e) })

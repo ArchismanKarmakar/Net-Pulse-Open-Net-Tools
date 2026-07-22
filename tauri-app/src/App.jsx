@@ -1196,10 +1196,33 @@ export default function App() {
   // paints it, rather than the library re-implementing CSS color parsing —
   // so it handles this app's actual stylesheet correctly.
   const exportHopsTablePng = async () => {
-    if (!sel || !hopTableRef.current) return
+    if (!sel) return
+    if (!hopTableRef.current) {
+      await showModal({ title: 'Nothing to export', message: 'The hop table isn\u2019t currently visible.' })
+      return
+    }
     try {
       const { toPng } = await import('html-to-image')
-      const dataUrl = await toPng(hopTableRef.current, { backgroundColor: '#0e1116', pixelRatio: 2 })
+      // skipFonts: true — this app bundles no custom web fonts (see
+      // README.md's Styling section), so there's nothing for html-to-image
+      // to embed here. Without this, toPng() still walks every stylesheet
+      // on the page looking for @font-face rules to inline, including
+      // reading .cssRules on stylesheets it didn't load — a known source of
+      // synchronous SecurityErrors on cross-origin sheets in some
+      // browser/webview combinations, for a feature this app never uses.
+      //
+      // The timeout below is defense in depth on top of that: whatever the
+      // exact cause on a given machine (an older WebView2 runtime not
+      // supporting a JS API the library calls, e.g. HTMLImageElement's
+      // decode() — checked the library's own source, which calls that
+      // inside a raw onload handler where a throw would leave the promise
+      // permanently pending, neither resolved nor rejected), this makes
+      // sure the button can never again look like it's just doing nothing
+      // forever — after 12s it fails LOUDLY with a real error instead.
+      const dataUrl = await Promise.race([
+        toPng(hopTableRef.current, { backgroundColor: '#0e1116', pixelRatio: 2, skipFonts: true }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Timed out capturing the hop table as an image (this can happen on some Windows systems if WebView2 needs updating).')), 12000)),
+      ])
       const res = await fetch(dataUrl)
       const bytes = new Uint8Array(await res.arrayBuffer())
       await saveViaDialog(`netpulse_traceroute_${sanitizeFilename(sel.name)}.png`, [{ name: 'PNG image', extensions: ['png'] }], bytes)

@@ -5,13 +5,11 @@
 //! preload.js contextBridge allowlist — same principle (a narrow, explicit,
 //! named surface), enforced by Tauri's own permission system this time
 //! instead of a hand-written bridge object.
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter};
 
 use crate::ffi;
-use crate::tools::{self, PingOpts, PingRegistry};
+use crate::tools;
 
 // ---------------------------------------------------------------------------
 // Target management — thin wrappers over ffi.rs, which is itself a thin
@@ -106,19 +104,18 @@ pub fn update_target(id: u64, cfg: PartialTargetConfig) -> Result<bool, String> 
     .map_err(|e| e.to_string())
 }
 
-/// Reads a target's CURRENT settings back out of get_state_json — the engine
-/// already reports them per-target under "config" (probe/timeout/payload/
-/// maxhops/raw/family/src/pausedHops — see manager.hpp's state_json), so this
-/// reuses that instead of adding a new C++ export just for this.
+/// Reads a target's CURRENT settings via get_target_config_json — a single-
+/// target FFI call (see netpulse_ffi.hpp), NOT the full multi-target
+/// get_state_json. Building and parsing the entire state payload just to
+/// read one target's config would get linearly slower per active target on
+/// every partial update (e.g. dragging a probe-interval slider), stuttering
+/// the UI at scale (50-100 targets) — this reads exactly the bytes needed.
 fn current_config(id: u64) -> Result<TargetConfig, String> {
-    let json = ffi::get_state_json(0.0, false);
-    let v: serde_json::Value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
-    let targets = v.get("targets").and_then(|t| t.as_array()).ok_or("malformed state JSON")?;
-    let t = targets
-        .iter()
-        .find(|t| t.get("id").and_then(|i| i.as_u64()) == Some(id))
-        .ok_or_else(|| format!("update_target: no such target id {id}"))?;
-    let c = t.get("config").ok_or("target has no config")?;
+    let json = ffi::get_target_config_json(id);
+    let c: serde_json::Value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+    if !c.is_object() || c.as_object().map(|m| m.is_empty()).unwrap_or(true) {
+        return Err(format!("update_target: no such target id {id}"));
+    }
     let getf = |k: &str, d: f64| c.get(k).and_then(|x| x.as_f64()).unwrap_or(d);
     Ok(TargetConfig {
         target: String::new(),
@@ -154,6 +151,11 @@ pub fn remove_target(id: u64) {
 }
 
 #[tauri::command]
+pub fn force_recheck(id: u64) {
+    ffi::force_recheck(id);
+}
+
+#[tauri::command]
 pub fn get_state(focus_secs: Option<f64>) -> String {
     match focus_secs {
         Some(f) => ffi::get_state_json(f, true),
@@ -164,6 +166,24 @@ pub fn get_state(focus_secs: Option<f64>) -> String {
 #[tauri::command]
 pub fn list_interfaces() -> String {
     ffi::list_interfaces_json()
+}
+
+/// Every raw sample this target has ever recorded, across every hop —
+/// deliberately separate from get_state (see export_target_full_csv's doc
+/// comment in manager.hpp) rather than a flag on it, since this reads
+/// straight through to ColdStore with no downsampling and no focus-window
+/// cutoff, a meaningfully different (and heavier) operation than an
+/// ordinary poll. Empty string if the id is unknown — the frontend already
+/// treats that as "nothing to export" the same way target_config_json does.
+#[tauri::command]
+pub fn export_target_csv(id: u64) -> String {
+    ffi::export_target_full_csv(id)
+}
+
+/// Same, every target at once.
+#[tauri::command]
+pub fn export_all_targets_csv() -> String {
+    ffi::export_all_targets_full_csv()
 }
 
 #[tauri::command]
@@ -192,9 +212,17 @@ pub async fn port_scan(host: String, start: u16, end: u16) -> tools::PortScanRes
 }
 
 // ---------------------------------------------------------------------------
-// Ping — streams output as Tauri events ("np-ping-line" / "np-ping-done"),
-// replacing the old ipcRenderer.send-based streaming. See src/main.jsx's
-// bridge for the matching listen() calls on the frontend side.
+// Ping — native engine (ffi::ping_start/ping_stop/ping_poll, backed by
+// PingRun/Manager::start_ping in the C++ core — see ping_run.hpp's doc
+// comment for the full rationale), NOT an OS `ping` subprocess. The C++
+// side is poll-based (ping_poll returns whatever's new since the last
+// call — same shape get_state_json already uses for the main dashboard);
+// this polls it at a tight interval and re-emits each new result as the
+// SAME "np-ping-line" / "np-ping-done" Tauri events the frontend already
+// listens for, just carrying structured fields (seq/ok/rtt_ms/from/note)
+// instead of a raw text line to regex-parse. See src/tauri-bridge.js for
+// the matching listen() calls and components/tools/PingPage.jsx for the
+// consumer.
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -211,58 +239,117 @@ pub struct PingArgs {
 #[derive(Serialize, Clone)]
 struct PingLineEvent {
     id: String,
-    line: String,
-    stream: &'static str,
+    seq: i64,
+    ok: bool,
+    rtt_ms: Option<f64>,
+    from: String,
+    note: String,
 }
 #[derive(Serialize, Clone)]
 struct PingDoneEvent {
     id: String,
-    code: Option<i32>,
+}
+
+// Frontend (PingPage.jsx) expects { id, cmd } back from ping_start — id to
+// correlate streamed np-ping-line/np-ping-done events, cmd to show the user
+// a human-readable summary of what got invoked (see ping_start's doc
+// comment in netpulse_ffi.hpp for why this is no longer a real shell
+// command line — there's no subprocess to show one for anymore).
+#[derive(Serialize)]
+pub struct PingStartResult {
+    pub id: String,
+    pub cmd: String,
+}
+
+#[derive(Deserialize)]
+struct PingPollLine {
+    seq: i64,
+    ok: bool,
+    rtt_ms: Option<f64>,
+    from: String,
+    note: String,
+}
+#[derive(Deserialize)]
+struct PingPollResult {
+    lines: Vec<PingPollLine>,
+    done: bool,
 }
 
 #[tauri::command]
-pub async fn ping_start(
-    app: AppHandle,
-    registry: State<'_, Arc<PingRegistry>>,
-    host: String,
-    args: PingArgs,
-) -> Result<String, String> {
-    let opts = PingOpts {
-        count: args.count.unwrap_or(10),
-        size: args.size,
-        timeout_ms: args.timeout,
-        ttl: args.ttl,
-        interval: args.interval,
-        family: args.family,
-        continuous: args.continuous.unwrap_or(false),
-    };
-    let reg = registry.inner().clone();
-    let id = tools::new_id();
+pub async fn ping_start(app: AppHandle, host: String, args: PingArgs) -> Result<PingStartResult, String> {
+    let count = args.count.unwrap_or(10) as f64;
+    let continuous = args.continuous.unwrap_or(false);
+    let size = args.size.unwrap_or(56) as f64;
+    // PingArgs.timeout is milliseconds (matches the old OS-ping contract the
+    // frontend still sends); the engine wants seconds, 0 meaning "auto".
+    let timeout_secs = args.timeout.map(|t| t as f64 / 1000.0).unwrap_or(0.0);
+    let ttl = args.ttl.unwrap_or(255) as f64;
+    let interval_secs = args.interval.unwrap_or(1.0);
+    let family = args.family.clone().unwrap_or_default();
 
-    let id_for_lines = id.clone();
-    let app_line = app.clone();
-    let id_for_done = id.clone();
-    let app_done = app.clone();
+    // Raw ICMP (same requirement, and same default, as the main engine —
+    // see build.rs's comment on why this app doesn't run elevated by
+    // default but every probe still needs a raw socket) and no explicit
+    // source binding; PingPage.jsx doesn't currently expose either as a
+    // user-facing option, matching its pre-existing scope.
+    let json = ffi::ping_start(&host, count, continuous, size, timeout_secs, ttl, interval_secs, &family, true, "")
+        .map_err(|e| e.to_string())?;
+    let parsed: serde_json::Value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+    let id = parsed.get("id").and_then(|v| v.as_u64()).ok_or_else(|| "ping_start: malformed response".to_string())?;
+    let cmd = parsed.get("cmd").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let id_str = id.to_string();
 
-    tools::start(
-        &reg,
-        id.clone(),
-        &host,
-        opts,
-        move |line, stream| {
-            let _ = app_line.emit("np-ping-line", PingLineEvent { id: id_for_lines.clone(), line, stream });
-        },
-        move |code| {
-            let _ = app_done.emit("np-ping-done", PingDoneEvent { id: id_for_done.clone(), code });
-        },
-    )
-    .await?;
+    let id_for_events = id_str.clone();
+    tokio::spawn(async move {
+        loop {
+            let poll_json = ffi::ping_poll(id);
+            let Ok(res) = serde_json::from_str::<PingPollResult>(&poll_json) else { break };
+            for l in res.lines {
+                let _ = app.emit(
+                    "np-ping-line",
+                    PingLineEvent { id: id_for_events.clone(), seq: l.seq, ok: l.ok, rtt_ms: l.rtt_ms, from: l.from, note: l.note },
+                );
+            }
+            if res.done {
+                let _ = app.emit("np-ping-done", PingDoneEvent { id: id_for_events.clone() });
+                break;
+            }
+            // Tight enough that replies feel live (well under one probe
+            // interval even at the fastest UI-exposed setting), loose
+            // enough not to matter as a CPU cost — the same tradeoff
+            // kNetworkWatchdogPollSecs and other poll cadences in the C++
+            // core already make, just much faster here since this is
+            // user-facing latency, not a background self-heal check.
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        }
+    });
 
-    Ok(id)
+    Ok(PingStartResult { id: id_str, cmd })
 }
 
 #[tauri::command]
-pub async fn ping_stop(registry: State<'_, Arc<PingRegistry>>, id: String) -> Result<(), String> {
-    tools::stop(registry.inner(), &id).await;
+pub fn ping_stop(id: String) -> Result<(), String> {
+    let id: u64 = id.parse().map_err(|_| "ping_stop: invalid id".to_string())?;
+    ffi::ping_stop(id);
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Minimal file read/write for the .npulse Save As / Open flow. The project
+// grants no generic fs plugin (see capabilities/default.json) — these two
+// commands exist ONLY to write/read the exact bytes the user picked via
+// tauri-plugin-dialog's native save()/open() dialogs, not a general
+// filesystem surface. The path always originates from the dialog, never from
+// arbitrary frontend input, so there's no separate scope/allowlist to
+// enforce beyond "the user picked this path in a native OS dialog."
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn write_file(path: String, data: Vec<u8>) -> Result<(), String> {
+    std::fs::write(&path, data).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn read_file(path: String) -> Result<Vec<u8>, String> {
+    std::fs::read(&path).map_err(|e| e.to_string())
 }

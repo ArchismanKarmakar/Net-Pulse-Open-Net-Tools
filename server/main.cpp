@@ -15,12 +15,14 @@
 #include "netpulse/transport.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <tuple>
 #include <string>
@@ -33,12 +35,14 @@
 #  endif
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
+#  include <direct.h>
 using socklen_t = int;
 #  define CLOSESOCK closesocket
 #else
 #  include <arpa/inet.h>
 #  include <netinet/in.h>
 #  include <sys/socket.h>
+#  include <sys/stat.h>
 #  include <unistd.h>
 #  define CLOSESOCK ::close
 #endif
@@ -206,6 +210,9 @@ static void handle(int fd, Manager& mgr, const std::string& dist) {
     } else if (path == "/api/pause") {
         if (q.count("id")) mgr.pause(std::stoull(q["id"]), !q.count("on") || q["on"] != "0");
         send_response(fd, "200 OK", "application/json", "{}");
+    } else if (path == "/api/recheck") {
+        if (q.count("id")) mgr.force_recheck(std::stoull(q["id"]));
+        send_response(fd, "200 OK", "application/json", "{}");
     } else {
         // static files from the built frontend
         std::string rel = (path == "/") ? "/index.html" : path;
@@ -228,6 +235,13 @@ int main(int argc, char** argv) {
 #endif
     int port = (argc > 1) ? std::atoi(argv[1]) : 8787;
     std::string dist = (argc > 2) ? argv[2] : "web/dist";
+    std::string data_dir = (argc > 3) ? argv[3] : "npdata";
+#ifdef _WIN32
+    _mkdir(data_dir.c_str());
+#else
+    ::mkdir(data_dir.c_str(), 0755);
+#endif
+    ColdStore::instance().configure(data_dir);
 
     Manager mgr;
     int srv = ::socket(AF_INET, SOCK_STREAM, 0);

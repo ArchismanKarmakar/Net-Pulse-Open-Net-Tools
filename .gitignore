@@ -11,3 +11,32 @@ tauri-app/node_modules
 tauri-app/dist
 tauri-app/src-tauri/target
 tauri-app/src-tauri/gen
+
+
+# Env files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.development
+.env.test
+.env.production
+.env.*
+
+
+# Lock Files
+package-lock.json
+Cargo.lock
+tauri-app/package-lock.json
+tauri-app/yarn.lock
+tauri-app/pnpm-lock.yaml
+tauri-app/src-tauri/Cargo.lock
+
+
+# Cache Files
+.mypy_cache/
+
+
+Unnecessary files
+step0_classifier.py

@@ -6,6 +6,49 @@ static inline uint16_t be16(const uint8_t* b) {
     return static_cast<uint16_t>((b[0] << 8) | b[1]);
 }
 
+// RFC 4884 extension structure walk, shared by parse_v4/parse_v6. `icmp`
+// points at the start of the ICMP/ICMPv6 header of a Time Exceeded/
+// Unreachable message (byte 0 = type); `icmplen` is the remaining buffer
+// length from there. RFC 4884 repurposes byte 5 of the classic 4-byte
+// "unused" field as the length of the copied original datagram, in 4-byte
+// words — a router that doesn't implement RFC 4884 leaves it 0, which is
+// indistinguishable from "no extension present", so that case is treated as
+// no labels rather than guessing an offset. Any malformed/truncated/
+// checksum-mismatched structure also yields no labels — same fail-soft
+// posture as the rest of this file, never UB.
+static std::vector<uint32_t> parse_mpls_extensions(const uint8_t* icmp, size_t icmplen) {
+    std::vector<uint32_t> labels;
+    if (icmplen < 8) return labels;
+    uint8_t orig_len_words = icmp[5];
+    if (orig_len_words == 0) return labels; // legacy router, no RFC 4884 hint
+    size_t ext_off = 8 + static_cast<size_t>(orig_len_words) * 4;
+    if (ext_off + 4 > icmplen) return labels;
+    const uint8_t* ext = icmp + ext_off;
+    size_t ext_len = icmplen - ext_off;
+    if ((ext[0] >> 4) != 2) return labels; // extension structure version must be 2
+    if (checksum(ext, ext_len) != 0) return labels; // structure's own checksum must validate
+
+    size_t pos = 4; // skip the 4-byte common header
+    while (pos + 4 <= ext_len) {
+        uint16_t obj_len = be16(ext + pos);
+        if (obj_len < 4 || pos + obj_len > ext_len) break;
+        uint8_t class_num = ext[pos + 2];
+        uint8_t c_type = ext[pos + 3];
+        if (class_num == 1 && c_type == 1) { // MPLS Label Stack Object (RFC 4950)
+            size_t p = pos + 4;
+            size_t obj_end = pos + obj_len;
+            while (p + 4 <= obj_end) {
+                uint32_t v = (static_cast<uint32_t>(ext[p]) << 24) | (static_cast<uint32_t>(ext[p + 1]) << 16) |
+                             (static_cast<uint32_t>(ext[p + 2]) << 8) | static_cast<uint32_t>(ext[p + 3]);
+                labels.push_back(v);
+                p += 4;
+            }
+        }
+        pos += obj_len;
+    }
+    return labels;
+}
+
 uint16_t checksum(const uint8_t* d, size_t len) {
     uint32_t sum = 0;
     size_t i = 0;
@@ -79,7 +122,7 @@ std::optional<ParsedReply> parse_v4(const uint8_t* buf, size_t len) {
     size_t icmplen = len - ihl;
     uint8_t t = icmp[0];
     if (t == 0) { // echo reply
-        return ParsedReply{ReplyKind::EchoReply, be16(icmp + 4), be16(icmp + 6)};
+        return ParsedReply{ReplyKind::EchoReply, be16(icmp + 4), be16(icmp + 6), {}};
     }
     if (t == 11 || t == 3) { // time exceeded / dest unreachable
         if (icmplen < 8) return std::nullopt;
@@ -90,7 +133,7 @@ std::optional<ParsedReply> parse_v4(const uint8_t* buf, size_t len) {
         if (innerlen < iihl + 8) return std::nullopt;
         const uint8_t* orig = inner + iihl;
         return ParsedReply{t == 11 ? ReplyKind::TimeExceeded : ReplyKind::Unreachable,
-                           be16(orig + 4), be16(orig + 6)};
+                           be16(orig + 4), be16(orig + 6), parse_mpls_extensions(icmp, icmplen)};
     }
     return std::nullopt;
 }
@@ -99,7 +142,7 @@ std::optional<ParsedReply> parse_v6(const uint8_t* buf, size_t len) {
     if (len < 8) return std::nullopt;
     uint8_t t = buf[0];
     if (t == 129) { // echo reply
-        return ParsedReply{ReplyKind::EchoReply, be16(buf + 4), be16(buf + 6)};
+        return ParsedReply{ReplyKind::EchoReply, be16(buf + 4), be16(buf + 6), {}};
     }
     if (t == 3 || t == 1) { // time exceeded / dest unreachable
         const uint8_t* inner = buf + 8;
@@ -107,7 +150,7 @@ std::optional<ParsedReply> parse_v6(const uint8_t* buf, size_t len) {
         if (innerlen < 48) return std::nullopt; // 40 (IPv6 hdr) + 8 (orig icmp)
         const uint8_t* orig = inner + 40;
         return ParsedReply{t == 3 ? ReplyKind::TimeExceeded : ReplyKind::Unreachable,
-                           be16(orig + 4), be16(orig + 6)};
+                           be16(orig + 4), be16(orig + 6), parse_mpls_extensions(buf, len)};
     }
     return std::nullopt;
 }

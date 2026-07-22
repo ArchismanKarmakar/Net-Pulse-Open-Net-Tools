@@ -17,6 +17,10 @@
 //    hands back a plain object, no parsing needed.
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { save as saveDialog, open as openDialog } from '@tauri-apps/plugin-dialog'
+import { check as checkUpdate } from '@tauri-apps/plugin-updater'
+import { relaunch } from '@tauri-apps/plugin-process'
+import { getVersion as tauriGetVersion } from '@tauri-apps/api/app'
 
 // invoke()/listen() silently rely on window.__TAURI_INTERNALS__, which only
 // exists inside the real Tauri webview process. If this page was opened in a
@@ -55,6 +59,13 @@ function install() {
       return JSON.parse(json)
     },
     listInterfaces: async () => JSON.parse(await invoke('list_interfaces')),
+    // Full-fidelity CSV — every raw sample ColdStore has for a target (or
+    // every target), NOT the chart's downsampled series get_state already
+    // returns. Plain text back (not JSON — there's nothing to parse, it's
+    // already the file content), so the caller can hand it straight to
+    // saveFile/writeFile.
+    exportTargetCsv: (id) => invoke('export_target_csv', { id }),
+    exportAllTargetsCsv: () => invoke('export_all_targets_csv'),
     addTarget: (opts) => invoke('add_target', { cfg: toTargetConfig(opts) }),
     // update_target is a PARTIAL update on the Rust side (see commands.rs's
     // PartialTargetConfig) — it merges only the fields present here into the
@@ -68,7 +79,24 @@ function install() {
     pauseTarget: (id, on) => invoke('pause_target', { id, on: !!on }),
     stopTarget: (id) => invoke('stop_target', { id }),
     removeTarget: (id) => invoke('remove_target', { id }),
+    forceRecheck: (id) => invoke('force_recheck', { id }),
     engineBuild: () => invoke('engine_build'),
+
+    // Native Save As / Open dialogs for the .npulse target-list format (see
+    // App.jsx's exportTargetList/importTargetList) — saveFile/openFile return
+    // null if the user cancels, matching browser showSaveFilePicker()'s own
+    // cancel-throws-AbortError convention loosely (null is simpler to check
+    // than a try/catch at every call site).
+    saveFile: async (defaultName, filters) => {
+      const path = await saveDialog({ defaultPath: defaultName, filters })
+      return path || null
+    },
+    openFile: async (filters) => {
+      const path = await openDialog({ multiple: false, filters })
+      return path || null
+    },
+    writeFile: (path, bytes) => invoke('write_file', { path, data: Array.from(bytes) }),
+    readFile: async (path) => new Uint8Array(await invoke('read_file', { path })),
 
     tools: {
       dns: (name) => invoke('dns_lookup', { name }),
@@ -82,6 +110,9 @@ function install() {
         listen('np-ping-line', (event) => cb(event.payload)).then((fn) => {
           if (cancelled) fn()
           else unlisten = fn
+        }).catch((e) => {
+          console.error('Net Pulse: failed to listen for ping output —', e)
+          cb({ seq: 0, ok: false, rtt_ms: null, from: '', note: `Failed to receive ping output: ${e}` })
         })
         return () => { cancelled = true; if (unlisten) unlisten() }
       },
@@ -91,8 +122,55 @@ function install() {
         listen('np-ping-done', (event) => cb(event.payload)).then((fn) => {
           if (cancelled) fn()
           else unlisten = fn
+        }).catch((e) => {
+          console.error('Net Pulse: failed to listen for ping completion —', e)
+          cb({ id: null })
         })
         return () => { cancelled = true; if (unlisten) unlisten() }
+      },
+    },
+
+    // Reads the version tauri.conf.json was actually built with — used by
+    // the About box so it can never drift out of sync with a real release
+    // the way a hand-typed version string in App.jsx eventually would.
+    getVersion: async () => {
+      try { return await tauriGetVersion() } catch { return null }
+    },
+
+    // Auto-update: check() returns { available, version, date, body } or
+    // { available: false }; on failure (offline, GitHub unreachable, no
+    // matching release yet) it also returns { available: false } rather than
+    // throwing — a missed update check should never surface as an error to
+    // the user, just silently try again next time. install(onProgress)
+    // downloads, verifies the signature (the plugin itself refuses anything
+    // not signed with the configured pubkey — this cannot be bypassed from
+    // here), installs, and relaunches; the caller doesn't need to know any
+    // of that, just call it after check() said one's available.
+    updater: {
+      check: async () => {
+        try {
+          const u = await checkUpdate()
+          if (!u) return { available: false }
+          return { available: true, version: u.version, date: u.date || null, body: u.body || '', _update: u }
+        } catch (e) {
+          return { available: false, error: String(e) }
+        }
+      },
+      install: async (info, onProgress) => {
+        if (!info || !info._update) return { ok: false, error: 'No update to install' }
+        try {
+          let downloaded = 0
+          let total = 0
+          await info._update.downloadAndInstall((event) => {
+            if (event.event === 'Started') { total = event.data.contentLength || 0 }
+            else if (event.event === 'Progress') { downloaded += event.data.chunkLength || 0 }
+            if (onProgress) onProgress({ downloaded, total })
+          })
+          await relaunch()
+          return { ok: true }
+        } catch (e) {
+          return { ok: false, error: String(e) }
+        }
       },
     },
   }

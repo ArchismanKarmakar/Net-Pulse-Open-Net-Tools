@@ -45,10 +45,36 @@ mod ffi {
         fn pause_target(id: u64, on: bool);
         fn stop_target(id: u64);
         fn remove_target(id: u64);
+        fn force_recheck(id: u64);
 
         fn get_state_json(focus_secs: f64, has_focus: bool) -> String;
+        fn get_target_config_json(id: u64) -> String;
+        fn export_target_full_csv(id: u64) -> String;
+        fn export_all_targets_full_csv() -> String;
         fn list_interfaces_json() -> String;
         fn engine_build() -> String;
+        fn set_data_dir(dir: &str);
+
+        // Native Ping tool — see ping_run.hpp (core) and netpulse_ffi.hpp's
+        // doc comment on ping_start for the full contract. Replaces the old
+        // OS-`ping`-subprocess implementation (tools.rs) with the SAME
+        // pooled-socket + shared-dispatcher engine the main multi-target
+        // monitor uses, instead of a second, unrelated ICMP mechanism.
+        #[allow(clippy::too_many_arguments)]
+        fn ping_start(
+            host: &str,
+            count: f64,
+            continuous: bool,
+            size: f64,
+            timeout_secs: f64,
+            ttl: f64,
+            interval_secs: f64,
+            family: &str,
+            raw: bool,
+            src: &str,
+        ) -> Result<String>;
+        fn ping_stop(id: u64);
+        fn ping_poll(id: u64) -> String;
     }
 }
 

@@ -1,5 +1,343 @@
 # Changelog
 
+## 0.9.5 revised
+
+Version files (`tauri.conf.json` / `Cargo.toml` / `package.json`) are still at
+`0.9.5` — this section isn't tied to a version bump yet. When ready to ship
+it, bump all three (the `tauri-version-release.yml` workflow checks they
+match) and rename this heading.
+
+### Ping tool: rebuilt on the native engine, not an OS subprocess
+
+The standalone Ping tab used to spawn and text-parse the OS `ping` binary —
+the one tool in the app that didn't share the main engine's pooled-socket
+architecture. Replaced end to end:
+- **New engine (`core/include/netpulse/ping_run.hpp`, `core/src/ping_run.cpp`):**
+  `PingRun`, a second `IcmpOwner` implementation alongside `Session` (see
+  `ARCHITECTURE.md` §2), sharing the exact same pooled sockets and RX
+  dispatcher thread — no separate thread, no subprocess. The cross-session
+  registry (`g_registry`) was generalized from `map<uint16_t, Session*>` to
+  `map<uint16_t, IcmpOwner*>` to make this possible.
+- **Manager orchestration:** `start_ping`/`stop_ping`/`poll_ping`, mirroring
+  the existing target lifecycle but short-lived (auto-cleanup once done and
+  drained).
+- **Frontend (`PingPage.jsx`):** now consumes structured per-line results
+  (`{seq, ok, rtt_ms, from, note}`) instead of regex-parsing raw process
+  output text.
+- **Fixed during rollout:** the new `ping_run.cpp` was missing from
+  `tauri-app/src-tauri/build.rs`'s hand-maintained `cxx_build` file list
+  (unlike `CMakeLists.txt`, which globs `core/src/*.cpp` and picked it up
+  automatically — masking the omission through every C++-only test run).
+  Surfaced as a real MSVC link error (`unresolved external symbol
+  PingRun::PingRun`/`PingRun::run`) the first time the actual Tauri/Cargo
+  build ran on real hardware.
+
+### Drag-to-reorder: replaced, not patched again
+
+The sidebar/dashboard target list's drag-to-reorder was hand-rolled on raw
+`mousemove`/`mouseup` events with a live-DOM-sibling-query + `busy`/
+`requestAnimationFrame` gate — after two rounds of patching the same race
+condition kept resurfacing under fast multi-card drags. Replaced entirely
+with [Motion](https://motion.dev/)'s `Reorder.Group`/`Reorder.Item` (pointer-
+gesture based, not native HTML5 drag-and-drop — irrelevant to Tauri's
+webview intercepting native `dragstart`, which is why this was hand-rolled
+in the first place). `useDragControls()` per row (via a small wrapper
+component, since it's a hook and can only be called once per rendered item)
+keeps dragging restricted to the existing `⠿` handle. The custom FLIP-
+animation hook is gone — Motion's `Reorder.Item` animates displaced rows
+natively.
+
+### Light-mode contrast fix
+
+`.tc-dest` (the destination/family/cadence line on each sidebar card) used a
+fixed Tailwind gray token (`--color-gray-300`) instead of the theme-aware
+`--muted` variable every other muted-text rule in the stylesheet uses — a
+stray typo, per the code's own adjacent comment stating the intended value.
+Unreadable against a light background. Fixed to `var(--muted)`.
+
+### Exports: Full CSV, multi-sheet Excel, and Traceroute PNG
+
+- **Full-history CSV** (per target and fleet-wide) — every recorded sample,
+  not just the current summary row. Reads `ColdStore`'s uncapped history via
+  new `Manager::export_target_full_csv()`/`export_all_targets_full_csv()`.
+- **Fixed along the way:** these CSV exports used JSON-string escaping
+  (`esc()`) instead of proper RFC 4180 CSV escaping — a target name or
+  hostname containing a comma would silently shift every column after it.
+  Added a dedicated `csv_esc()` in `manager.hpp`.
+- **Excel export** (per target and fleet-wide), via SheetJS (`xlsx`) — see
+  the dependency note below for why it's installed from SheetJS's own CDN.
+  Per-target: Config + Hop Summary + Full History as separate sheets in one
+  workbook. Fleet-wide: Targets Overview + All Hops Summary + Full History
+  across every target.
+- **Traceroute PNG** — a picture of the hop table itself (distinct from the
+  existing latency-graph PNG export), via
+  [html-to-image](https://github.com/bubkoo/html-to-image). Deliberately
+  *not* the far more commonly reached-for `html2canvas`: it has a long-
+  standing, unresolved bug failing to parse `oklch()`/`color-mix()`
+  ([niklasvh/html2canvas#3269](https://github.com/niklasvh/html2canvas/issues/3269)),
+  and this app's Tailwind v4 theme uses `color-mix()` throughout. html-to-
+  image sidesteps this by rendering through an SVG `foreignObject` — the
+  browser's own CSS engine paints it, not a reimplementation of CSS color
+  parsing.
+
+### Fleet-wide Excel export: fixed a real UI freeze, then rebuilt for scale
+
+The fleet-wide Excel export button froze the entire app for several seconds
+before the save dialog appeared. Root-caused in two layers, both fixed:
+1. Building the workbook (CSV parsing + `aoa_to_sheet` + `write`) ran
+   synchronously on the main thread — moved to a Web Worker
+   (`tauri-app/src/workers/xlsxWorker.js`).
+2. That alone wasn't sufficient: the fleet's full history was fetched as
+   *one* backend call returning *one* potentially huge string, and handing
+   that string to the worker via `postMessage` structured-clones it — a
+   synchronous main-thread copy regardless of where the parsing happens.
+   **Redesigned** to reuse the existing, already-bounded per-target
+   `exportTargetCsv(id)` command in a sequential loop (one target at a
+   time), streaming each chunk into a persistent worker as a *transferred*
+   `ArrayBuffer` (zero-copy) via a `start`/`append`/`finish` protocol. Every
+   backend call, IPC decode, and transfer is now bounded by one target's
+   data, never the whole fleet's, and each `await` in the loop yields back
+   to the browser between targets — real per-target progress
+   ("Exporting 47/130…", shown on the button itself) falls out of this for
+   free. Sequential rather than parallel on purpose, to avoid contending
+   `Manager`'s shared locks with concurrent requests at real fleet scale.
+
+### Dependencies
+
+- Added [`motion`](https://motion.dev/) (MIT) — drag-to-reorder.
+- Added [`html-to-image`](https://github.com/bubkoo/html-to-image) (MIT) —
+  Traceroute PNG export.
+- **`xlsx` (SheetJS, Apache-2.0) is installed from SheetJS's own CDN
+  (`cdn.sheetjs.com`), not the npm registry.** The npm-published build is
+  permanently frozen on an old release with two known high-severity
+  vulnerabilities — prototype pollution
+  ([GHSA-4r6h-8v6p-xvw6](https://github.com/advisories/GHSA-4r6h-8v6p-xvw6))
+  and ReDoS
+  ([GHSA-5pgg-2g8v-p4x9](https://github.com/advisories/GHSA-5pgg-2g8v-p4x9))
+  — because SheetJS stopped publishing fixed releases to npm after a policy
+  dispute; the CDN is their own documented distribution channel for current
+  versions. This requires `tauri-app/.npmrc`'s `allow-remote=all`: recent npm
+  versions default to refusing any dependency specified as a raw tarball
+  URL (a good default in general, and exactly what this one dependency
+  intentionally does). Two practical consequences documented in `.npmrc`'s
+  own comment and `README.md`: `npm install`/`npm ci` needs outbound access
+  to `cdn.sheetjs.com`, not just the npm registry; and `.npmrc` must actually
+  be committed for a fresh clone (including CI) to have it.
+
+## 0.9.5 - Real-machine compile fixes: missing deps, IPC permissions, ping pipeline, corrected firewall rules
+
+Everything in this release surfaced only once the app was actually built and run
+on real Windows hardware for the first time — several of these are pre-existing
+gaps that had no way to be caught earlier without a working Rust/Windows
+toolchain to compile against.
+
+- **Fixed: two plugins referenced in code but never actually declared as
+  dependencies.** `tauri_plugin_dialog::init()` was called in `lib.rs` with no
+  `tauri-plugin-dialog` entry in `Cargo.toml`; `@tauri-apps/plugin-dialog` was
+  imported in `tauri-bridge.js` with no matching `package.json` entry. Both
+  failed the build/dev-server outright with clear errors once actually compiled.
+- **Fixed: Ping tab produced no output at all**, from two independent bugs that
+  both hid behind "the process runs fine in the background, the UI just never
+  updates":
+  - `core:event:allow-listen` was missing from `capabilities/default.json`,
+    so `listen('np-ping-line', ...)` rejected with a permission error — an
+    unhandled promise rejection with no user-visible feedback.
+  - `ping_start` returned a bare ID string instead of `{ id, cmd }`; the
+    frontend's `res.id` access on a plain string silently evaluated to
+    `undefined`, so the `id === idRef.current` correlation check between
+    streamed events and the active ping session never matched, ever.
+  - Also fixed: streamed ping lines rendered as one run-on block with no line
+    breaks — sibling `<span>` elements with nothing between them don't get
+    separated by `<pre>`'s whitespace preservation, since there was no
+    whitespace there to preserve. And: clicking Ping with an empty host field
+    did nothing, with zero feedback.
+- **Fixed: Cargo workspace mis-resolution.** `cargo` searches parent
+  directories for a workspace root when none is declared in the current
+  package, so any unrelated `Cargo.toml` sitting in a parent folder (e.g.
+  wherever this repo happens to be extracted to) was silently mistaken for
+  this project's own workspace, producing a confusing "can't find library
+  netpulse_lib" error. Fixed with an explicit empty `[workspace]` table.
+- **Fixed: window un-maximize/resize corruption on every Windows focus-regain.**
+  The WebView2 stale-frame repaint workaround (added this cycle — see 0.9.4)
+  called `set_size()` unconditionally on `Focused(true)`. `inner_size()` while
+  a window is maximized returns the maximized (near-fullscreen) dimensions,
+  not a separate "restore" size — Tauri's window API has no way to read the
+  true pre-maximize size at that point. Reapplying that fullscreen size via
+  `set_size()` (which itself un-maximizes) permanently corrupted the window's
+  remembered restore size: every later un-maximize, even a manual one, snapped
+  to fill the screen, and since this fired on every focus-regain it repeated,
+  visibly "popping" between states on every alt-tab. Fixed by skipping the
+  nudge entirely while maximized.
+- **Fixed: Windows Firewall NSIS hooks allowed the wrong ICMP traffic.** The
+  original rules used `icmpv4:8,any` / `icmpv6:128,any` (Echo Request only)
+  for *both* directions. That's correct outbound (sending our own probes) but
+  wrong inbound — it only let *other hosts* ping `netpulse.exe`, not the
+  actual Echo Reply / Time Exceeded / Destination Unreachable traffic
+  traceroute needs back. Windows Firewall's normal "allow replies to my own
+  outbound request" connection tracking doesn't help here either, since
+  traceroute's replies come from a *different* host at every hop, not the
+  final destination the packet was addressed to — which is exactly why an
+  explicit, type-unrestricted inbound rule is required at all. Corrected to
+  unrestricted `protocol=icmpv4`/`icmpv6` in both directions, still scoped to
+  `netpulse.exe` specifically via `program=`, not a system-wide allow.
+- **New: Linux raw-ICMP permission automated for real, not just documented.**
+  A `.deb` postinst script (`setcap cap_net_raw+ep` on the installed binary)
+  is spliced into the already-built `.deb` as a release-workflow post-build
+  step, since Tauri's bundler has no config surface for maintainer scripts at
+  all (confirmed against the open upstream issue tauri-apps/tauri#8993).
+  Verified against a real mock `.deb` built and read back by `dpkg-deb`
+  itself, not just written blind — same one-time-at-install-elevation pattern
+  as the Windows NSIS hooks, no `sudo`/root needed at every launch. AppImage
+  and macOS still need a manual one-time step: AppImage has no install
+  step to hook into at all, and macOS's real fix needs a paid Apple Developer
+  account for a signed privileged helper, which the project doesn't have yet.
+- **New: "Force recheck" restored to the Tauri app.** Fully wired at the
+  Rust/bridge layer (`force_recheck` command, `forceRecheck` bridge function,
+  capability grant) but had no UI trigger anywhere in `tauri-app/src/App.jsx`
+  — apparently never ported over from the sibling `web/src/App.jsx` during the
+  original Tauri migration. Menu item, per-target sidebar button, and main
+  detail-panel button all restored, matching the web app's implementation
+  exactly (non-destructive on-demand route re-verification, with a brief
+  local "recheck requested…" pulse for immediate feedback since the engine
+  doesn't reset any state for `isDiscovering()` to react to).
+- **Fixed: DNS lookups silently failed on restrictive networks.**
+  `hickory-resolver`'s `ResolverConfig::default()` hardcodes Google's public
+  DNS servers (8.8.8.8/8.8.4.4) rather than reading the system's actual
+  configured resolver — on a network that only permits the system-configured
+  DNS server (the same class of restrictive setup that blocked ICMP on some
+  test machines), direct queries to those hardcoded external servers were
+  silently blocked while `nslookup`/browsers worked fine via the properly
+  allowed system resolver. Switched to `Resolver::builder_tokio()`.
+- **Fixed: sidebar target card's secondary line (IP/type/probe-interval) sat
+  visibly out of alignment with the status lamps above it**, in both compact
+  and dashboard layouts. Root cause was structural, not cosmetic: `.tc-dest`
+  was nested inside `.tc-id`, stacked directly under `.tc-name` — so its
+  left edge inherited wherever the bold, proportional-font name text
+  happened to start, while `.tc-name` and `.tc-dest` render in different
+  fonts/sizes with different left side-bearing, and neither position had
+  any relationship to where `.signal` (the lamps) actually sits. Moved
+  `.tc-dest`/`.tc-error` out of `.tc-id` into a new sibling `.tc-subrow`,
+  indented by `calc(20px + 10px)` — `.drag-handle`'s fixed width plus
+  `.tc-row1`'s flex gap, both constants — so it lines up under the lamps
+  in every mode regardless of font metrics or selection state.
+- **Fixed: `.tc-dest` rendered at full `--text` brightness instead of
+  muted.** Its className included a literal `muted` class, but no CSS rule
+  for a bare `.muted` exists outside `.drawer`/`.update-banner` scopes, so
+  it silently did nothing. Given an explicit `color: var(--muted)`.
+  Also dropped `font-mono` from this line and a duplicated space+margin gap
+  before the family label, to match the plain, non-monospace `text-faint
+  text-[11px]` styling the original (pre-Tauri) sidebar used for the same
+  line.
+- **Fixed: selected-card accent bar sat flush against the card edge with no
+  breathing room, and read as too thin.** `left`/`width` were hardcoded to
+  5px/3px; both are now `--tc-accent-bar-left`/`--tc-accent-bar-width`
+  (8px/5px), and selected compact cards get `--tc-sel-extra-indent` (4px)
+  of extra left padding beyond the shared 18px gutter so the bar has
+  visible space before the drag handle.
+- **Fixed: card-reorder drag animation visually corrupted uninvolved rows
+  when 3+ targets were present.** `useFlipAnimation`'s FLIP hook called
+  `Element.animate()` on every reordered row without ever canceling a
+  still-running animation from a previous swap. A fast drag across several
+  cards can trigger a second swap on the same row before its first 260ms
+  animation finishes; the Web Animations API doesn't blend two independent
+  `transform` animations on one element sanely, so the row visibly snapped
+  toward whichever animation was winning that frame — which looked like
+  unrelated cards jumping to the opposite side of the one actually being
+  dragged. Fixed by tracking the in-flight `Animation` per row and calling
+  `.cancel()` on it before starting a new one.
+- **Fixed: "Save list (.npulse)" / "Export JSON" wrote targets in raw
+  engine order, not the user's manually drag-reordered arrangement** — the
+  export payload mapped over `targets` directly instead of sorting by
+  `customOrder`. Now sorted via the existing `orderIndex()` helper before
+  export. "Load list" previously re-added targets in file order but never
+  told `customOrder` about the new ids, so even a correctly-ordered file
+  imported into whatever order the engine happened to report the new
+  targets back in; import now captures each newly-created id in the file's
+  own order and folds it into `customOrder` afterward.
+- **New: dashboard toolbar actions.** Pause/Resume all, Save list, Export
+  JSON, and Load list previously only existed in the sidebar's stacked
+  button column (`compact` mode); the dashboard view had no equivalent.
+  Added as a row of pills at the end of the dashboard toolbar, reusing the
+  same handlers — the sidebar's stacked full-width layout doesn't suit the
+  dashboard's horizontal space, so this is a new `.dashboard-actions`
+  layout, not a copy-paste of the sidebar markup.
+- **Improved: dashboard card visual pass.** Non-compact target cards now
+  get a status-colored left accent bar (ok/warn/bad/down/discovering,
+  reusing the same state colors as the status lamps) for at-a-glance
+  scanning of a long list; the Latency metric tints to match the card's
+  overall status; the status label upgraded from plain colored text to a
+  filled pill; and card padding opened up slightly (`13px 16px 13px 18px`)
+  so the row reads less cramped.
+- **New: About box shows the real running version and a link to the
+  GitHub repo.** Previously just a title and one-line description with no
+  version number anywhere in the UI. Version is read via
+  `@tauri-apps/api/app`'s `getVersion()` (a new minimal `core:app:
+  allow-version` grant in `capabilities/default.json`) rather than a
+  hardcoded string, so it can't drift out of sync with the actual build at
+  the next release.
+
+## 0.9.4 - Tauri hardening: crash fixes, install-time permissions, auto-update
+
+- **Fixed: production-only crash on first chart render**
+  (`Cannot read properties of undefined (reading 'has')`, every installed
+  build, every machine, `tauri dev` unaffected). Root cause: the JS bundle
+  obfuscator was running over third-party library code (React, ReactDOM,
+  Recharts, D3, `@tauri-apps/api`) along with the app's own source, since
+  Vite bundles everything into one chunk by default. Control-flow flattening
+  and identifier renaming were never designed to survive being applied to
+  vendor code, and were confirmed to corrupt internal Map/Set-based library
+  logic. Fixed via `autoExcludeNodeModules: true`, scoping obfuscation to the
+  app's own `src/` files only — vendor code ships unobfuscated (no real loss,
+  it's open source already), app code stays fully obfuscated.
+- **Fixed: CSP blocked a legitimate dependency internal.** `script-src 'self'`
+  (no `unsafe-eval`) was blocking a `Function('return this')()` UMD
+  global-object-detection fallback baked into `decimal.js` (a transitive
+  dependency pulled in via Recharts) — inherent to that library's own bundled
+  source, not something the obfuscator introduced. Added `unsafe-eval`; safe
+  here since `script-src` stays `'self'`-only regardless (no remote script
+  loading possible either way).
+- **Fixed: traceroute permanently capped at the shortest path ever seen after
+  a route change** (VPN toggle, network switch, etc.) — `dest_hop_` tracked
+  the *minimum* hop the destination was ever reached at with no decay
+  mechanism, unlike the sibling `max_hop_seen_`, which already had one (with
+  a comment describing this exact failure mode almost verbatim). Once pinned,
+  the engine stopped probing past that hop forever, so a shorter VPN-era path
+  permanently prevented rediscovering the real, longer path afterward. Added
+  matching staleness-based decay, reusing the existing per-hop reply
+  timestamps.
+- **Fixed: false-positive "routing loop" warning for two adjacent hops sharing
+  one address** — confirmed benign against Windows' own `tracert` (common for
+  MPLS/tunnel hops or load-balanced routers). A genuine loop requires packets
+  to actually cycle, which needs at least a 2-hop gap to be structurally
+  possible; now requires that gap before considering it loop evidence at all.
+- **Fixed: a reply from a private/CGNAT address could be misattributed as
+  reaching a public destination**, permanently pinning discovery at hop 1
+  (the LAN gateway) — raw ICMP sockets receive all ICMP traffic on the
+  interface, not just replies to this app's own probes, so a coincidental
+  id/sequence collision with unrelated traffic could get misattributed to the
+  pending-probe table. Added a defensive invariant rejecting this regardless
+  of the underlying mechanism: a private address can never legitimately mean
+  a public target was reached, full stop.
+- **New: Windows Firewall exceptions added automatically via NSIS installer
+  hooks**, scoped to `netpulse.exe` specifically — no more silently-blocked
+  ICMP on machines with a restrictive default firewall profile (confirmed on
+  at least two test PCs), and no UAC prompt needed at every app launch, since
+  the installer is already elevated to write to Program Files.
+- **New: auto-update via `tauri-plugin-updater`**, checking GitHub Releases
+  directly with no separate hosting infrastructure needed. The update
+  manifest (`latest.json`) is generated by a custom release-workflow script
+  rather than `tauri-action`'s own built-in generator, to avoid a real
+  architectural conflict: that generator needs the action to manage the
+  GitHub Release itself (its own token, its own tag/release creation), which
+  collides with this project's deliberate build-only-then-separately-publish
+  pipeline (see 0.9.1's Electron-era equivalent fix for the same class of
+  problem).
+- **Raw ICMP toggle removed from the UI.** Confirmed Windows has no
+  unprivileged ICMP socket path at all — `SOCK_DGRAM + IPPROTO_ICMP` isn't
+  supported by Winsock, unlike Linux's `ping_group_range` mechanism — so the
+  toggle was either a no-op or actively misleading depending on state. Raw
+  stays on unconditionally, on every platform.
+
 ## 0.9.2 - Pause/resume sync fix + free code-signing guide
 
 - **Fixed: hop-level pause buttons out of sync with target-level pause.** The hop-pause

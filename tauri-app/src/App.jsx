@@ -1144,20 +1144,50 @@ export default function App() {
 
   // Captures the currently-shown latency chart as PNG bytes (a Promise
   // wrapper around the canvas/blob callback dance), used by exportPng below.
-  const captureChartPng = () => new Promise((resolve) => {
+  const captureChartPng = () => new Promise((resolve, reject) => {
     const svg = chartRef.current?.querySelector('svg')
     if (!svg) { resolve(null); return }
-    const xml = new XMLSerializer().serializeToString(svg)
+    // getBoundingClientRect(), not clientWidth/clientHeight — more reliable
+    // across environments, and gives fractional precision recharts'
+    // ResponsiveContainer actually rendered at.
+    const rect = svg.getBoundingClientRect()
+    const w = Math.max(1, Math.round(rect.width))
+    const h = Math.max(1, Math.round(rect.height))
+    // Clone rather than mutate the live chart, and explicitly bake width/
+    // height IN AS XML ATTRIBUTES on the clone before serializing. The live
+    // SVG's actual pixel size comes from ResponsiveContainer's own
+    // ResizeObserver-based measurement of its parent container — that
+    // sizing context doesn't necessarily survive being serialized out into
+    // a standalone data: URI image with no parent to measure against,
+    // which is a well-known cause of an SVG rasterizing at some fallback
+    // size (sometimes 0×0) instead of the size it actually appeared at —
+    // this is almost certainly why some environments produced a blank PNG.
+    const clone = svg.cloneNode(true)
+    clone.setAttribute('width', String(w))
+    clone.setAttribute('height', String(h))
+    if (!clone.getAttribute('viewBox')) clone.setAttribute('viewBox', `0 0 ${w} ${h}`)
+    const xml = new XMLSerializer().serializeToString(clone)
     const img = new Image()
     img.onload = () => {
-      const c = document.createElement('canvas'); c.width = svg.clientWidth * 2; c.height = svg.clientHeight * 2
-      const ctx = c.getContext('2d'); ctx.fillStyle = '#0e1116'; ctx.fillRect(0, 0, c.width, c.height); ctx.scale(2, 2); ctx.drawImage(img, 0, 0)
-      c.toBlob(async (blob) => {
-        if (!blob) { resolve(null); return }
-        resolve(new Uint8Array(await blob.arrayBuffer()))
-      }, 'image/png')
+      // decode(), not just onload — onload can fire once the image's
+      // intrinsic size is known, before the browser has necessarily
+      // finished rasterizing complex nested SVG content (recharts' text
+      // labels, tooltips, grid lines); decode() specifically guarantees
+      // the image is fully ready to draw. This is the same pattern
+      // html-to-image's own internals use for exactly this reason (see
+      // exportHopsTablePng's comment above for what tracing that source
+      // turned up).
+      const ready = img.decode ? img.decode() : Promise.resolve()
+      ready.then(() => {
+        const c = document.createElement('canvas'); c.width = w * 2; c.height = h * 2
+        const ctx = c.getContext('2d'); ctx.fillStyle = '#0e1116'; ctx.fillRect(0, 0, c.width, c.height); ctx.scale(2, 2); ctx.drawImage(img, 0, 0)
+        c.toBlob(async (blob) => {
+          if (!blob) { reject(new Error('Canvas produced no image data')); return }
+          resolve(new Uint8Array(await blob.arrayBuffer()))
+        }, 'image/png')
+      }).catch(reject)
     }
-    img.onerror = () => resolve(null)
+    img.onerror = () => reject(new Error('Failed to rasterize the chart (the browser could not load the serialized SVG)'))
     img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(xml)))
   })
   const exportPng = async () => {

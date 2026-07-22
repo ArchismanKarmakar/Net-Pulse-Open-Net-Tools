@@ -107,4 +107,23 @@ jobs:
 
       - name: tauri build (packaging smoke test)
         working-directory: tauri-app
-        run: npx tauri build
+        shell: bash
+        # --config overrides createUpdaterArtifacts for JUST this invocation
+        # (Tauri merges it over the real tauri.conf.json via JSON Merge
+        # Patch) — this step exists to confirm packaging succeeds, not to
+        # produce a real signed distributable, so it has no business
+        # requiring TAURI_SIGNING_PRIVATE_KEY (which, correctly, isn't set
+        # here — that's tauri-release.yml's job). Without this, the base
+        # config's updater pubkey (needed for real releases) makes ANY bare
+        # `tauri build` fail with "a public key has been found, but no
+        # private key", on every OS in the matrix, which is exactly what
+        # this step was doing before this fix.
+        #
+        # Forced to bash explicitly (this job's other steps use whatever
+        # GitHub's default shell is per OS — bash on ubuntu/macos, but
+        # pwsh on windows-latest) so this exact command runs identically on
+        # every matrix OS, rather than depending on the embedded JSON's
+        # double-quotes surviving PowerShell's own argument reconstruction
+        # for an external process — a real inconsistency to design around,
+        # not something to assume just works.
+        run: npx tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'

@@ -93,23 +93,36 @@ jobs:
       - name: Set signing env (only if secrets are configured)
         shell: bash
         run: |
-          if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" ]; then
-            echo "TAURI_SIGNING_PRIVATE_KEY=${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" >> "$GITHUB_ENV"
-            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" >> "$GITHUB_ENV"
-          fi
-          if [ -n "${{ secrets.APPLE_CERTIFICATE }}" ]; then
-            echo "APPLE_CERTIFICATE=${{ secrets.APPLE_CERTIFICATE }}" >> "$GITHUB_ENV"
-            echo "APPLE_CERTIFICATE_PASSWORD=${{ secrets.APPLE_CERTIFICATE_PASSWORD }}" >> "$GITHUB_ENV"
-          fi
-          if [ -n "${{ secrets.APPLE_ID }}" ]; then
-            echo "APPLE_ID=${{ secrets.APPLE_ID }}" >> "$GITHUB_ENV"
-            echo "APPLE_PASSWORD=${{ secrets.APPLE_PASSWORD }}" >> "$GITHUB_ENV"
-            echo "APPLE_TEAM_ID=${{ secrets.APPLE_TEAM_ID }}" >> "$GITHUB_ENV"
-          fi
-          if [ -n "${{ secrets.WINDOWS_CERTIFICATE }}" ]; then
-            echo "WINDOWS_CERTIFICATE=${{ secrets.WINDOWS_CERTIFICATE }}" >> "$GITHUB_ENV"
-            echo "WINDOWS_CERTIFICATE_PASSWORD=${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}" >> "$GITHUB_ENV"
-          fi
+          # A plain `echo "KEY=$VALUE" >> $GITHUB_ENV` silently breaks for a
+          # multi-line value — GitHub's env-file format parses each line as
+          # its own KEY=value pair, so a value containing a newline either
+          # gets truncated to its first line or corrupts the file outright.
+          # Tauri's signing private key is exactly this shape (an
+          # "untrusted comment: ..." header line followed by the actual key
+          # data on its own line) — this is almost certainly why the build
+          # reported "no private key" even with TAURI_SIGNING_PRIVATE_KEY
+          # genuinely set as a repository secret. Using GitHub's own
+          # documented heredoc syntax for every secret here, not just the
+          # one confirmed multi-line one, so this can't recur if a
+          # certificate secret is ever stored un-encoded instead of as the
+          # conventional base64 blob.
+          set_multiline_env() {
+            local name="$1" value="$2"
+            if [ -n "$value" ]; then
+              echo "${name}<<TAURI_ENV_EOF" >> "$GITHUB_ENV"
+              echo "$value" >> "$GITHUB_ENV"
+              echo "TAURI_ENV_EOF" >> "$GITHUB_ENV"
+            fi
+          }
+          set_multiline_env TAURI_SIGNING_PRIVATE_KEY "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}"
+          set_multiline_env TAURI_SIGNING_PRIVATE_KEY_PASSWORD "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}"
+          set_multiline_env APPLE_CERTIFICATE "${{ secrets.APPLE_CERTIFICATE }}"
+          set_multiline_env APPLE_CERTIFICATE_PASSWORD "${{ secrets.APPLE_CERTIFICATE_PASSWORD }}"
+          set_multiline_env APPLE_ID "${{ secrets.APPLE_ID }}"
+          set_multiline_env APPLE_PASSWORD "${{ secrets.APPLE_PASSWORD }}"
+          set_multiline_env APPLE_TEAM_ID "${{ secrets.APPLE_TEAM_ID }}"
+          set_multiline_env WINDOWS_CERTIFICATE "${{ secrets.WINDOWS_CERTIFICATE }}"
+          set_multiline_env WINDOWS_CERTIFICATE_PASSWORD "${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}"
 
       - name: tauri-action build
         id: tauri-build

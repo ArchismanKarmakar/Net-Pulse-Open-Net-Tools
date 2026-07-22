@@ -1145,7 +1145,21 @@ export default function App() {
   // Captures the currently-shown latency chart as PNG bytes (a Promise
   // wrapper around the canvas/blob callback dance), used by exportPng below.
   const captureChartPng = () => new Promise((resolve, reject) => {
-    const svg = chartRef.current?.querySelector('svg')
+    // Recharts renders one small icon <svg class="recharts-surface"> per
+    // legend entry, in addition to the actual chart's own <svg
+    // class="recharts-surface"> — both share the same class, so a plain
+    // querySelector('svg') can match a legend icon instead of the chart
+    // once there are several legend entries (confirmed directly via
+    // DevTools: with overlay-all-hops on, this was grabbing an svg with
+    // aria-label="hop 1 legend icon", a 14×14 icon — which is exactly why
+    // the exported PNG was a tiny dot instead of the chart). The main
+    // plotting surface is always a direct child of .recharts-wrapper;
+    // legend icons are nested deeper inside .recharts-legend-wrapper — the
+    // direct-child combinator picks the right one unambiguously, rather
+    // than relying on document order (which isn't guaranteed and is
+    // exactly what broke here).
+    const svg = chartRef.current?.querySelector(':scope .recharts-wrapper > svg.recharts-surface')
+      || chartRef.current?.querySelector('svg')
     if (!svg) { resolve(null); return }
     // getBoundingClientRect(), not clientWidth/clientHeight — more reliable
     // across environments, and gives fractional precision recharts'

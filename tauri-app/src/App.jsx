@@ -1120,7 +1120,17 @@ export default function App() {
   const { yDomain, clippedSpikes } = useMemo(() => {
     const vals = []
     for (const row of chartData) for (const k in row) if (k !== 'ts' && row[k] != null) vals.push(row[k])
-    if (!vals.length || !clipOutliers) return { yDomain: [0, 'auto'], clippedSpikes: 0 }
+    // Overlay mode mixes several hops' values together, and different hops
+    // have legitimately different baseline latencies (a near hop and the
+    // destination aren't "outliers" of each other, they're just different
+    // points on the path) — a single combined median across all of them
+    // isn't a meaningful "typical value" the way it is for one hop's own
+    // history. Skip clipping entirely here rather than compute a threshold
+    // that would silently push an entire hop's normal data off the top of
+    // the chart (confirmed: this is exactly what was happening — a
+    // low near-hop-weighted median was clipping the destination hop's
+    // completely ordinary ~30ms readings out of the visible range).
+    if (!vals.length || !clipOutliers || overlay) return { yDomain: [0, 'auto'], clippedSpikes: 0 }
     vals.sort((a, b) => a - b)
     const max = vals[vals.length - 1]
     // Median-based ratio test instead of a percentile INDEX (e.g. 95th
@@ -1139,13 +1149,27 @@ export default function App() {
     if (max <= baseline * 6 || max < 100) return { yDomain: [0, 'auto'], clippedSpikes: 0 }
     const top = Math.max(Math.ceil(baseline * 3), 10)
     return { yDomain: [0, top], clippedSpikes: vals.filter((v) => v > top).length }
-  }, [chartData, clipOutliers])
+  }, [chartData, clipOutliers, overlay])
 
 
   // Captures the currently-shown latency chart as PNG bytes (a Promise
   // wrapper around the canvas/blob callback dance), used by exportPng below.
   const captureChartPng = () => new Promise((resolve, reject) => {
-    const svg = chartRef.current?.querySelector('svg')
+    // Recharts renders one small icon <svg class="recharts-surface"> per
+    // legend entry, in addition to the actual chart's own <svg
+    // class="recharts-surface"> — both share the same class, so a plain
+    // querySelector('svg') can match a legend icon instead of the chart
+    // once there are several legend entries (confirmed directly via
+    // DevTools: with overlay-all-hops on, this was grabbing an svg with
+    // aria-label="hop 1 legend icon", a 14×14 icon — which is exactly why
+    // the exported PNG was a tiny dot instead of the chart). The main
+    // plotting surface is always a direct child of .recharts-wrapper;
+    // legend icons are nested deeper inside .recharts-legend-wrapper — the
+    // direct-child combinator picks the right one unambiguously, rather
+    // than relying on document order (which isn't guaranteed and is
+    // exactly what broke here).
+    const svg = chartRef.current?.querySelector(':scope .recharts-wrapper > svg.recharts-surface')
+      || chartRef.current?.querySelector('svg')
     if (!svg) { resolve(null); return }
     // getBoundingClientRect(), not clientWidth/clientHeight — more reliable
     // across environments, and gives fractional precision recharts'
@@ -1225,6 +1249,22 @@ export default function App() {
   // rendering through an SVG foreignObject — the browser's own CSS engine
   // paints it, rather than the library re-implementing CSS color parsing —
   // so it handles this app's actual stylesheet correctly.
+  // Decodes a data: URL directly to bytes (base64 → Uint8Array) without
+  // fetch(). fetch() on a data: URL is a `connect-src` CSP check — this
+  // app's CSP (connect-src 'self' ipc: http://ipc.localhost https:)
+  // doesn't list `data:`, so fetch(dataUrl) is silently blocked by the
+  // browser's own CSP enforcement (confirmed directly from a DevTools
+  // console error, not inferred). atob() is a plain synchronous string
+  // API with no network request involved, so no CSP category applies to
+  // it — this is the correct way to turn a data: URL into bytes inside a
+  // CSP'd app, not a workaround.
+  const dataUrlToBytes = (dataUrl) => {
+    const base64 = dataUrl.slice(dataUrl.indexOf(',') + 1)
+    const binary = atob(base64)
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+    return bytes
+  }
   const exportHopsTablePng = async () => {
     if (!sel) return
     if (!hopTableRef.current) {
@@ -1253,8 +1293,7 @@ export default function App() {
         toPng(hopTableRef.current, { backgroundColor: '#0e1116', pixelRatio: 2, skipFonts: true }),
         new Promise((_, reject) => setTimeout(() => reject(new Error('Timed out capturing the hop table as an image (this can happen on some Windows systems if WebView2 needs updating).')), 12000)),
       ])
-      const res = await fetch(dataUrl)
-      const bytes = new Uint8Array(await res.arrayBuffer())
+      const bytes = dataUrlToBytes(dataUrl)
       await saveViaDialog(`netpulse_traceroute_${sanitizeFilename(sel.name)}.png`, [{ name: 'PNG image', extensions: ['png'] }], bytes)
     } catch (e) {
       await showModal({ title: 'Export failed', message: String(e?.message || e) })

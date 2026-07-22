@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-export-all-targets-csv"
+description = "Enables the export_all_targets_csv command without any pre-configured scope."
+commands.allow = ["export_all_targets_csv"]
+
+[[permission]]
+identifier = "deny-export-all-targets-csv"
+description = "Denies the export_all_targets_csv command without any pre-configured scope."
+commands.deny = ["export_all_targets_csv"]

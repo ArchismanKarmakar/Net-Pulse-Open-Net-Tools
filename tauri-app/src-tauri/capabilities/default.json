@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Net Pulse's complete IPC surface. Every command the frontend can invoke is named explicitly here — nothing else is reachable, mirroring the old Electron contextBridge allowlist (see preload.js in the legacy electron/ app) but enforced by Tauri's own permission system instead of a hand-written bridge object. No built-in Tauri capabilities (fs, shell, http, dialog, etc.) are granted — this app doesn't need any of them; every network operation goes through the app's own commands below, not a generic plugin.",
+  "description": "Net Pulse's complete IPC surface. Every command the frontend can invoke is named explicitly here — nothing else is reachable, mirroring the old Electron contextBridge allowlist (see preload.js in the legacy electron/ app) but enforced by Tauri's own permission system instead of a hand-written bridge object. Almost no built-in Tauri capabilities are granted — deliberate exceptions are tauri-plugin-dialog's save/open permissions (native Save As / Open dialogs for the .npulse target-list format), scoped to exactly those two operations; the updater/process plugins (check-for-updates + relaunch after install); core:event's listen permission (ping's streaming output — np-ping-line/np-ping-done — is delivered via Tauri's event system, which needs this even though the events themselves are app-defined, not a built-in Tauri feature); and core:app's version-read permission (the About box shows the real bundled version instead of a hand-typed string that could drift out of sync at release time). Every network operation still goes through the app's own commands below, not a generic plugin.",
   "windows": ["main"],
   "permissions": [
     "allow-add-target",
@@ -9,13 +9,25 @@
     "allow-pause-target",
     "allow-stop-target",
     "allow-remove-target",
+    "allow-force-recheck",
     "allow-get-state",
     "allow-list-interfaces",
+    "allow-export-target-csv",
+    "allow-export-all-targets-csv",
     "allow-engine-build",
     "allow-dns-lookup",
     "allow-reverse-lookup",
     "allow-port-scan",
     "allow-ping-start",
-    "allow-ping-stop"
+    "allow-ping-stop",
+    "allow-write-file",
+    "allow-read-file",
+    "dialog:allow-save",
+    "dialog:allow-open",
+    "updater:default",
+    "process:allow-restart",
+    "core:event:default",
+    "core:event:allow-listen",
+    "core:app:allow-version"
   ]
 }

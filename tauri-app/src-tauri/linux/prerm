@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+# No explicit cleanup needed — the capability is an extended attribute on
+# the binary file itself, and dpkg removes that file on uninstall regardless.
+# This script exists for symmetry with postinst / to avoid dpkg lint
+# warnings about an unpaired maintainer script, not because there's state to
+# revert.
+exit 0

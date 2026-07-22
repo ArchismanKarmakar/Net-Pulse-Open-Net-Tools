@@ -73,6 +73,32 @@
      selection bar uncoloured → it looked black). Define them for dark too. */
   --target-card-accent-bg: color-mix(in srgb, var(--accent) 14%, var(--panel));
   --target-card-accent-bar: var(--accent);
+  /* Extra left padding applied ONLY to a selected compact card, on top of
+     the shared 18px gutter — gives the accent bar visible breathing room
+     from the drag handle instead of both states sharing one fixed indent.
+     This intentionally means content shifts right slightly the moment a
+     card is selected; `.target-card`'s `padding .3s ease` transition (see
+     that rule) animates the shift instead of letting it jump. */
+  --tc-sel-extra-indent: 4px;
+  /* Accent bar (the vertical cyan line on a selected compact card) — was
+     hardcoded to left:5px / width:3px, sitting right against the card
+     edge and reading as too thin. Both tunable here; bump either up/down
+     a px or two if it's still not quite right rather than hunting through
+     the ::before rule. */
+  --tc-accent-bar-left: 8px;
+  --tc-accent-bar-width: 5px;
+  /* Vertical gap between .tc-row1 and .tc-subrow. .tc-row1's own box is
+     taller than its text (20px drag-handle vs. ~17px text line-height),
+     so the visible gap was reading as bigger than this number alone
+     suggests — .tc-subrow's negative margin-top (see that rule) is what
+     actually pulls it in close; this var is the remaining breathing room. */
+  --tc-row-gap: 0px;
+  /* Slow–very-fast–slow S-curve for the dashboard⇄open-target transition
+     family (panel width, card collapse, detail-pane entrance) — a much
+     steeper hold-at-both-ends-and-rush-through-the-middle shape than a
+     standard ease-in-out, closer to how a montage cut reads: a beat of
+     anticipation, a fast whip through the middle, a beat of settle. */
+  --ease-montage: cubic-bezier(0.83, 0, 0.17, 1);
 }
 :root[data-theme=light] {
   --bg:#e8edf3; --panel:#ffffff; --panel2:#eaeff5; --input-bg:#ffffff;
@@ -107,12 +133,18 @@
   :root { color-scheme: dark; }
   :root[data-theme=light] { color-scheme: light; }
   * { box-sizing: border-box; }
-  html, body, #root { margin: 0; height: 100%; }
+  html, body, #root { margin: 0; height: 100%; overflow: hidden; }
   body { @apply bg-bg text-ink antialiased; font: 14px/1.45 var(--font-sans); }
   h1 { @apply m-0 text-[17px] font-semibold tracking-tight; }
   button { @apply bg-btnbg border border-border2 text-ink rounded-lg px-2.5 py-1.5 cursor-pointer; transition: background-color .12s, box-shadow .12s, transform .08s; }
   button:hover { @apply bg-btnhover; box-shadow: var(--shadow-sm); }
   button:active { transform: translateY(0.5px); }
+  /* Icon-only buttons (the per-target export row) — same base look as a
+     normal button, just square/centered instead of text-shaped padding.
+     The icon SVGs use fill="currentColor" (MaterialIcons.jsx), so they
+     pick up this same color rule automatically in both themes. */
+  button.icon-btn { @apply px-1.5 py-1.5 inline-flex items-center justify-center; }
+  button.icon-btn:hover { color: var(--accent); }
   button:focus-visible, select:focus-visible, input:focus-visible { @apply outline-none ring-2 ring-accent; }
   /* Broad selector (not just [type=text]) so an input that's missing an
      explicit `type` attribute is never left unstyled — this is exactly what
@@ -130,11 +162,12 @@
 
 @layer components {
   /* ---- app shell ---- */
-  .app { @apply flex flex-col h-screen; background-image: radial-gradient(1200px 600px at 15% -10%, color-mix(in srgb, var(--accent) 5%, transparent), transparent 60%); }
+  .app { @apply flex flex-col h-screen overflow-hidden; background-image: radial-gradient(1200px 600px at 15% -10%, color-mix(in srgb, var(--accent) 5%, transparent), transparent 60%); }
   header { @apply bg-panel border-b border-border px-3.5 py-2.5; box-shadow: var(--shadow-sm); position: relative; z-index: 20; }
   .body { @apply flex-1 flex min-h-0; }
   main { @apply flex-1 flex flex-col min-w-0 p-2.5 gap-2.5; }
   .empty { @apply m-auto text-faint text-sm; }
+  .link-btn { @apply ml-2 underline; background: none; border: none; padding: 0; cursor: pointer; font: inherit; color: var(--accent); }
 
   /* ---- header controls ---- */
   .controls { @apply flex flex-wrap gap-2 items-center; }
@@ -150,9 +183,384 @@
   :root[data-theme=light] button.primary, :root[data-theme=light] .apply { background: var(--accent); border-color: var(--accent); color: #ffffff; }
   :root[data-theme=light] button.primary:hover, :root[data-theme=light] .apply:hover { filter: brightness(1.05); }
 
-  /* ---- targets sidebar ---- */
-  aside { @apply w-[230px] border-r border-border p-2.5 flex flex-col gap-2; background: var(--panel); }
-  aside h3 { @apply m-0 text-[11px] text-muted uppercase tracking-wider; }
+  /* ---- Unified target panel ----
+     ONE persistent element for both the full-width dashboard and the
+     narrow open-target strip — not two components swapped for each other.
+     Toggling .compact (and the inline width, set to sidebarWidth in JS)
+     is what makes this a genuine width transition: the detail pane is a
+     flex:1 sibling, so it grows into whatever space this gives up on every
+     animation frame for free, no extra code needed on that side. */
+  .target-panel {
+    width: 100%; flex-shrink: 0; position: relative;
+    display: flex; flex-direction: column; overflow: auto;
+    padding: 20px; gap: 16px;
+    /* Width-only transition, isolated to this element. Dashboard-open/close
+       animation lives here; drag-resize disables it via .resizing below. */
+    transition: width .4s var(--ease-montage);
+    contain: layout paint;
+  }
+  .target-panel.compact {
+    width: 300px; padding: 10px; gap: 8px;
+    border-right: 1px solid var(--border); background: var(--panel);
+  }
+  /* Drag-resize: width is written straight to the DOM every rAF; any CSS
+     transition on width would fight that and read as lag. Kill it hard
+     (also on descendants that might animate as a knock-on) until the
+     drag ends and React restores the smooth open/close animation. */
+  .target-panel.resizing,
+  .target-panel.resizing * { transition: none !important; animation: none !important; }
+  .target-panel.resizing { will-change: width; }
+  .target-panel-toolbar { @apply flex items-center gap-2; }
+  .target-panel-list { display: flex; flex-direction: column; gap: 8px; }
+
+  aside h3, .strip-head h3 { @apply m-0 text-[11px] text-muted uppercase tracking-wider; }
+  .strip-head { @apply flex items-center justify-between gap-1.5; }
+  .strip-back {
+    @apply shrink-0 text-[11px] px-1.5 py-1 rounded-md;
+    background: transparent; border: 1px solid var(--border2); color: var(--muted);
+  }
+  .strip-back:hover { background: var(--btn-hover); color: var(--ink); box-shadow: none; }
+  .strip-counts { @apply flex gap-1.5 text-[11px] font-mono; }
+  .strip-counts .sc-ok { color: var(--good); }
+  .strip-counts .sc-warn { color: var(--warn); }
+  .strip-counts .sc-down { color: var(--danger); }
+  /* dashboard filter/sort */
+  .dash-search { @apply flex-1 min-w-0 text-xs; padding: 5px 8px 5px 24px; border-radius: 7px; border: 1px solid var(--border2); background: var(--input-bg); color: var(--text); }
+  .dash-search::placeholder { color: var(--faint); }
+  .dash-search:focus { outline: none; border-color: var(--accent); }
+  .dash-empty { @apply text-xs text-center py-3; cursor: default; }
+
+  /* ── Summary cards + sort/search head row (full mode only) ──────────── */
+  .dashboard-head { @apply flex items-start justify-between flex-wrap gap-3; }
+  .dashboard-cards { @apply flex flex-wrap items-stretch gap-3; }
+  .dcard {
+    @apply rounded-lg px-3 py-2 min-w-[92px] flex items-center gap-2;
+    background: var(--panel2); border: 1px solid var(--border);
+    transition: transform .12s, box-shadow .12s, border-color .12s;
+    font: inherit; text-align: left; cursor: pointer;
+  }
+  .dcard:hover { transform: translateY(-1px); box-shadow: var(--shadow-md); border-color: var(--border2); }
+  .dcard-ok.dcard-active { box-shadow: 0 0 0 1.5px var(--good) inset; }
+  .dcard-settling.dcard-active { box-shadow: 0 0 0 1.5px var(--lime) inset; }
+  .dcard-warn.dcard-active { box-shadow: 0 0 0 1.5px var(--warn-soft) inset; }
+  .dcard-bad.dcard-active { box-shadow: 0 0 0 1.5px var(--bad) inset; }
+  .dcard-down.dcard-active { box-shadow: 0 0 0 1.5px var(--danger) inset; }
+  .dcard-discovering.dcard-active { box-shadow: 0 0 0 1.5px var(--accent) inset; }
+  .dcard-icon {
+    @apply flex items-center justify-center shrink-0 rounded-lg text-sm;
+    width: 26px; height: 26px; background: var(--btn-bg); color: var(--muted);
+  }
+  .dcard-body { min-width: 0; }
+  .dcard-label { @apply text-[10px] uppercase tracking-wider text-muted; white-space: nowrap; }
+  .dcard-value { @apply text-lg font-semibold mt-0.5; font-variant-numeric: tabular-nums; }
+  .dcard-ok { background: color-mix(in srgb, var(--good) 8%, var(--panel2)); }
+  .dcard-ok .dcard-icon { background: color-mix(in srgb, var(--good) 25%, transparent); color: var(--good); }
+  .dcard-ok .dcard-value { color: var(--good); }
+  .dcard-settling { background: color-mix(in srgb, var(--lime) 8%, var(--panel2)); }
+  .dcard-settling .dcard-icon { background: color-mix(in srgb, var(--lime) 25%, transparent); color: var(--lime); }
+  .dcard-settling .dcard-value { color: var(--lime); }
+  .dcard-warn { background: color-mix(in srgb, var(--warn-soft) 8%, var(--panel2)); }
+  .dcard-warn .dcard-icon { background: color-mix(in srgb, var(--warn-soft) 25%, transparent); color: var(--warn-soft); }
+  .dcard-warn .dcard-value { color: var(--warn-soft); }
+  .dcard-bad { background: color-mix(in srgb, var(--bad) 8%, var(--panel2)); }
+  .dcard-bad .dcard-icon { background: color-mix(in srgb, var(--bad) 25%, transparent); color: var(--bad); }
+  .dcard-bad .dcard-value { color: var(--bad); }
+  .dcard-down { background: color-mix(in srgb, var(--danger) 8%, var(--panel2)); }
+  .dcard-down .dcard-icon { background: color-mix(in srgb, var(--danger) 25%, transparent); color: var(--danger); }
+  .dcard-down .dcard-value { color: var(--danger); }
+  .dcard-discovering { background: color-mix(in srgb, var(--accent) 8%, var(--panel2)); }
+  .dcard-discovering .dcard-icon { background: color-mix(in srgb, var(--accent) 25%, transparent); color: var(--accent); }
+  .dcard-discovering .dcard-value { color: var(--accent); }
+
+  /* Two lamp-based groups (destination / path), each a labelled cluster of
+     small cards, visually distinct from the lone "Targets" total card. */
+  .dcard-group { display: flex; flex-direction: column; gap: 4px; }
+  .dcard-group-label { @apply text-[10px] uppercase tracking-wider text-faint; padding-left: 2px; }
+  .dcard-group-cards { display: flex; flex-wrap: wrap; gap: 6px; }
+  .dcard-group .dcard { min-width: 68px; padding: 6px 9px; gap: 5px; }
+  .dcard-group .dcard-icon { width: 18px; height: 18px; font-size: 10px; }
+  .dcard-group .dcard-value { @apply text-base; }
+  .dashboard-toolbar { @apply flex flex-col items-end gap-1.5 shrink-0; }
+  .dash-search-row { @apply flex items-center gap-3; }
+  .dash-search-wrap { position: relative; display: flex; flex: 1; align-items: center; min-width: 0; }
+  .dash-search-icon { position: absolute; left: 8px; font-size: 11px; opacity: .55; pointer-events: none; }
+  .dash-search-lg { @apply text-sm; padding: 8px 12px 8px 30px; border-radius: 9px; border: 1px solid var(--border2);
+    background: var(--input-bg); color: var(--text); width: 240px; max-width: 100%; }
+  .dash-search-lg::placeholder { color: var(--faint); }
+  .dash-search-lg:focus { outline: none; border-color: var(--accent); }
+  .dash-count { @apply text-[12.5px] whitespace-nowrap; }
+
+  /* ── Sort bar (pills) — used in both full and compact mode ───────────── */
+  .sort-bar { @apply flex flex-wrap items-center justify-end gap-1.5; }
+  .sort-bar-label { @apply text-[11px] uppercase tracking-wider text-faint mr-1; }
+  .sort-pill {
+    @apply text-[12px] rounded-full px-3 py-1; background: var(--panel2); border: 1px solid var(--border2); color: var(--muted);
+  }
+  .sort-pill-icon { display: inline-block; margin-right: 4px; opacity: .8; }
+  .sort-pill:hover { background: var(--btn-hover); color: var(--ink); box-shadow: none; }
+  .sort-pill.active { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, var(--border2)); background: color-mix(in srgb, var(--accent) 10%, var(--panel2)); }
+  .sort-pill .sort-arrow { color: var(--accent); margin-left: 2px; }
+
+  /* ── Dashboard toolbar actions (pause/save/export/load) — same actions
+     as the sidebar's stacked .sidebar-actions block, but the dashboard has
+     the horizontal room the sidebar doesn't, so these are laid out as a
+     row of pills (reusing .sort-pill's look) instead of full-width
+     stacked buttons. */
+  .dashboard-actions { @apply flex flex-wrap items-center justify-end gap-1.5; }
+  .dashboard-actions-divider { width: 1px; align-self: stretch; background: var(--border2); margin: 0 2px; }
+  .dash-action-pill {
+    @apply inline-flex items-center gap-1.5 text-[12px] rounded-full px-3 py-1 cursor-pointer whitespace-nowrap;
+    background: var(--panel2); border: 1px solid var(--border2); color: var(--muted);
+    transition: background-color .12s, color .12s, border-color .12s;
+  }
+  .dash-action-pill:hover { background: var(--btn-hover); color: var(--ink); }
+  .dash-action-pill.active { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, var(--border2)); background: color-mix(in srgb, var(--accent) 10%, var(--panel2)); }
+
+  /* ── Empty state ──────────────────────────────────────────────────────── */
+  .dash-empty-state { @apply flex flex-col items-center justify-center gap-1.5 text-center py-16 text-muted; }
+  .dash-empty-state svg { opacity: .85; margin-bottom: 4px; }
+  .dash-empty-title { @apply text-lg font-semibold text-ink; }
+  .dash-guide-row { @apply flex flex-wrap items-center justify-center gap-2 mt-3; }
+  .dash-guide-row button {
+    @apply text-[12.5px] rounded-full px-3.5 py-1.5;
+    background: var(--panel2); border: 1px solid var(--border2); color: var(--muted);
+  }
+  .dash-guide-row button:hover { background: var(--btn-hover); color: var(--ink); border-color: var(--accent); box-shadow: none; }
+
+  /* ── Unified target card ──────────────────────────────────────────────
+     The SAME element in full and compact mode (TargetCard.jsx never
+     unmounts/remounts across the toggle) — only opacity/max-height/
+     max-width change, all real interpolable CSS transitions, so the card
+     genuinely resizes/reveals-or-hides content in sync with the panel's
+     own width transition instead of two different elements popping. */
+  .target-card {
+    display: flex; flex-direction: column; gap: var(--tc-row-gap);
+    padding: 10px 14px; border-radius: 12px;
+    background: var(--card-bg); border: 1px solid var(--card-border);
+    cursor: pointer;
+    position: relative; overflow: hidden;
+    transition: background-color .12s, border-color .12s, transform .1s, padding .3s ease;
+  }
+  .target-card:hover { background: var(--card-hover); border-color: var(--border2); transform: translateY(-1px); }
+  .target-card.compact { padding: 8px 10px 8px 18px; }
+  /* Selected cards get a bit of extra left padding beyond the shared 18px
+     gutter, so the accent bar (below) has visible breathing room before
+     the drag handle instead of sitting right up against it. `padding` is
+     repeated here explicitly (not just inherited from `.compact` above)
+     so nothing else in the cascade can accidentally override it for just
+     this state — only the LEFT value differs from `.compact`. */
+  .target-card.compact.sel {
+    padding: 8px 10px 8px calc(20px + var(--tc-sel-extra-indent));
+    background: color-mix(in srgb, var(--accent) 12%, var(--card-bg));
+    border: 1px solid var(--accent) !important;
+    box-shadow: var(--shadow-md);
+    z-index: 1;
+  }
+  /* Accent bar hugs the left edge with a small deliberate gutter (not flush
+     against it) before the target name. See --tc-accent-bar-left/-width
+     near :root to tune position/thickness. */
+  .target-card.compact.sel::before {
+    content: ''; position: absolute; left: var(--tc-accent-bar-left); top: 8px; bottom: 8px;
+    width: var(--tc-accent-bar-width);
+    border-radius: 999px; background: var(--accent);
+  }
+  /* Dashboard (non-compact) status accent — the compact bar above is
+     reserved for "this is the currently-open target", which has no
+     equivalent single-item concept in the dashboard's flat row list. Every
+     dashboard row gets its own health-colored bar instead, so a long list
+     is scannable by color without reading each row's status text. Flush
+     to the left edge (not inset like the compact bar) since there's no
+     drag-handle column to clear here. */
+  .target-card:not(.compact) {
+    padding: 13px 16px 13px 18px;
+    box-shadow: var(--shadow-sm);
+  }
+  .target-card:not(.compact):hover { box-shadow: var(--shadow-md); }
+  .target-card:not(.compact)::before {
+    content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+    background: var(--faint); opacity: .45;
+  }
+  .target-card:not(.compact).st-ok::before,
+  .target-card:not(.compact).st-okloss::before { background: var(--good); opacity: 1; }
+  .target-card:not(.compact).st-warn::before { background: var(--warn-soft); opacity: 1; }
+  .target-card:not(.compact).st-bad::before { background: var(--bad); opacity: 1; }
+  .target-card:not(.compact).st-down::before { background: var(--danger); opacity: 1; }
+  .target-card:not(.compact).st-discovering::before {
+    background: var(--accent); opacity: 1; animation: lamp-pulse 1.4s ease-in-out infinite;
+  }
+
+  .tc-row1 { display: flex; align-items: center; gap: 10px; min-width: 0; overflow: hidden; }
+  /* Compact mode: keep the top row on ONE line — name truncates, control
+     buttons stay flush to the top-right (matches the reference layout
+     `1.1.1.1   ok ↻ ⏸ ✕`). Previously this wrapped, pushing the controls
+     onto their own row below the name. */
+  .target-card.compact .tc-row1 { flex-wrap: nowrap; overflow: hidden; row-gap: 0; }
+  .tc-handle { flex-shrink: 0; }
+  .tc-id { flex: 1 1 140px; min-width: 70px; }
+  .target-card.compact .tc-id { min-width: 0; flex: 1 1 auto; overflow: hidden; }
+  .tc-name { @apply font-semibold text-[16px] truncate; }
+  /* Sits directly under .signal (the status lamps): 20px is .drag-handle's
+     fixed width, 10px is .tc-row1's flex gap between handle and lamps —
+     both constants regardless of compact/dashboard mode or selection, so
+     this stays pinned to the lamps' left edge instead of drifting with
+     whatever .tc-id happens to measure. */
+  .tc-subrow {
+    margin-left: calc(25px + 10px); min-width: 0;
+    /* .tc-row1 is 20px tall (set by .drag-handle, not by the text), while
+       .tc-name's own line box is only ~17px — that leftover ~3px plus the
+       flex gap above was reading as too much space before this line even
+       starts, so pull it back up rather than relying on --tc-row-gap alone. */
+    margin-top: -5px;
+  }
+  /* Matches the old sidebar's `aside li small { text-faint text-[11px] }`,
+     nudged one step brighter (--muted instead of --faint) per feedback —
+     "muted" as a literal class name has no rule outside .drawer/
+     .update-banner scopes, so this was previously rendering at full
+     --text brightness with no dimming applied at all. */
+  .tc-dest { @apply text-[12px] truncate; color: var(--muted); }
+  /* Single source of the gap before the family label — previously a literal
+     JSX space AND this margin were both present, doubling the gap between
+     the IP and "IPv4 (auto)". The space in TargetCard.jsx is removed; this
+     margin is now the only thing spacing them. */
+  .tc-dest span { @apply ml-2; }
+  .tc-cadence { white-space: nowrap; display: inline-block; overflow: hidden; transition: opacity .28s ease; opacity: 1; }
+  /* display:none, not opacity:0 — this isn't a "fade out" moment, the
+     open-target strip is a fundamentally tighter layout and this text
+     has no business reserving width it isn't showing. */
+  .target-card.compact .tc-cadence { display: none; }
+  .tc-error { color: var(--danger); font-size: 11.5px; margin-top: 2px; }
+  .tc-error.tc-warn-loop, .pstrip-error.tc-warn-loop { color: var(--warn-soft); }
+
+  /* Width-collapsing wrapper (mini-path, metric readout): a 1-column grid
+     whose column track animates between 1fr and 0fr. The column's actual
+     width always matches its content exactly (unlike a hand-picked
+     max-width), so there's nothing to overshoot or clip awkwardly at
+     either end of the transition — the grid track IS the content size. */
+  .tc-collapse-x {
+    display: grid; grid-template-columns: 1fr; flex-shrink: 0; min-width: 0;
+    transition: grid-template-columns .4s var(--ease-montage), opacity .3s ease;
+    opacity: 1;
+  }
+  .tc-collapse-x > * { overflow: hidden; min-width: 0; }
+  .target-card.compact .tc-collapse-x { grid-template-columns: 0fr; opacity: 0; }
+
+  /* min/avg/med/max/jit/pl readout — this is the compact sidebar's own
+     format (a tight, unlabeled grid sized for a 300px strip). Dashboard
+     mode uses a different, more spacious format instead — tc-full-metrics
+     below, labeled LATENCY / LOSS / JITTER / UPTIME / HOPS — so these are
+     two distinct presentations of the same numbers, not one format shown
+     at two widths. This only ever appears in compact. */
+  .tc-collapse-y {
+    display: grid; grid-template-rows: 0fr; min-height: 0;
+    transition: grid-template-rows .4s var(--ease-montage), opacity .3s ease;
+    opacity: 0;
+  }
+  .tc-collapse-y > * { overflow: hidden; min-height: 0; }
+  .target-card.compact .tc-collapse-y { grid-template-rows: 1fr; opacity: 1; }
+
+  .tc-path { flex-shrink: 0; }
+
+  .tc-actions { display: flex; align-items: center; gap: 1px; flex-shrink: 0; margin-left: auto; }
+  .target-card.compact .tc-actions button { padding-left: 3px; padding-right: 3px; }
+  .target-card.compact .card-move { padding-left: 2px; padding-right: 2px; }
+
+  .tc-compact-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px 10px;
+    font-size: 10px; font-family: ui-monospace, monospace; color: var(--muted);
+    padding-top: 6px; margin-top: 2px; border-top: 1px solid var(--border);
+  }
+  .tc-compact-grid b { color: var(--text); }
+  .tc-compact-grid b.danger { color: var(--danger); }
+
+  .tc-full-metrics { display: flex; align-items: center; gap: 16px; flex-wrap: nowrap; }
+  .tc-metrics { display: flex; align-items: center; gap: 16px; flex-shrink: 0; }
+  .tc-metric { text-align: center; min-width: 46px; }
+  .tc-metric-label { @apply text-[10px] uppercase tracking-wider text-faint; }
+  .tc-metric-value { @apply text-[14px] font-semibold mt-0.5; font-variant-numeric: tabular-nums; }
+  .tc-metric-value.danger { color: var(--danger); }
+  .tc-metric-value.tone-warn { color: var(--warn-soft); }
+  .tc-metric-value.tone-bad { color: var(--bad); }
+  .tc-metric-sub { @apply text-[9.5px]; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  /* Hero KPI (Latency) — sized up from the supporting stats next to it so
+     the one number that answers "how's it doing right now" reads first,
+     the way an enterprise monitoring dashboard leads with one big number
+     per row rather than five same-sized ones. */
+  .tc-metric-hero { min-width: 74px; }
+  .tc-metric-hero .tc-metric-label { color: var(--muted); }
+  .tc-metric-value.hero { @apply text-[22px] font-bold; letter-spacing: -0.01em; }
+  .tc-metric-unit { @apply text-[12px] font-medium; color: var(--muted); margin-left: 2px; }
+  /* Thin vertical rules marking the identity/path/stats/charts sections of
+     a dashboard row as distinct zones — purely visual scaffolding, hence
+     aria-hidden and non-interactive. */
+  .tc-vdivider, .tc-metric-divider {
+    width: 1px; align-self: stretch; background: var(--border2); flex-shrink: 0;
+  }
+  .tc-vdivider { margin: -2px 0; }
+
+  .tc-spark, .tc-latgraph { text-align: center; flex-shrink: 0; }
+  .tc-spark-label { @apply text-[10px] mb-0.5; white-space: nowrap; }
+
+
+  /* ── Mini visual path (condensed topology strip) ─────────────────────── */
+  .mvp { display: flex; align-items: center; gap: 4px; }
+  .mvp-empty { font-size: 12px; }
+  .mvp-node {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 20px; height: 20px; border-radius: 999px; font-size: 10px; font-weight: 700;
+    background: var(--btn-bg); border: 1px solid var(--border2); color: var(--muted); flex-shrink: 0;
+  }
+  .mvp-host, .mvp-target { background: transparent; border: none; font-size: 13px; width: 18px; }
+  .mvp-hop.mvp-ok { background: color-mix(in srgb, var(--good) 20%, var(--btn-bg)); border-color: var(--good); color: var(--good); }
+  .mvp-hop.mvp-loss { background: color-mix(in srgb, var(--warn) 22%, var(--btn-bg)); border-color: var(--warn); color: var(--warn); }
+  .mvp-hop.mvp-down { background: color-mix(in srgb, var(--danger) 22%, var(--btn-bg)); border-color: var(--danger); color: var(--danger); }
+  .mvp-hop.mvp-silent { opacity: .5; }
+  .mvp-line { width: 10px; height: 1px; background: var(--border2); flex-shrink: 0; }
+  .mvp-line-dashed { background: none; border-top: 1px dashed var(--border2); width: 14px; }
+  .mvp-more {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 18px; height: 18px; padding: 0 4px; border-radius: 999px; font-size: 9.5px; font-weight: 600;
+    background: var(--panel2); border: 1px dashed var(--border2); color: var(--faint); flex-shrink: 0;
+  }
+
+  /* Manual reorder: drag handle (mouse) + inline ▲/▼ (button) + the sidebar's
+     select-then-move toolbar all write into the same customOrder array. */
+  .drag-handle {
+    @apply inline-flex items-center justify-center shrink-0 rounded cursor-grab select-none;
+    width: 20px; height: 20px; color: var(--faint); font-size: 13px;
+    transition: color .12s, background-color .12s;
+  }
+  .drag-handle:hover { color: var(--text); background: var(--btn-hover); }
+  .drag-handle:active { cursor: grabbing; }
+  .drag-handle.armed { color: var(--accent); background: color-mix(in srgb, var(--accent) 18%, transparent); }
+  th.order-col-active { color: var(--accent); }
+  /* Reorder.Item (motion/react, TargetPanel.jsx) wraps each TargetCard —
+     position:relative is required for its automatic while-dragging z-index
+     to actually apply (see the Reorder docs' own note on this); otherwise
+     just a plain block so it doesn't disturb .target-panel-list's flex
+     column layout — .target-card inside it keeps its own full styling
+     unchanged. */
+  .target-card-reorder-item { display: block; position: relative; }
+  .card-move {
+    @apply text-[10px] rounded-md px-1 py-1; background: transparent; border: 1px solid transparent;
+    color: var(--muted); opacity: .55; line-height: 1;
+  }
+  .card-move:hover { opacity: 1; background: var(--btn-hover); border-color: var(--border2); color: var(--text); box-shadow: none; }
+  .reorder-toolbar {
+    @apply flex items-center gap-1.5 text-[11px] px-2 py-1.5 rounded-lg;
+    background: color-mix(in srgb, var(--accent) 8%, var(--panel2)); border: 1px solid var(--border2);
+  }
+  .reorder-toolbar .spacer { @apply flex-1; }
+  .reorder-toolbar button { @apply text-[11px] px-2 py-1; }
+  .dash-empty-state { @apply flex flex-col items-center justify-center gap-1.5 text-center py-16 text-muted; }
+  .dash-empty-state-icon { @apply text-4xl opacity-60 mb-1; }
+  .dash-empty-state svg { opacity: .85; margin-bottom: 4px; }
+  .dash-empty-title { @apply text-lg font-semibold text-ink; }
+  .dash-guide-row { @apply flex flex-wrap items-center justify-center gap-2 mt-3; }
+  .dash-guide-row button {
+    @apply text-[12.5px] rounded-full px-3.5 py-1.5;
+    background: var(--panel2); border: 1px solid var(--border2); color: var(--muted);
+  }
+  .dash-guide-row button:hover { background: var(--btn-hover); color: var(--ink); border-color: var(--accent); box-shadow: none; }
   aside ul { @apply list-none m-0 p-0 flex-1 overflow-auto flex flex-col gap-1; }
   aside li { @apply px-2.5 py-2 rounded-lg cursor-pointer flex flex-col; position: relative; background: var(--card-bg); border: 1px solid var(--card-border); transition: background-color .12s, border-color .12s; }
   aside li:hover { background: var(--card-hover); border-color: var(--border2); }
@@ -174,23 +582,27 @@
     background: var(--target-card-accent-bar);
   }
 
-  /* Per-card delete button — small, lives in the card header, revealed on hover */
+  /* Per-card delete button — small, lives in the card header. Always
+     visible at reduced opacity (like .card-move), full opacity on hover.
+     Previously this only revealed itself on `aside li:hover`/`.sel`, which
+     meant it was permanently invisible on the dashboard's performance-strip
+     cards — those live outside <aside> entirely, so that selector never
+     matched there at all. */
   .card-del {
     @apply ml-auto shrink-0 w-5 h-5 flex items-center justify-center rounded text-[11px] font-bold;
     background: transparent; border: none; color: var(--faint); padding: 0; cursor: pointer;
-    opacity: 0; transition: opacity .12s, background .12s, color .12s; line-height: 1;
+    opacity: .55; transition: opacity .12s, background .12s, color .12s; line-height: 1;
   }
-  aside li:hover .card-del, aside li.sel .card-del { opacity: .55; }
   .card-del:hover { opacity: 1 !important; background: color-mix(in srgb, var(--danger) 18%, var(--panel)); color: var(--danger); }
 
   /* Export / import strip at the bottom of the sidebar */
   .sidebar-actions { @apply flex flex-col gap-1 pt-2 mt-2 border-t border-border; }
   .sidebar-actions button, .import-btn {
-    @apply w-full text-left text-[12px] px-2.5 py-1.5 rounded-lg cursor-pointer transition-colors;
+    @apply w-full inline-flex items-center gap-1.5 text-left text-[12px] px-2.5 py-1.5 rounded-lg cursor-pointer transition-colors;
     background: var(--btn-bg); border: 1px solid var(--border2); color: var(--muted);
   }
   .sidebar-actions button:hover, .import-btn:hover { background: var(--btn-hover); color: var(--ink); }
-  .import-btn { display: block; }
+  .import-btn { display: inline-flex; }
   aside li small { @apply text-faint text-[11px]; }
     /* Use the two-lamp `signal` instead of tinting the card. */
 
@@ -211,6 +623,11 @@
   .lamp.st-down   { background: var(--danger); opacity: 1; box-shadow: var(--shadow-led); color: var(--danger); }
   .lamp.st-discovering { background: var(--accent); opacity: 1; animation: lamp-pulse 1s ease-in-out infinite; }
   .lamp.st-settling { background: var(--lime); opacity: 1; animation: lamp-pulse 1.6s ease-in-out infinite; }
+  /* A touch larger in the full-width dashboard cards specifically — there's
+     room, and at that size they read better at a glance than the compact
+     strip's smaller ones need to. */
+  .target-card:not(.compact) .signal { @apply p-1.5 gap-1.5; }
+  .target-card:not(.compact) .lamp { @apply w-3 h-3 rounded-[2px]; }
   @keyframes lamp-pulse { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
 
   .dot { @apply inline-block w-2 h-2 rounded-full mr-1.5; background: var(--good); }
@@ -219,7 +636,7 @@
   .dot.st-warn   { background: var(--warn-soft); }
   .dot.st-bad    { background: var(--bad); }
   .dot.st-down   { background: var(--danger); box-shadow: var(--shadow-led); color: var(--danger); }
-  .statelabel { @apply text-[10px] px-1.5 rounded ml-1.5 font-semibold; }
+  .statelabel { @apply text-[10px] px-1.5 rounded ml-1.5 font-semibold; flex-shrink: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 70px; }
   .statelabel.st-discovering { color: var(--accent); animation: lamp-pulse 1s ease-in-out infinite; }
   .statelabel.st-settling { color: var(--lime); }
   .statelabel.st-ok     { color: var(--good); }
@@ -238,14 +655,52 @@
   .hopdot.st-down   { background: var(--danger); box-shadow: var(--shadow-led); color: var(--danger); }
   .hopdot.st-silent { background: var(--faint); opacity: .45; } /* no ICMP reply — normal, not a fault */
 
-  /* ---- status bar / config strip / edit panel ---- */
-  .statusbar { @apply flex items-center gap-2.5 px-2.5 py-2 bg-panel border border-border rounded-xl; box-shadow: var(--shadow-sm), var(--shadow-inset); }
+  /* ---- status bar / config strip / edit panel ----
+     Tinted by the open target's own health so the state is legible at a
+     glance (matches the two-lamp colour language used everywhere else),
+     instead of a flat neutral bar that gives no signal until you read text. */
+  .statusbar { @apply flex items-center gap-2.5 px-2.5 py-2 bg-panel border border-border rounded-xl;
+    box-shadow: var(--shadow-sm), var(--shadow-inset);
+    border-left: 3px solid var(--border2);
+    transition: background-color .15s, border-color .15s;
+    animation: detail-in .32s var(--ease-montage);
+  }
+  @keyframes detail-in { from { opacity: 0; transform: translateX(14px); } to { opacity: 1; transform: none; } }
   .statusbar .spacer { @apply flex-1; }
   .statusbar .err { color: var(--bad); @apply text-[13px]; }
+  /* Deliberately no background tint by status here (was tried, didn't read
+     well against the rest of the panel) — the status-pill badge already
+     carries the colour signal clearly on its own. */
+
+  /* Compact status tag, e.g. "OK" / "WARN" / "DOWN" — the coloured word that
+     anchors the bar's tint to an explicit, readable label. */
+  .status-pill { @apply text-[10px] font-bold tracking-wider px-1.5 py-0.5 rounded-md shrink-0; }
+  .status-pill.st-ok, .status-pill.st-okloss { color: var(--good); background: color-mix(in srgb, var(--good) 16%, transparent); }
+  .status-pill.st-warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 16%, transparent); }
+  .status-pill.st-bad { color: var(--bad); background: color-mix(in srgb, var(--bad) 16%, transparent); }
+  .status-pill.st-down { color: var(--danger); background: color-mix(in srgb, var(--danger) 16%, transparent); }
+  .status-pill.st-discovering { color: var(--accent); background: color-mix(in srgb, var(--accent) 16%, transparent); animation: lamp-pulse 1s ease-in-out infinite; }
+
+  /* Explicit close (✕) control on the detail header — separate from the
+     "← Dashboard" text link so there's an unmistakable, always-in-the-same-
+     corner way to close the target, matching the back button's target. Both
+     call the same closeTarget() handler. */
+  .btn-close-x {
+    @apply shrink-0 w-7 h-7 flex items-center justify-center rounded-lg text-sm font-bold;
+    background: transparent; border: 1px solid var(--border2); color: var(--muted);
+    transition: background-color .12s, color .12s, border-color .12s;
+  }
+  .btn-close-x:hover { background: color-mix(in srgb, var(--danger) 16%, var(--panel)); color: var(--danger); border-color: var(--danger); box-shadow: none; }
   .rtt { @apply text-muted text-xs mr-1.5; }
   .rtt b { @apply text-ink text-[15px]; }
   .rttsub { @apply text-faint text-[11px]; }
   .badge { @apply px-2 py-0.5 rounded-md text-[11px] mx-0.5 font-medium; background: color-mix(in srgb, var(--accent) 16%, var(--panel)); color: var(--accent); }
+  .btn-recheck { @apply text-[11px] px-2 py-0.5 mx-0.5 font-medium; }
+  .btn-close-target { @apply text-[12px] font-medium; padding: 5px 10px; display: inline-flex;
+    align-items: center; justify-content: center; border-radius: 7px; color: var(--muted); border-color: var(--border2);
+    white-space: nowrap; }
+  .btn-close-target:hover { background: var(--btn-hover); color: var(--ink); border-color: var(--border2); box-shadow: none; }
+  .btn-recheck:disabled { opacity: .5; cursor: default; }
 
   .cfgstrip { @apply flex items-center gap-3.5 px-3 py-2 mt-1.5 bg-panel border border-border rounded-xl text-xs text-muted flex-wrap; box-shadow: var(--shadow-sm), var(--shadow-inset); }
   .cfgstrip .cfglabel { @apply font-bold tracking-wider text-faint text-[10px]; }
@@ -256,6 +711,39 @@
   .editpanel label { @apply flex flex-col gap-1 text-[11px] text-muted; }
   .editpanel input, .editpanel select { @apply w-[120px]; }
   .editpanel .apply { @apply self-end px-3.5 py-1.5 rounded-md font-semibold border-none cursor-pointer; }
+
+  /* Routing-loop advisory — deliberately NOT styled like a blocking error
+     screen (see `.loading`/`sel.error` below): the table underneath is fully
+     valid data, this only calls out two specific rows, so it reads as a
+     banner sitting ABOVE the table, never replacing it. */
+  .loop-banner {
+    @apply flex items-center gap-2.5 px-3 py-2 mb-1.5 rounded-xl text-[13px] flex-wrap;
+    background: color-mix(in srgb, var(--warn) 12%, var(--panel));
+    border: 1px solid color-mix(in srgb, var(--warn) 35%, var(--border));
+    color: var(--ink);
+  }
+  .loop-banner-icon { color: var(--warn); font-size: 15px; flex-shrink: 0; }
+  .loop-banner-text { @apply flex-1; }
+  .loop-banner-text b { color: var(--warn-soft); }
+  .loop-banner-jump {
+    @apply text-[11px] px-2 py-1 font-medium;
+    background: color-mix(in srgb, var(--warn) 18%, var(--btn-bg)); border-color: var(--warn);
+  }
+  .loop-banner-jump:hover { background: color-mix(in srgb, var(--warn) 30%, var(--btn-bg)); }
+  .statusbar .err.warn-loop { color: var(--warn-soft); }
+
+  /* The two specific hop rows a confirmed loop implicates — a left accent
+     bar and faint tint, same visual language as .selrow, so it's readable
+     alongside selection/pause state instead of fighting it. */
+  tr.looprow { background: color-mix(in srgb, var(--warn) 7%, transparent); box-shadow: inset 3px 0 0 var(--warn); }
+  tr.looprow.selrow { background: color-mix(in srgb, var(--warn) 14%, var(--sel)); }
+  .loop-badge { color: var(--warn); margin-left: 5px; font-size: 12px; cursor: help; }
+
+  /* Last-known address/hostname/ASN shown after a hop goes dark (no live
+     reply at all right now) — dimmed and italic so it reads unmistakably as
+     "remembered, not current," never mistaken for a live measurement. */
+  td.stale-cell { opacity: .55; font-style: italic; }
+  .stale-tag { opacity: .8; font-style: normal; font-size: 10px; margin-left: 3px; }
 
   /* ---- table ---- */
   .tablewrap { @apply max-h-[38%] overflow-auto border border-border rounded-xl; box-shadow: var(--shadow-sm); }
@@ -334,22 +822,56 @@
 .menu-item .menu-label { flex: 1; }
 .menu-sep { height: 1px; background: var(--border); margin: 4px 2px; }
 
-/* Per-card pause button (added) */
-.card-pause { opacity: .0; margin-left: 2px; background: transparent; border: none;
+/* Per-card pause button — always visible at reduced opacity (not hidden
+   until hover within <aside>, which never applies on the dashboard cards) */
+.card-pause { opacity: .6; margin-left: 2px; background: transparent; border: none;
   color: var(--muted); font-size: 12px; line-height: 1; padding: 2px 5px; border-radius: 6px;
   cursor: pointer; transition: opacity .12s, background .12s, color .12s; }
-aside li:hover .card-pause, aside li.sel .card-pause { opacity: .8; }
 .card-pause:hover { opacity: 1 !important; background: color-mix(in srgb, var(--accent) 18%, var(--panel));
   color: var(--accent); box-shadow: none; }
+
+/* Per-card force-recheck button — same treatment as .card-pause */
+.card-recheck { opacity: .6; margin-left: 2px; background: transparent; border: none;
+  color: var(--muted); font-size: 12px; line-height: 1; padding: 2px 5px; border-radius: 6px;
+  cursor: pointer; transition: opacity .12s, background .12s, color .12s; }
+.card-recheck:hover { opacity: 1 !important; background: color-mix(in srgb, var(--accent) 18%, var(--panel));
+  color: var(--accent); box-shadow: none; }
+.card-recheck:disabled { opacity: .35 !important; cursor: default; }
+
+/* Compact panel specifically: keep recheck/pause/remove hidden until you
+   hover or the row is the currently-open target — ▲/▼ (reorder) stay
+   visible always, since those are the primary interaction there. The
+   dashboard's own cards are unaffected (that's where these were previously
+   invisible outright due to a stale selector scope, which is what actually
+   needed the always-visible fix; the compact list's decluttering was
+   correct as designed). */
+.target-card.compact .card-recheck,
+.target-card.compact .card-pause,
+.target-card.compact .card-del { opacity: 0; }
+.target-card.compact:hover .card-recheck,
+.target-card.compact:hover .card-pause,
+.target-card.compact:hover .card-del,
+.target-card.compact.sel .card-recheck,
+.target-card.compact.sel .card-pause,
+.target-card.compact.sel .card-del { opacity: .6; }
 
 /* About dialog (added) */
 .about-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.5); display: flex;
   align-items: center; justify-content: center; z-index: 200; }
 .about-box { background: var(--panel); border: 1px solid var(--border2); border-radius: 12px;
   box-shadow: var(--shadow-md); padding: 20px 22px; max-width: 380px; }
+.about-version { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.about-box a { color: var(--accent); text-decoration: none; font-size: 13px; word-break: break-all; }
+.about-box a:hover { text-decoration: underline; }
 
 /* Inline config validation errors (added) */
 .cfg-errs div { margin-top: 2px; }
+
+/* Auto-update banner (added) */
+.update-banner { display: flex; align-items: center; gap: 10px; padding: 8px 14px;
+  background: var(--accent-dim, #16324a); border-bottom: 1px solid var(--border); font-size: 13px; }
+.update-banner .muted { opacity: 0.75; }
+.update-banner .spacer { flex: 1; }
 
 /* ── Tab bar + tool pages (added) ─────────────────────────────────────── */
 .tabbar { display: flex; gap: 4px; padding: 6px 10px 0; border-bottom: 1px solid var(--border);

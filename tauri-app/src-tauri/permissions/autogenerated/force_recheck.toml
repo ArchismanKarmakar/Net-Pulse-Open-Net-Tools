@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-force-recheck"
+description = "Enables the force_recheck command without any pre-configured scope."
+commands.allow = ["force_recheck"]
+
+[[permission]]
+identifier = "deny-force-recheck"
+description = "Denies the force_recheck command without any pre-configured scope."
+commands.deny = ["force_recheck"]

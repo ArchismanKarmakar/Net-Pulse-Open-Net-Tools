@@ -138,11 +138,18 @@ extra latency on its first reply only.
 ### Cross-session routing: the registry
 
 Every `Session` has a per-session-unique `icmp_id_` and registers itself in a
-process-global `map<uint16_t /*icmp id*/, Session*> g_registry` for the
-duration of its `run()`. `Session::dispatch_incoming()` (called only by the
-RX dispatcher) looks a reply up by the ICMP id embedded in the parsed ICMP
-packet, and pushes it straight into *that* session's `inbox_` — a
+process-global `map<uint16_t /*icmp id*/, IcmpOwner*> g_registry` for the
+duration of its `run()`. `dispatch_incoming()` (called only by the RX
+dispatcher) looks a reply up by the ICMP id embedded in the parsed ICMP
+packet, and pushes it straight into *that* owner's `inbox_` — a
 mutex-protected `deque<Incoming>` — then notifies `inbox_cv_`.
+
+`IcmpOwner` is a small abstract interface (`session.hpp`) with one method,
+`push_incoming(const Incoming&)`; `Session` implements it, and so does
+`PingRun` (`ping_run.hpp` — the standalone Ping tool's engine, §11's file
+map). The registry itself only ever deals in `IcmpOwner*`, not `Session*` —
+that's what lets the Ping tool share this exact socket pool and dispatcher
+rather than needing its own thread or its own registry.
 
 This removes the entire class of "which socket did the OS hand it to" bug
 from part 1: there's no more ambiguity about socket ownership because replies
@@ -688,6 +695,7 @@ that unit tests deliberately don't exercise.
 | `core/include/netpulse/icmp.hpp` / `core/src/icmp.cpp` | ICMP/ICMPv6 packet codec, RFC 1071 checksum, Paris-style checksum pinning. |
 | `core/include/netpulse/transport.hpp` / `core/src/transport.cpp` | `Prober` (one raw/datagram socket), the socket pool, `list_interfaces()`. |
 | `core/include/netpulse/session.hpp` / `core/src/session.cpp` | Everything in this document: `Session::run()`, the RX dispatcher, the global pacer, the shared-hop cache, the rDNS pool, the loop auditor. |
+| `core/include/netpulse/ping_run.hpp` / `core/src/ping_run.cpp` | `PingRun` — the standalone single-host Ping tool's engine. A second `IcmpOwner` implementation (see §2's registry) alongside `Session`, sharing the same pooled sockets and RX dispatcher rather than opening its own — no separate thread, no OS `ping` subprocess. |
 | `core/include/netpulse/stats.hpp` | `HopStats`/`HopStat` — rolling per-hop RTT/loss stats over the focus window. |
 | `core/include/netpulse/platform.hpp` | `ensure_winsock_ready()` — lazy, thread-safe Winsock init (see the comment in `transport.cpp` on why this replaced a namespace-scope static). |
 | `tests/test_core.cpp` | Unit tests for every externally-linked pure function above. |

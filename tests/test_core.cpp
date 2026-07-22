@@ -108,10 +108,54 @@ int main() {
         CHECK(r->id == 0x7777);
         CHECK(r->seq == 5);
     }
+    {
+        // RFC 4884/4950: Time Exceeded carrying an MPLS label stack extension.
+        auto orig = build_echo(Family::V4, 0xABCD, 9, 8);
+        auto inner_ip = ipv4_wrap(1, orig); // 36 bytes -> 9 words
+        std::vector<uint8_t> ext = {0x20, 0x00, 0x00, 0x00,  // common header (checksum filled below)
+                                     0x00, 0x08, 1,    1,     // object header: length=8, class=1 (MPLS), c-type=1
+                                     0,    0,    0,    0};    // label entry, filled below
+        uint32_t label_val = (16003u << 12) | (0u << 9) | (1u << 8) | 1u; // label=16003 exp=0 S=1 ttl=1
+        ext[8] = static_cast<uint8_t>(label_val >> 24);
+        ext[9] = static_cast<uint8_t>(label_val >> 16);
+        ext[10] = static_cast<uint8_t>(label_val >> 8);
+        ext[11] = static_cast<uint8_t>(label_val);
+        uint16_t ck = checksum(ext.data(), ext.size());
+        ext[2] = static_cast<uint8_t>(ck >> 8);
+        ext[3] = static_cast<uint8_t>(ck & 0xff);
+        CHECK(checksum(ext.data(), ext.size()) == 0);
+
+        std::vector<uint8_t> err = {11, 0, 0, 0, 0, static_cast<uint8_t>(inner_ip.size() / 4), 0, 0};
+        err.insert(err.end(), inner_ip.begin(), inner_ip.end());
+        err.insert(err.end(), ext.begin(), ext.end());
+        auto frame = ipv4_wrap(1, err);
+        auto r = parse_v4(frame.data(), frame.size());
+        CHECK(r.has_value());
+        CHECK(r->kind == ReplyKind::TimeExceeded);
+        CHECK(r->mpls_labels.size() == 1);
+        if (!r->mpls_labels.empty()) {
+            uint32_t v = r->mpls_labels[0];
+            CHECK((v >> 12) == 16003);
+            CHECK(((v >> 9) & 0x7) == 0);
+            CHECK(((v >> 8) & 0x1) == 1);
+            CHECK((v & 0xff) == 1);
+        }
+    }
+    {
+        // Legacy router: RFC 4884 length hint left at 0 -> no extension parsing attempted.
+        auto orig = build_echo(Family::V4, 0xABCD, 9, 8);
+        auto inner_ip = ipv4_wrap(1, orig);
+        std::vector<uint8_t> err = {11, 0, 0, 0, 0, 0, 0, 0}; // byte 5 == 0 => no RFC 4884 hint
+        err.insert(err.end(), inner_ip.begin(), inner_ip.end());
+        auto frame = ipv4_wrap(1, err);
+        auto r = parse_v4(frame.data(), frame.size());
+        CHECK(r.has_value());
+        CHECK(r->mpls_labels.empty());
+    }
 
     std::printf("[stats]\n");
     {
-        HopStats h(1);
+        HopStats h(1, 1);
         double base = now_secs();
         for (int i = 0; i < 10; ++i) {
             std::optional<double> rtt = (i == 2) ? std::nullopt : std::optional<double>(i);
@@ -126,7 +170,7 @@ int main() {
         CHECK(win.min.has_value() && *win.min == 6.0);
     }
     {
-        HopStats h(2);
+        HopStats h(1, 2);
         h.set_address("10.0.0.1");
         h.push(now_secs(), 5.0);
         h.set_address("10.0.0.2"); // route flap

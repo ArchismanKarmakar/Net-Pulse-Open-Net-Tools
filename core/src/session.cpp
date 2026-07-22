@@ -47,34 +47,56 @@ namespace netpulse {
 // share the exact same socket, read by exactly one RX dispatcher thread — so
 // there's no more "which socket did the OS hand it to" ambiguity to begin
 // with. This registry is what the dispatcher uses to find the right owner:
-// it maps each session's unique ICMP id -> Session*, and every incoming reply
+// it maps each ICMP id -> IcmpOwner* (session.hpp), and every incoming reply
 // (regardless of which pooled socket it arrived on) is looked up here and
-// pushed directly into the OWNING session's inbox — the only way any session
-// ever receives a reply now; sessions no longer read sockets themselves.
+// forwarded to that owner's push_incoming() — the only way anything ever
+// receives a reply now; nothing reads sockets directly except the
+// dispatcher itself. Originally Session-only (map value used to be
+// Session*); generalized to IcmpOwner* so PingRun (ping_run.hpp) can share
+// this exact same registry/dispatcher instead of standing up a second,
+// parallel receive mechanism.
 namespace {
 std::mutex g_reg_mtx;
-std::map<uint16_t, Session*> g_registry;
+std::map<uint16_t, IcmpOwner*> g_registry;
 } // namespace
+
+void register_icmp_owner(uint16_t icmp_id, IcmpOwner* owner) {
+    std::lock_guard<std::mutex> lk(g_reg_mtx);
+    g_registry[icmp_id] = owner;
+}
+
+void unregister_icmp_owner(uint16_t icmp_id, IcmpOwner* owner) {
+    std::lock_guard<std::mutex> lk(g_reg_mtx);
+    auto it = g_registry.find(icmp_id);
+    if (it != g_registry.end() && it->second == owner) g_registry.erase(it);
+}
 
 // Called ONLY by the shared RX dispatcher thread (see rx_dispatch_loop below),
 // for every reply read off any pooled socket. Public (not private) solely
 // because the dispatcher is a free function living outside the Session class
 // — mirrors resolve() already being public "for tests" in spirit: internal
-// plumbing exposed out of necessity, not meant for general callers.
+// plumbing exposed out of necessity, not meant for general callers. Kept as
+// the dispatcher's call site (unchanged name/signature) even though the
+// actual lookup is now owner-type-agnostic — see register_icmp_owner above.
 void Session::dispatch_incoming(const Incoming& inc) {
-    std::lock_guard<std::mutex> lk(g_reg_mtx);
-    auto it = g_registry.find(inc.reply.id);
-    if (it == g_registry.end() || !it->second) return; // no current owner (removed target, or a stray/duplicate packet) — safe to drop
-    Session* owner = it->second;
-    std::lock_guard<std::mutex> ib(owner->inbox_mtx_);
-    owner->inbox_.push_back(inc);
-    owner->inbox_cv_.notify_one(); // wake owner's run() if it's waiting on an empty inbox
+    IcmpOwner* owner;
+    {
+        std::lock_guard<std::mutex> lk(g_reg_mtx);
+        auto it = g_registry.find(inc.reply.id);
+        if (it == g_registry.end() || !it->second) return; // no current owner (removed target, or a stray/duplicate packet) — safe to drop
+        owner = it->second;
+    }
+    owner->push_incoming(inc);
+}
+
+void Session::push_incoming(const Incoming& inc) {
+    std::lock_guard<std::mutex> ib(inbox_mtx_);
+    inbox_.push_back(inc);
+    inbox_cv_.notify_one(); // wake this session's run() if it's waiting on an empty inbox
 }
 
 Session::~Session() {
-    std::lock_guard<std::mutex> lk(g_reg_mtx);
-    auto it = g_registry.find(icmp_id_);
-    if (it != g_registry.end() && it->second == this) g_registry.erase(it);
+    unregister_icmp_owner(icmp_id_, this);
 }
 
 // ---------------------------------------------------------------------------
@@ -593,6 +615,71 @@ constexpr int     kEchoTestTries = 4;  // direct misses (with no direct reply ye
 // its whole point is to independently re-verify what's actually there.
 constexpr double kHopRecheckSecs = 45.0;
 
+// Frankenstein-route guard (see the legacy_miss comment further down, near
+// Session::run()'s state variables) — how many consecutive LEGACY-probe
+// misses, and how much wall-clock time they must span, before a hop's stale
+// address is wiped and rediscovered from scratch. Time-boxed rather than a
+// bare count: an echo_ok/probationary hop only gets ONE legacy probe per
+// kHopRecheckSecs (so 2 of those, ~90s apart, really is a route-change
+// signal) — but an echo_silent hop gets a legacy probe EVERY probe interval
+// instead (that's its whole steady-state measurement channel), where 2
+// consecutive per-second misses is just ordinary loss/rate-limiting, not a
+// route change. Requiring the streak to ALSO span kLegacyMissWindowSecs of
+// wall clock keeps the rare-recheck case exactly as sensitive as before
+// while no longer mistaking an echo_silent hop's routine jitter for a route
+// change — see the timeout-sweep use of these below for the full mechanism.
+constexpr int    kLegacyMissThreshold = 2;
+constexpr double kLegacyMissWindowSecs = kHopRecheckSecs;
+
+// Residual gap in the time-box above: it protects against a FAST, continuous
+// silence stream (echo_silent hops) but does nothing for a hop on the SLOW
+// due_recheck channel (echo_ok/probationary hops, one legacy probe per
+// kHopRecheckSecs) whose reply rate on THAT specific channel is just
+// chronically bad — e.g. a router that answers direct-echo fine but rarely
+// bothers generating Time-Exceeded at all. For such a hop, two ~45s-apart
+// recheck misses isn't rare — it's business as usual — and wiping it every
+// time produces the exact "IP keeps disappearing and reappearing" flapping
+// this constant exists to stop.
+//
+// The actual danger the whole guarded wipe defends against is a hop that
+// LOOKS reliable (low loss, believable) silently becoming wrong — a hop
+// already showing heavy loss isn't "falsely healthy" in the first place
+// (its loss% is already honestly telling the user something's off), so
+// there's much less harm in leaving its last-known address in place a
+// while longer than in wiping and rediscovering it every ~90s. Gating the
+// wipe on the hop's own recent aggregate loss (across BOTH its measurement
+// channels, direct and legacy — see HopStats::compute) targets exactly the
+// case that matters: a hop that WAS reliable going dark is a real signal;
+// a hop that's ALWAYS been unreliable having one more bad patch is not.
+constexpr double kGuardedWipeMaxRecentLossPct = 40.0;
+constexpr double kGuardedWipeRecentLossWindowSecs = 120.0;
+
+// Second-order guard on top of the recent-loss check above: samples_ gets
+// cleared BY every wipe (clear_address()), so "recent loss" alone resets to
+// a clean slate each time — a chronically bad hop can pass it again right
+// after being rediscovered, simply because rediscovery itself requires a
+// handful of lucky replies. Capping how many times the SAME device can be
+// wiped (see wipe_count's doc comment above) is what actually stops the
+// repeating cycle instead of merely slowing it down. 1 is deliberately
+// strict: a real silent reroute only needs to be caught once to fix the
+// display; a hop that qualifies for the guarded wipe a SECOND time despite
+// that is demonstrating a pattern, not a one-off event.
+constexpr int kMaxGuardedWipesPerHop = 1;
+
+// --- Dead-socket / dead-route self-heal (sleep/wake, interface flap) -------
+// Complements the Manager-level interface-change watchdog (manager.hpp),
+// which reacts to the OS reporting a DIFFERENT interface/address set — the
+// fast, common signal for an actual sleep/wake. These two constants are the
+// fallback for when the interface list looks unchanged but the network
+// still isn't usable yet: send() itself failing repeatedly
+// (kMaxConsecutiveSendFails), or send() reporting success while nothing
+// ever comes back at all (kSilenceRebuild*) — which is exactly what happens
+// if the OS accepts a raw sendto() before its own routing table has caught
+// up after a sleep/resume cycle.
+constexpr int    kMaxConsecutiveSendFails = 10;
+constexpr double kSilenceRebuildMinSecs = 15.0;     // never trigger sooner than this, however fast the probe interval
+constexpr double kSilenceRebuildIntervalMult = 5.0; // …or this many probe intervals, whichever is larger
+
 // Declared in session.hpp (external linkage, not in an anonymous namespace)
 // specifically so tests/test_core.cpp can call it directly without a live
 // socket — see the doc comment there for the full contract.
@@ -630,6 +717,16 @@ uint16_t Session::next_seq() {
 }
 
 void Session::resolve() {
+    // Clear any error left over from a PREVIOUS resolve() attempt before
+    // trying again — error_ is otherwise never cleared anywhere, so a
+    // transient DNS failure (or family-fallback notice) that later
+    // resolves cleanly would stay stuck on screen forever, even once
+    // dest_/family_ are freshly and correctly populated below. This must
+    // run before getaddrinfo(), not after a successful lookup, so the
+    // intentional "falling back to IPv4/IPv6" notices set further down in
+    // this same function aren't immediately wiped out the moment they're
+    // set.
+    error_.reset();
     ensure_winsock_ready(); // must run before any Winsock call (see platform.hpp)
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
@@ -695,7 +792,7 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
         return;
     }
     on_update(snapshot(true, {})); // immediate "tracing…" with resolved IP
-    { std::lock_guard<std::mutex> lk(g_reg_mtx); g_registry[icmp_id_] = this; } // enable cross-session reply routing
+    register_icmp_owner(icmp_id_, this); // enable cross-session reply routing
     PacerMembership pacer_membership; // count this target toward the global pacer's scaled rate (RAII: leaves on any return)
     g_rdns().ensure_started();        // spin up the shared reverse-DNS resolver on first target
     g_rx().ensure_started();          // spin up the shared RX dispatcher on first target (see its class comment)
@@ -751,6 +848,11 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
                     on_update(snapshot(false, {}));
                     return;
                 }
+                // Egress came back (or the family pref changed away from V6)
+                // within the wait — the "waiting for IPv6" message above is
+                // now stale; without this, it would otherwise sit on screen
+                // forever even once probing resumes normally.
+                if (has_local_v6) error_.reset();
             }
             if (resolved_v6_) { family_ = Family::V6; dest_ = resolved_v6_; }
         } else if (s.family == FamilyPref::V4) {
@@ -770,6 +872,9 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
                     on_update(snapshot(false, {}));
                     return;
                 }
+                // Same as the IPv6 branch above — clear the now-stale
+                // "waiting for IPv4" message once egress actually recovers.
+                if (has_local_v4) error_.reset();
             }
             if (resolved_v4_) { family_ = Family::V4; dest_ = resolved_v4_; }
         }
@@ -812,47 +917,106 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
     std::map<uint8_t, bool> echo_silent;     // hop answered discovery but never a direct ping → fall back to TTL-limited probing
     std::map<uint8_t, int>  echo_miss;       // consecutive direct-ping misses while still unconfirmed (drives the echo_silent decision)
     std::map<uint8_t, double> hop_recheck_at; // last time this hop got a legacy TTL-elicited re-confirm probe (see kHopRecheckSecs)
+    // Consecutive LEGACY (non-direct, TTL-elicited) probe timeouts for a hop
+    // that already has an address on file. Distinct from echo_miss above,
+    // which only tracks DIRECT-echo misses and drives fallback to legacy
+    // probing — this tracks the opposite direction: a legacy probe timing
+    // out. On a route change, if the new device at this hop replies (even
+    // with a different address), set_address() already handles it correctly
+    // via the flap path. If the new device is silent instead (drops the
+    // legacy probe without replying), NOTHING previously cleared the old
+    // address — so a separate DIRECT-echo probe to that old, now-wrong,
+    // still-globally-routable address could keep getting real replies from
+    // the device that isn't on this path anymore, producing a hybrid/
+    // "Frankenstein" hop that blends two different physical routes. See the
+    // legacy-miss handling in the timeout sweep below.
+    std::map<uint8_t, int> legacy_miss;
+    // Wall-clock of the FIRST miss in the current legacy_miss streak for this
+    // hop — reset (erased) the moment the streak breaks (any successful
+    // legacy reply) or the hop's address changes/clears. Paired with
+    // legacy_miss[hop] to decide the guarded wipe below: the streak must
+    // both reach kLegacyMissThreshold misses AND span kLegacyMissWindowSecs
+    // of real time, so a burst of sub-second misses on a fast, continuously
+    // legacy-probed (echo_silent) hop can't trigger it the way a genuine
+    // ~45s-apart recheck failure can — see kLegacyMissWindowSecs above.
+    std::map<uint8_t, double> legacy_miss_since;
+    // How many times THIS device (not this TTL slot — see the flap-reset
+    // note below) has been through the guarded wipe below. Deliberately NOT
+    // cleared when a wipe happens (unlike legacy_miss/legacy_miss_since) —
+    // it exists specifically to survive the wipe it's counting, because the
+    // recent-loss gate (kGuardedWipeMaxRecentLossPct) alone isn't enough: a
+    // hop's samples_ get cleared BY the wipe, so its "recent loss" reads
+    // artificially good again immediately after rediscovery (whatever
+    // handful of replies it takes to get rediscovered are, almost by
+    // definition, a lucky streak) — long enough for a genuinely chronic hop
+    // to pass the recent-loss check again and get wiped a second time, a
+    // third, forever, which is exactly the repeating "IP disappears and
+    // reappears" cycle a real user would notice. Only reset on a CONFIRMED
+    // flap to a genuinely different device (see the flap-detection block
+    // below) — a new device deserves its own fresh allowance; the same
+    // device coming back after being wiped does not.
+    std::map<uint8_t, int> wipe_count;
+
+    // Consecutive raw send() failures (see try_send below) — NOT the same as
+    // a probe timing out (that's a real send that got no reply); this is the
+    // OS refusing/failing the sendto() call itself. A stale socket left over
+    // from before a sleep/interface change is the classic cause. After
+    // kMaxConsecutiveSendFails in a row, request a socket rebuild so the
+    // engine heals itself instead of silently spinning forever refunding
+    // pacer tokens — see the try_send lambda for where this increments.
+    int consecutive_send_fails = 0;
+
+    // Wall-clock of the most recent REAL reply this session received, of any
+    // kind (direct-echo, legacy/TTL-elicited, or shared-hop adoption) — a
+    // session-wide signal, deliberately not scoped to one hop. If sends are
+    // going out but ABSOLUTELY NOTHING has come back for kSilenceRebuild*
+    // (see above), that's very unlikely to be ordinary per-hop loss (it
+    // would need every single hop, including the destination, to go silent
+    // at once) and much more likely a dead socket/route that never actually
+    // errors on send() — e.g. the OS accepting a raw sendto() before its
+    // routing table has caught up after a sleep/resume cycle, which a
+    // send-failure counter alone would never catch. Reset on every reply and
+    // whenever the loop is paused (see the paused branch below), so the
+    // clock doesn't run while there's nothing to receive by design.
+    double last_any_reply_at = now_secs();
 
     // Routing-loop auditor state (see the comment block above near
     // kLoopAuditSecs for the full rationale). loop_at_hop: the confirmed loop
     // boundary, if any — compute_max_hop() freezes the discovery window here.
-    // loop_error: whether `error_` currently holds OUR message, so clearing it
-    // on self-heal never clobbers an unrelated error set elsewhere. loop_confirm:
-    // two-strikes counter per (higher hop, lower/duplicated hop) pair — a
-    // single sighting is not enough to freeze (see the ECMP false-positive
-    // discussion above); it takes two independent replies confirming the same
-    // pair.
+    // loop_confirm: two-strikes counter per (higher hop, lower/duplicated
+    // hop) pair — a single sighting is not enough to freeze (see the ECMP
+    // false-positive discussion above); it takes two independent replies
+    // confirming the same pair. The advisory itself lives in loop_warning_/
+    // loop_hop_/loop_dup_at_ (session.hpp) — dedicated fields, not shared
+    // with error_, so no loop_error flag is needed to track "whose message
+    // is this" anymore.
     std::optional<uint8_t> loop_at_hop;
-    bool loop_error = false;
     std::map<std::pair<uint8_t, uint8_t>, int> loop_confirm;
 
     auto ensure_hop = [&](uint8_t h) -> HopStats& {
         auto it = hops_.find(h);
-        if (it == hops_.end()) it = hops_.emplace(h, HopStats(h)).first;
+        if (it == hops_.end()) it = hops_.emplace(h, HopStats(id_, h)).first;
         return it->second;
     };
     // Predecessor address for the shared-hop cache key (see the SharedHopTable
     // comment above for why the edge, not just the node, is what's keyed on).
-    // Walk backward from hop-1 down to hop 1 and use the NEAREST hop that has
-    // actually resolved — not just hop-1 directly. Many real routers never
-    // answer a TTL-limited probe at all (silently forward without generating
-    // Time-Exceeded) while still forwarding fine, so hop-1 being unresolved
-    // ("*") does NOT mean the whole predecessor chain is unknown — hop-2 (or
-    // further back) may well be resolved and is the correct, stable
-    // predecessor to key on. Only fall back to the "SRC" sentinel once NO
-    // hop below this one has resolved (from the network's perspective this
-    // hop is then indistinguishable from being directly reachable from our
-    // own source). Without this, a route whose hop-1 happens to be silent
-    // would get a DIFFERENT (sentinel-based) key than the exact same route
-    // once hop-1 starts answering, splitting what should be one stable cache
-    // entry into two, and — worse — coincidentally colliding with another
-    // target whose OWN hop-1 is silent for a completely different reason.
+    // The predecessor is simply hop-1 — NOT the nearest already-resolved hop
+    // further back. Using the nearest resolved hop as a stand-in collapses
+    // every target whose immediate predecessor happens to be unresolved onto
+    // whichever earlier hop DID resolve, even though two targets can diverge
+    // at that unresolved hop and reach genuinely different next hops — they'd
+    // wrongly share one cache entry and stomp each other's real measurements.
+    // If hop-1 itself hasn't resolved, that's still a distinct, stable key —
+    // distinct per missing TTL (not the single shared "SRC" sentinel), so two
+    // targets that both have an unresolved hop-1 (for unrelated reasons, or
+    // because they've genuinely diverged before hop 1 resolves) don't collide
+    // either.
     auto predecessor_of = [&](uint8_t hop) -> std::string {
-        for (uint8_t h = hop; h-- > 1;) { // h = hop-1, hop-2, ..., 1
-            auto it = hops_.find(h);
-            if (it != hops_.end() && it->second.address()) return *it->second.address();
-        }
-        return shared_hop_src_sentinel();
+        if (hop <= 1) return shared_hop_src_sentinel();
+        uint8_t h = hop - 1;
+        auto it = hops_.find(h);
+        if (it != hops_.end() && it->second.address()) return *it->second.address();
+        return "UNKN-" + std::to_string(h);
     };
 
     while (!stop->load()) {
@@ -860,7 +1024,7 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
         bool rebuild = false;
         {
             std::lock_guard<std::mutex> lk(settings_mtx_);
-            if (rebuild_needed_) { rebuild = true; rebuild_needed_ = false; }
+            if (rebuild_needed_) rebuild = true;
             settings_dirty_ = false;
         }
         if (rebuild) {
@@ -874,42 +1038,176 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
             // combo, the pool's entry for it goes stale and its underlying
             // socket closes, same lifecycle as the old make_prober() had, just
             // shared instead of exclusive.
+            //
+            // rebuild_needed_ is deliberately NOT cleared until a rebuild
+            // actually succeeds (see the success branch below) — an interface
+            // that's still coming up (DNS not ready yet, or the new socket
+            // fails to bind) must keep retrying every pass instead of getting
+            // exactly one attempt and then being stuck on whatever `sock` that
+            // one attempt left behind (a still-good old socket dropped for a
+            // broken new one, or an untouched old one nobody frees) until the
+            // user happens to touch settings again.
+            //
+            // Captured BEFORE resolve() overwrites dest_/family_ — compared
+            // against their post-resolve values further down to decide
+            // whether this rebuild represents a genuine route change (wipe
+            // accumulated history) or just a local socket rebuild (don't).
+            std::optional<std::string> dest_before_rebuild = dest_;
+            std::optional<Family> family_before_rebuild = family_;
             resolve(); // family may have changed → re-pick dest/family
             if (!dest_ || !family_) {
                 // leave the previous state intact, surface a running snapshot
                 on_update(snapshot(true, {}));
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
             } else {
-                sock = acquire_sock();
-                if (!sock->ok()) {
-                    error_ = sock->error();
+                auto new_sock = acquire_sock();
+                if (!new_sock->ok()) {
+                    error_ = new_sock->error();
                     on_update(snapshot(true, {}));
                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 } else {
-                    // successful rebuild — reset discovery state and resume
+                    sock = std::move(new_sock);
+                    {
+                        std::lock_guard<std::mutex> lk(settings_mtx_);
+                        rebuild_needed_ = false;
+                    }
+                    // Always necessary regardless of what changed: probes
+                    // in flight were sent on the OLD socket, so their
+                    // replies (if any still arrive) can't be meaningfully
+                    // matched against anything; the rate limiter and
+                    // self-heal counters are cheap to just restart clean.
+                    // A successful rebuild means we just got a working
+                    // socket (and, above, a fresh resolve()) — whatever
+                    // caused the dead-socket/silence symptoms is resolved,
+                    // so both self-heal counters restart clean instead of
+                    // possibly re-triggering another rebuild on stale counts.
                     pending.clear();
                     next_send.clear();
-                    dest_hop_.reset();
-                    max_hop_seen_ = 0;
-                    hops_.clear();
-                    dest_found_at = 0.0;       // discovery restarts from scratch
                     tokens = kProbeBurst;
                     last_refill = now_secs();
-                    tries.clear();
-                    rr = 1;
-                    last_reply_at.clear();
-                    echo_ok.clear();
-                    echo_silent.clear();
-                    echo_miss.clear();
-                    hop_recheck_at.clear();
-                    loop_at_hop.reset();
-                    loop_error = false;
-                    loop_confirm.clear();
+                    consecutive_send_fails = 0;
+                    last_any_reply_at = now_secs();
+
+                    // Only wipe accumulated per-hop history (hops_, discovery
+                    // progress, loop-detection state — everything below) if
+                    // the ROUTE itself actually changed: a different resolved
+                    // destination address, or switching address family. Those
+                    // hops would genuinely be different devices, so the old
+                    // data is meaningless. A rebuild triggered by nothing more
+                    // than the LOCAL egress interface changing (e.g. Windows
+                    // failing Ethernet over to Wi-Fi and back within a few
+                    // seconds) still reaches the exact same destination, very
+                    // often via a substantially unchanged path beyond the
+                    // local gateway — wiping months of history and the whole
+                    // graph for a brief local link blip throws away exactly
+                    // the continuity a monitoring tool exists to provide.
+                    // hops_'s in-memory stats are the hot tier of a
+                    // deliberately hybrid store (see ColdStore/compute_stat_
+                    // tiered in manager.hpp) specifically so RAM doesn't have
+                    // to hold unbounded history — leaving hops_ alone here
+                    // means that relationship, and everything the user has
+                    // already been shown for this session, survives a local
+                    // link flap intact. If a hop genuinely IS a different
+                    // device after all this, the existing flap/loop-detection
+                    // machinery (§4/§5, ARCHITECTURE.md) is exactly what's
+                    // supposed to catch and correct that at the per-hop
+                    // level — that machinery doesn't need a full session
+                    // wipe to do its job.
+                    bool route_context_changed =
+                        (dest_ != dest_before_rebuild) || (family_ != family_before_rebuild);
+                    if (route_context_changed) {
+                        dest_hop_.reset();
+                        max_hop_seen_ = 0;
+                        hops_.clear();
+                        dest_found_at = 0.0;   // discovery restarts from scratch
+                        tries.clear();
+                        rr = 1;
+                        last_reply_at.clear();
+                        echo_ok.clear();
+                        echo_silent.clear();
+                        echo_miss.clear();
+                        legacy_miss.clear();
+                        legacy_miss_since.clear();
+                        wipe_count.clear();
+                        hop_recheck_at.clear();
+                        loop_at_hop.reset();
+                        loop_confirm.clear();
+                        loop_warning_.reset();
+                        loop_hop_.reset();
+                        loop_dup_at_.reset();
+                    }
                 }
             }
+        } else if (force_recheck_needed_.exchange(false)) {
+            // User-requested recheck. First, cheaply check whether the
+            // DESTINATION's own DNS answer has changed — resolve() alone
+            // never mutates anything the UI shows, it only fills dest_/
+            // family_/resolved_v4_/resolved_v6_, so calling it here to
+            // compare is free of side effects unless something really
+            // changed. This is what a hostname target losing its IP over a
+            // sleep/resume cycle (a genuinely stale DNS answer, not just a
+            // stale socket) needs — previously Force Recheck never called
+            // resolve() at all, so a target stuck this way had no button
+            // that could fix it. If the answer changed (or resolution
+            // starts failing), route this through the SAME rebuild path
+            // settings changes already use (below) rather than duplicating
+            // its socket/state-reset logic here — `continue` so this pass
+            // re-enters the loop and the `rebuild` branch handles it.
+            {
+                auto old_dest = dest_;
+                resolve();
+                if (!dest_ || dest_ != old_dest) {
+                    std::lock_guard<std::mutex> lk(settings_mtx_);
+                    rebuild_needed_ = true;
+                    continue;
+                }
+            }
+            // DNS unchanged — fire the SAME automatic route-update mechanism
+            // that already runs every kHopRecheckSecs (see due_recheck in
+            // try_send below) right now, instead of waiting out the timer —
+            // no separate window, no separate retry path, and no wipe of any
+            // hop that currently HAS an address. Zeroing hop_recheck_at makes
+            // due_recheck true on the very next pass for every already-known
+            // hop, which is exactly what the periodic timer does on its own
+            // cadence; hops_/last_reply_at/dest_hop_ are left untouched, so
+            // an already-addressed hop only ever gets an in-place update (its
+            // address/RTT changing), never a reset. A hop that's currently
+            // BLANK is different — see the else branch below — since there's
+            // no existing measurement there to disturb, only its discovery
+            // cadence is re-armed.
+            for (auto& [ttl, hs] : hops_) {
+                if (hs.address()) {
+                    hop_recheck_at[ttl] = 0.0;
+                } else {
+                    // A hop showing blank (`*`) — either still mid-discovery,
+                    // or it lost its address earlier (e.g. the legacy-miss
+                    // guarded wipe, kLegacyMissThreshold above) and has since
+                    // fallen back to the slow steady `interval` cadence for
+                    // rediscovery (see kDiscoveryTries' fast-cadence comment
+                    // in try_send). A recheck request is exactly the moment
+                    // to give it a fresh fast-discovery burst on demand
+                    // instead of making the user wait out however long the
+                    // steady cadence takes to get lucky against a router that
+                    // only rarely answers a TTL-elicited probe — same
+                    // kDiscoveryTries cap either way, just re-armed now.
+                    tries[ttl] = 0;
+                    next_send[ttl] = 0.0;
+                }
+            }
+            // Also immediately re-arm the destination-shrink probe (see
+            // dest_shrink_check_at_ below), which likewise already runs on
+            // its own kHopRecheckSecs cadence — a manual recheck should check
+            // for a route that's gotten SHORTER just as eagerly as it
+            // re-verifies already-known hops.
+            dest_shrink_check_at_ = 0.0;
         }
 
         if (paused && paused->load()) {
+            // Keep the silence-watchdog clock from running while there's
+            // nothing to receive by design — otherwise resuming after a long
+            // pause would immediately look like a dead socket and force an
+            // unnecessary rebuild.
+            last_any_reply_at = now_secs();
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
@@ -1014,6 +1312,7 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
                         hops_.find(ttl)->second.push(now, *shared);
                         buffer.push_back(NewPoint{ttl, now, *shared});
                         last_reply_at[ttl] = now;
+                        last_any_reply_at = now; // session-wide: see the silence-watchdog comment above — a fresh adopted sample is still real evidence this host's network stack is working
                         nx = now + interval; // steady cadence; we measured via adoption
                         adopted = true;
                     }
@@ -1056,12 +1355,25 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
                         tokens -= 1.0;
                         if (!use_direct) ++tries[ttl];
                         if (due_recheck) recheck_at = now;
+                        consecutive_send_fails = 0;
                     } else {
                         // do not consume a token or count a try for a failed send;
                         // refund the global token we took, and mark that pacing
                         // prevented sends this round.
                         g_pacer().refund();
                         due_but_paced_out = true;
+                        // The raw send() call itself failed (not a timeout —
+                        // this is the OS refusing sendto() outright), most
+                        // often a socket left over from before a sleep/
+                        // interface change. kMaxConsecutiveSendFails in a row
+                        // requests a rebuild so the engine heals itself
+                        // instead of spinning here forever — see
+                        // kMaxConsecutiveSendFails' comment above.
+                        if (++consecutive_send_fails >= kMaxConsecutiveSendFails) {
+                            std::lock_guard<std::mutex> lk(settings_mtx_);
+                            rebuild_needed_ = true;
+                            consecutive_send_fails = 0;
+                        }
                     }
                     // Fast cadence only where it helps: an answered hop only
                     // during the post-destination settle window; an unanswered
@@ -1072,11 +1384,32 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
                     // confirmed loop-audit hop, which always uses the slow
                     // kLoopAuditSecs backoff regardless of any of that, so a
                     // stuck tail costs near-zero load without ever going silent.
+                    //
+                    // Deliberately NOT gated on the session-wide `discovering`
+                    // flag for the unanswered-hop case (unlike the have_addr
+                    // branch, which legitimately only wants the settle-window
+                    // burst once, right after initial route discovery). That
+                    // flag answers "is the SESSION still finding its route",
+                    // but a hop can lose its own address well after the
+                    // session is fully settled — e.g. the legacy-miss guarded
+                    // wipe (see kLegacyMissThreshold above) firing on a
+                    // long-running target — and tries[ttl] is already reset
+                    // to 0 whenever that happens, so this is exactly the same
+                    // per-hop kDiscoveryTries-capped burst, just no longer
+                    // blocked from re-firing after the session's very first
+                    // discovery phase. Doesn't reopen the flood/scan risk the
+                    // `discovering` gate was originally about avoiding (see
+                    // the design comment above kDiscoveryInterval): the real
+                    // safety net is the per-target token bucket and the
+                    // process-wide pacer, both still fully in effect here —
+                    // this only changes how favourably a SPARSE, already-
+                    // capped burst for one re-lost hop is scheduled within
+                    // that budget, not how large the budget itself is.
                     if (loop_audit) {
                         nx = now + kLoopAuditSecs;
                     } else {
                         bool fast = have_addr ? settling
-                                              : (discovering && tries[ttl] < kDiscoveryTries);
+                                              : (tries[ttl] < kDiscoveryTries);
                         nx = now + (fast ? (std::min)(interval, kDiscoveryInterval) : interval);
                     }
                 } else {
@@ -1099,6 +1432,49 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
             rr = static_cast<uint8_t>(rr % max_hop + 1);
         }
         for (uint8_t ttl = 1; ttl <= max_hop; ++ttl) { if (answered(ttl)) try_send(ttl); if (ttl == 255) break; }
+
+        // Deliberate check for a SHORTENED route (e.g. a VPN/tunnel just came
+        // up). Once dest_hop_ is set, compute_max_hop() caps every probe at
+        // 1..dest_hop_ and try_send()'s recheck logic only ever re-verifies
+        // hops already inside that range — nothing ever sends a fresh,
+        // TTL-limited probe strictly BELOW dest_hop_, so a real reply from a
+        // now-closer destination has no path to ever be observed (see the
+        // TimeExceeded-at-dest_hop_ un-freeze above, which only covers the
+        // opposite, route-lengthened direction). Send exactly one legacy
+        // probe at ttl = dest_hop_ - 1, targeting the destination directly,
+        // on the same kHopRecheckSecs cadence as the ordinary per-hop
+        // recheck, tracked separately via dest_shrink_check_at_ so it doesn't
+        // disturb that hop's own hop_recheck_at bookkeeping. If the
+        // destination genuinely answers (EchoReply, or Unreachable from
+        // dest_) at this lower TTL, the ordinary reply-handling arrival logic
+        // below shrinks dest_hop_ via its existing min() — this reply's `hop`
+        // IS the lower TTL, unlike a stale recheck at the old TTL which could
+        // never move it. If instead a real intermediate router answers with
+        // TimeExceeded, that's just an ordinary confirmation the path is
+        // still that length, handled like any other legacy reply.
+        if (dest_hop_ && *dest_hop_ > 1 && now - dest_shrink_check_at_ >= kHopRecheckSecs) {
+            uint8_t shrink_ttl = static_cast<uint8_t>(*dest_hop_ - 1);
+            if (tokens >= 1.0 && g_pacer().try_take(now)) {
+                uint16_t seq = next_seq();
+                bool sent = sock->send(*dest_, shrink_ttl, icmp_id_, seq, s.payload_size, paris_checksum_target_);
+                if (sent) {
+                    pending[seq] = Pending{shrink_ttl, now, false, std::string()};
+                    tokens -= 1.0;
+                    dest_shrink_check_at_ = now;
+                    consecutive_send_fails = 0;
+                } else {
+                    g_pacer().refund();
+                    // Same dead-socket self-heal as the main try_send lambda
+                    // above — this send uses the same `sock`, so a failure
+                    // here is exactly as meaningful a signal.
+                    if (++consecutive_send_fails >= kMaxConsecutiveSendFails) {
+                        std::lock_guard<std::mutex> lk(settings_mtx_);
+                        rebuild_needed_ = true;
+                        consecutive_send_fails = 0;
+                    }
+                }
+            }
+        }
         // If probes were due but the pacer held them, wake when the next token
         // is ready rather than busy-spinning.
         if (due_but_paced_out) soonest = (std::min)(soonest, now + 1.0 / kMaxProbeRate);
@@ -1107,10 +1483,15 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
         double slice = (std::min)(soonest, last_emit + 0.25) - now;
         if (slice < 0.005) slice = 0.005;
         // Ceiling above which a reply is treated as a stale queue artifact
-        // rather than a real measurement. Kept a bit above the loss `timeout`
-        // (but hard-capped) so a genuinely slow-but-real hop isn't discarded,
-        // while the multi-second ramp from ICMP rate-limit queue drainage is.
-        double stale_ceiling = (std::max)(timeout * 2.0, 2.0); // seconds
+        // rather than a real measurement. Floor raised from 2.0s to 5.0s —
+        // at a fast probe/timeout config the old floor discarded genuine
+        // jitter spikes on lossy/congested links as if they were rate-limit
+        // queue artifacts. Still scales with the user's own configured
+        // timeout for longer-timeout targets (e.g. an intentionally
+        // generous timeout for a known-bad satellite link) rather than a
+        // flat cap, since a flat 5s ceiling would silently discard replies
+        // the user explicitly configured a >5s timeout to wait for.
+        double stale_ceiling = (std::max)(timeout * 2.0, 5.0); // seconds
         // Optional runtime debug tracing: enable by setting NETPULSE_DEBUG=1
         static bool debug_enabled = !!getenv("NETPULSE_DEBUG");
         // Every reply this session will ever see arrives via inbox_, pushed by
@@ -1172,6 +1553,7 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
                     ensure_hop(hop).push(inc.at, rtt);
                     buffer.push_back(NewPoint{hop, inc.at, rtt});
                     last_reply_at[hop] = inc.at;
+                    last_any_reply_at = inc.at; // session-wide: see the silence-watchdog comment above
                     shared_publish(s.source_addr, predecessor_of(hop), inc.from, inc.at, rtt, id_, hop);
                     echo_ok[hop] = true;
                     echo_miss[hop] = 0;
@@ -1236,11 +1618,27 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
                 echo_ok.erase(hop);
                 echo_silent.erase(hop);
                 echo_miss.erase(hop);
+                legacy_miss.erase(hop);
+                legacy_miss_since.erase(hop);
+                wipe_count.erase(hop); // a genuinely different device — see wipe_count's doc comment
             }
             hs.set_address(inc.from);
+            // A legacy probe just successfully confirmed an address at this
+            // hop (whether it's the same device as before, or a flap to a
+            // new one) — reset the miss counter driving clear_address()
+            // below, same requirement either way: consecutive misses, not
+            // total misses, are what should trigger clearing a stale hop.
+            legacy_miss[hop] = 0;
+            legacy_miss_since.erase(hop);
             hs.push(inc.at, rtt);
+            // Not every reply carries an RFC 4884/4950 extension structure —
+            // only overwrite the hop's label stack when this one actually had
+            // labels, so an ordinary reply right after a labeled one doesn't
+            // blank out the last-known stack.
+            if (!inc.reply.mpls_labels.empty()) hs.set_mpls_labels(inc.reply.mpls_labels);
             buffer.push_back(NewPoint{hop, inc.at, rtt});
             last_reply_at[hop] = inc.at; // a genuine transit/echo reply landed at this hop
+            last_any_reply_at = inc.at; // session-wide: see the silence-watchdog comment above
             hop_recheck_at[hop] = inc.at; // this legacy reply IS a fresh identity re-confirmation
 
             // Routing-loop detection + two-strikes confirmation + self-heal
@@ -1278,11 +1676,18 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
                         // which removes the common IPv4 cause of this at the
                         // root; this counter is the backstop for the rest).
                         if (!loop_at_hop || hop < *loop_at_hop) loop_at_hop = hop;
-                        if (!error_ || loop_error) {
-                            error_ = "Possible routing loop: hop " + std::to_string(hop) +
-                                    " repeats the address seen at hop " + std::to_string(*dup_at);
-                            loop_error = true;
-                        }
+                        // Dedicated fields (loop_warning_/loop_hop_/
+                        // loop_dup_at_), not error_ — a routing loop is an
+                        // advisory, every hop's data is still valid, so this
+                        // must never make the UI hide the table (see the
+                        // Snapshot doc comments in session.hpp). Structured
+                        // hop numbers alongside the message so the UI can
+                        // highlight exactly the two implicated rows instead
+                        // of only showing text.
+                        loop_warning_ = "Possible routing loop: hop " + std::to_string(hop) +
+                                        " repeats the address seen at hop " + std::to_string(*dup_at);
+                        loop_hop_ = hop;
+                        loop_dup_at_ = *dup_at;
                     }
                 } else if (loop_at_hop && hop >= *loop_at_hop) {
                     // Self-heal: a CLEAN reply at or beyond the current loop
@@ -1296,7 +1701,9 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
                     // and must NOT clear it prematurely.
                     loop_at_hop.reset();
                     loop_confirm.clear();
-                    if (loop_error) { error_.reset(); loop_error = false; }
+                    loop_warning_.reset();
+                    loop_hop_.reset();
+                    loop_dup_at_.reset();
                 }
             }
             // Publish this real measurement so other targets that traverse the
@@ -1331,11 +1738,13 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
                 // The loop auditor only matters while the real destination is
                 // still unknown (compute_max_hop only consults it in that
                 // branch) — once genuinely reached, it's moot; clear it so a
-                // stale loop message doesn't linger in `error_`.
+                // stale loop advisory doesn't linger.
                 if (loop_at_hop) {
                     loop_at_hop.reset();
                     loop_confirm.clear();
-                    if (loop_error) { error_.reset(); loop_error = false; }
+                    loop_warning_.reset();
+                    loop_hop_.reset();
+                    loop_dup_at_.reset();
                 }
             }
             pending.erase(it);
@@ -1379,10 +1788,97 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
                     // strict ICMP policy — so its rate-limit loss, like
                     // mtr/tracert would show for it, is unavoidable).
                     if (++echo_miss[hop] >= kEchoTestTries) echo_silent[hop] = true;
+                } else if (!it->second.direct) {
+                    // A LEGACY (TTL-elicited) probe timed out. If this hop
+                    // has no address yet, that's just ordinary discovery in
+                    // progress — nothing to do. If it DOES have an address,
+                    // this is the case set_address()'s flap-detection can
+                    // never see: the route changed and the new device is
+                    // silently dropping the legacy probe instead of
+                    // replying with a different address. Left unhandled,
+                    // the old address (still a real, globally-routable IP)
+                    // would linger forever and keep answering separate
+                    // direct-echo probes sent to it, producing a hop that
+                    // blends two different physical routes.
+                    //
+                    // The wipe below is TIME-BOXED, not just a raw miss
+                    // count — see kLegacyMissWindowSecs' comment above for
+                    // why. An echo_ok/probationary hop only gets ONE legacy
+                    // probe per kHopRecheckSecs, so kLegacyMissThreshold of
+                    // those (~kLegacyMissWindowSecs apart) is a real
+                    // route-change signal. An echo_silent hop instead gets a
+                    // legacy probe EVERY interval (its whole steady-state
+                    // channel, no separate direct-echo stream to blend a
+                    // stale IP into), so kLegacyMissThreshold consecutive
+                    // per-second misses there is just ordinary loss/rate-
+                    // limiting on a router that generates Time-Exceeded
+                    // slowly — requiring the streak to also span
+                    // kLegacyMissWindowSecs of real time is what keeps that
+                    // case from wiping the hop (and its whole latency
+                    // history) every couple of seconds.
+                    auto hit = hops_.find(hop);
+                    if (hit != hops_.end() && hit->second.address()) {
+                        int& miss = legacy_miss[hop];
+                        double& since = legacy_miss_since[hop];
+                        if (miss == 0) since = now; // start of a new streak
+                        ++miss;
+                        // s.legacy_miss_threshold/window_secs are opt-in
+                        // per-target overrides (0 = unset) — see their doc
+                        // comment in session.hpp. Falls back to the built-in
+                        // defaults tuned for a lossy consumer-ISP path.
+                        int effective_threshold = s.legacy_miss_threshold > 0
+                            ? s.legacy_miss_threshold : kLegacyMissThreshold;
+                        double effective_window = s.legacy_miss_window_secs > 0.0
+                            ? s.legacy_miss_window_secs : kLegacyMissWindowSecs;
+                        if (miss >= effective_threshold && (now - since) >= effective_window) {
+                            // Final gate: only wipe a hop that's actually
+                            // been LOOKING reliable — see
+                            // kGuardedWipeMaxRecentLossPct's comment above.
+                            // A chronically lossy hop (already well past
+                            // this threshold before the current streak even
+                            // started) isn't "falsely healthy" and doesn't
+                            // get this protection — it stays put, silence
+                            // streak or not, since flapping it every ~90s is
+                            // strictly worse than leaving a possibly-stale
+                            // address in place a while longer.
+                            HopStat recent = hit->second.compute(kGuardedWipeRecentLossWindowSecs);
+                            int& wipes = wipe_count[hop];
+                            if (recent.loss <= kGuardedWipeMaxRecentLossPct && wipes < kMaxGuardedWipesPerHop) {
+                                hit->second.clear_address();
+                                ++wipes; // NOT reset below — see wipe_count's doc comment
+                                tries[hop] = 0;
+                                next_send[hop] = 0.0;
+                                echo_ok.erase(hop);
+                                echo_silent.erase(hop);
+                                echo_miss.erase(hop);
+                                legacy_miss.erase(hop);
+                                legacy_miss_since.erase(hop);
+                            }
+                        }
+                    }
                 }
                 it = pending.erase(it);
             } else {
                 ++it;
+            }
+        }
+
+        // 3b) Dead-socket / dead-route self-heal via total silence — see
+        // kSilenceRebuildMinSecs's comment above for the full rationale.
+        // Gated on max_hop_seen_ (this session has gotten at least one real
+        // reply at SOME point) so a target that has NEVER once answered —
+        // genuinely unreachable from the start, not a network regression —
+        // isn't repeatedly wiped and rediscovered for no benefit; this only
+        // fires for a session that WAS getting replies and then went
+        // completely silent, which is exactly the sleep/wake/interface-flap
+        // signature, and is a much stronger signal than any single hop's own
+        // loss (it would take every hop, including the destination, going
+        // silent at once for this to be a false positive).
+        if (max_hop_seen_ > 0) {
+            double silence_threshold = (std::max)(kSilenceRebuildMinSecs, interval * kSilenceRebuildIntervalMult);
+            if (now - last_any_reply_at >= silence_threshold) {
+                std::lock_guard<std::mutex> lk(settings_mtx_);
+                rebuild_needed_ = true;
             }
         }
 
@@ -1456,6 +1952,15 @@ Settings Session::settings_snapshot() const {
     return settings_;
 }
 
+void Session::force_recheck() {
+    force_recheck_needed_.store(true);
+}
+
+void Session::request_rebuild() {
+    std::lock_guard<std::mutex> lk(settings_mtx_);
+    rebuild_needed_ = true;
+}
+
 Snapshot Session::snapshot(bool running, std::vector<NewPoint> new_points) const {
     Snapshot s;
     s.target = target_;
@@ -1463,6 +1968,9 @@ Snapshot Session::snapshot(bool running, std::vector<NewPoint> new_points) const
     s.family = family_;
     s.running = running;
     s.error = error_;
+    s.loop_warning = loop_warning_;
+    s.loop_hop = loop_hop_;
+    s.loop_dup_at = loop_dup_at_;
     for (const auto& [h, hs] : hops_) {
         s.hops.push_back(hs.compute(settings_.focus_secs));
         if (hs.is_dest()) s.dest_hop = h;

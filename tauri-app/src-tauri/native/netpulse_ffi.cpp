@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 
 #include "netpulse/manager.hpp"
@@ -49,7 +50,11 @@ static Settings settings_from_params(Settings base,
         base.payload_size = std::min<size_t>(base.payload_size, 1432);
     }
 #endif
-    base.max_hops = static_cast<uint8_t>(clampd(maxhops, 1.0, 64.0));
+    // 255 is the real ceiling here — max_hops is a uint8_t (Settings, session.hpp)
+    // and TTL itself is an 8-bit IP header field, so nothing above 255 is even
+    // representable. The old 64 cap was arbitrary, not a protocol or type limit,
+    // and was tight enough to matter for genuinely deep or looping paths.
+    base.max_hops = static_cast<uint8_t>(clampd(maxhops, 1.0, 255.0));
 
     std::string src_s(src);
     if (NETPULSE_OPAQUE(src_s.size() <= 64)) base.source_addr = src_s; // ignore absurd input, same as napi.cpp
@@ -91,6 +96,7 @@ bool update_target(uint64_t id,
 void pause_target(uint64_t id, bool on) { mgr().pause(id, on); }
 void stop_target(uint64_t id) { mgr().stop(id); }
 void remove_target(uint64_t id) { mgr().remove(id); }
+void force_recheck(uint64_t id) { mgr().force_recheck(id); }
 
 rust::String get_state_json(double focus_secs, bool has_focus) {
     std::optional<double> focus = has_focus ? std::optional<double>(focus_secs) : std::nullopt;
@@ -99,6 +105,18 @@ rust::String get_state_json(double focus_secs, bool has_focus) {
     // needed, which is the whole point of routing output through JSON.
     std::string j = mgr().state_json(focus);
     return rust::String(j);
+}
+
+rust::String get_target_config_json(uint64_t id) {
+    return rust::String(mgr().target_config_json(id));
+}
+
+rust::String export_target_full_csv(uint64_t id) {
+    return rust::String(mgr().export_target_full_csv(id));
+}
+
+rust::String export_all_targets_full_csv() {
+    return rust::String(mgr().export_all_targets_full_csv());
 }
 
 rust::String list_interfaces_json() {
@@ -115,6 +133,53 @@ rust::String list_interfaces_json() {
 
 rust::String engine_build() {
     return rust::String(NETPULSE_OBF_STR(NETPULSE_ENGINE_BUILD));
+}
+
+void set_data_dir(rust::Str dir) {
+    ColdStore::instance().configure(std::string(dir));
+}
+
+rust::String ping_start(rust::Str host, double count, bool continuous,
+                         double size, double timeout_secs, double ttl,
+                         double interval_secs, rust::Str family, bool raw, rust::Str src) {
+    std::string host_s(host);
+    if (host_s.empty() || host_s.size() > 255) {
+        throw std::runtime_error("Invalid host");
+    }
+    PingConfig cfg;
+    cfg.target = host_s;
+    cfg.count = static_cast<int>(clampd(count, 1.0, 10000.0));
+    cfg.continuous = continuous;
+    cfg.payload_size = static_cast<size_t>(clampd(size, 0.0, 65500.0));
+    cfg.timeout_secs = clampd(timeout_secs, 0.0, 60.0);
+    cfg.ttl = static_cast<uint8_t>(clampd(ttl, 1.0, 255.0));
+    cfg.interval_secs = clampd(interval_secs, 0.05, 3600.0);
+    std::string fam_s(family);
+    cfg.family = fam_s == "v4" ? PingFamilyPref::V4 : fam_s == "v6" ? PingFamilyPref::V6 : PingFamilyPref::Auto;
+    cfg.privileged = raw;
+    std::string src_s(src);
+    if (NETPULSE_OPAQUE(src_s.size() <= 64)) cfg.source_addr = src_s; // ignore absurd input, same as add_target/update_target
+
+    // Purely for display (shown in the UI in place of the old, fake OS
+    // shell-command line) — not parsed back by anything, so this can be
+    // freely reworded without touching the wire contract.
+    std::ostringstream cmd;
+    cmd << "native ping -> " << cfg.target
+        << " (" << (fam_s.empty() ? "auto" : fam_s) << ", "
+        << (cfg.continuous ? std::string("continuous") : (std::to_string(cfg.count) + " probes"))
+        << ", " << cfg.payload_size << "B, ttl=" << int(cfg.ttl) << ")";
+
+    uint64_t id = mgr().start_ping(cfg, cmd.str());
+    std::string j = "{\"id\":" + std::to_string(id) + ",\"cmd\":\"" + esc(cmd.str()) + "\"}";
+    return rust::String(j);
+}
+
+void ping_stop(uint64_t id) {
+    mgr().stop_ping(id);
+}
+
+rust::String ping_poll(uint64_t id) {
+    return rust::String(mgr().poll_ping(id));
 }
 
 } // namespace netpulse_ffi

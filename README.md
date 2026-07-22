@@ -93,6 +93,18 @@ npx tauri dev      # launches the app with hot-reload
 npx tauri build    # produces a real installer (NSIS/AppImage/dmg per OS)
 ```
 
+> **`npm install` needs one non-npm-registry download.** The Excel-export
+> feature depends on `xlsx` (SheetJS), whose npm-published build is
+> permanently frozen on an old, vulnerable release — see `tauri-app/.npmrc`'s
+> comment for why. `package.json` installs it from SheetJS's own CDN
+> (`cdn.sheetjs.com`) instead, and `.npmrc` permits that one exception to
+> npm's default "no installing from a raw URL" policy. Two practical
+> consequences: (1) `npm install`/`npm ci` needs outbound access to
+> `cdn.sheetjs.com`, not just the npm registry — relevant if you're behind a
+> restrictive corporate/CI firewall; (2) `.npmrc` must actually be committed
+> to the repo for a fresh clone (including CI) to pick it up — it's not
+> gitignored, but worth knowing if you ever regenerate project scaffolding.
+
 See [`docs/TAURI_MIGRATION.md`](docs/TAURI_MIGRATION.md) for the full
 architecture writeup, and [`docs/OBFUSCATED_BUILD.md`](docs/OBFUSCATED_BUILD.md)
 for the optional `--features obfuscate` hardened build variant.
@@ -247,7 +259,9 @@ trademarks of their respective owners; Net Pulse — Open Net Tools is an indepe
 The app is organized into tabs across the top:
 
 - **Path / MTR** (home) — the live multi-target path-latency monitor.
-- **Ping** — a single-host ping using the OS `ping`, streamed cmd-style.
+- **Ping** — a single-host ping using the same native ICMP engine as the
+  path monitor (pooled sockets, one shared reply-dispatch thread — not an OS
+  `ping` subprocess), with live count/size/TTL/interval/family controls.
 - **DNS Lookup** — forward (A/AAAA/CNAME) and reverse (PTR) resolution.
 - **Port Scanner** — a bounded TCP connect scan (≤ 2048 ports/scan). Only scan
   hosts you own or are authorized to test.
@@ -255,4 +269,3 @@ The app is organized into tabs across the top:
 The Ping, DNS, and Port Scanner tools run in the desktop app (they use the OS
 network stack via the Rust host); they are unavailable in a plain browser dev
 server.
-

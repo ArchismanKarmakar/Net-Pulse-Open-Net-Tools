@@ -16,6 +16,12 @@ struct ParsedReply {
     ReplyKind kind;
     uint16_t id;
     uint16_t seq;
+    // RFC 4950 MPLS label stack from a Time Exceeded/Unreachable's RFC 4884
+    // extension structure, top-of-stack first. Each entry is the raw 32-bit
+    // MPLS shim value: label:20 | exp/tc:3 | S:1 | ttl:8. Empty when the
+    // reply carried no (or an unparseable) extension structure — most
+    // routers along a real path never attach one.
+    std::vector<uint32_t> mpls_labels;
 };
 
 // Internet checksum (RFC 1071).

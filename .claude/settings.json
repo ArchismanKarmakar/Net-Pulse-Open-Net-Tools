@@ -91,10 +91,38 @@
       "Bash(tasklist //FI \"PID eq 46024\")",
       "Bash(powershell -NoProfile -Command \"Get-CimInstance Win32_Process -Filter \\\\\"ProcessId=46024\\\\\" | Select-Object ProcessId,Name,CommandLine | Format-List\")",
       "Bash(taskkill //PID 46024 //F)",
-      "Bash(taskkill //PID 69712 //F)"
+      "Bash(taskkill //PID 69712 //F)",
+      "Bash(cmake --build . --config Debug --target netpulse_core)",
+      "Bash(where cmake.exe)",
+      "Bash(where msbuild.exe)",
+      "Bash(find / -iname \"hickory-resolver-0.26*\" -maxdepth 8 2>/dev/null | head -5; find ~/.cargo -iname \"*hickory-resolver*\" 2>/dev/null | head -20)",
+      "Read(//c//**)",
+      "Bash(find / -iname \"hickory-proto-*\" -path \"*src*\" -maxdepth 8 -type d 2>/dev/null | head -3)",
+      "Bash(find ~/.cargo/registry/src -maxdepth 1 -iname \"hickory-proto*\" 2>/dev/null)",
+      "Read(//c/Users/Archisman/.cargo/registry/src/**)",
+      "Bash(xargs grep -ln \"type NS\")",
+      "Bash(SRC=\"/c/Users/Archisman/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hickory-proto-0.26.1\" *)",
+      "Read(//c/Users/Archisman/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hickory-proto-0.26.1/src/rr/rdata/**)",
+      "Bash(cargo check *)",
+      "Bash(cat \"/c/Users/Archisman/Downloads/Cargo.toml\" 2>&1)",
+      "Read(//c/Users/Archisman/Downloads/**)",
+      "Bash(cd \"c:\\\\Users\\\\Archisman\\\\Downloads\\\\NetPulse-cpp-web\\\\33\\\\NetPulse-cpp-web\\\\web\" && ls src; echo \"---\"; grep -rn \"netpulse\\\\b\" src/*.js 2>/dev/null; echo \"--- check dist bundle for hints \\(built artifact\\) ---\"; grep -o \"window.netpulse[^;]*\" dist/assets/*.js 2>/dev/null | head -5; echo \"--- git log or readme for web section context---\"; sed -n '60,80p' ../README.md)",
+      "Read(//c/Users/Archisman/Downloads/NetPulse-cpp-web/33/**)",
+      "Bash(npx --yes vite build)",
+      "Bash(g++ --version)",
+      "Read(//c/Program Files/Microsoft Visual Studio/**)",
+      "Read(//c/Program Files \\\\\\(x86\\\\\\)/Microsoft Visual Studio/**)",
+      "Bash(find \"/c/Program Files/Microsoft Visual Studio/18\" -iname \"cl.exe\" 2>/dev/null | head -5; find \"/c/Program Files/Microsoft Visual Studio/18\" -iname \"vcvars64.bat\" 2>/dev/null | head -5)",
+      "Read(//c/Program Files/Microsoft Visual Studio/18/**)",
+      "Bash(\"/c/Program Files/Microsoft Visual Studio/18/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe\" --build build --target ALL_BUILD)",
+      "Bash(\"./build/Debug/netpulse_tests.exe\")",
+      "Bash(find \"/c/Program Files/Microsoft Visual Studio/18\" -iname \"cl.exe\" 2>/dev/null | grep -i x64 | head -3)",
+      "Bash(cmd //c '\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Community\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64.bat\" && cl /std:c++20 /EHsc /c /I core\\\\include server\\\\main.cpp /Fo:nul 2>&1')",
+      "Bash(rm -f /tmp/build_server.bat)"
     ],
     "additionalDirectories": [
-      "C:\\Users\\Archisman\\AppData\\Local\\Temp\\plugintest"
+      "C:\\Users\\Archisman\\AppData\\Local\\Temp\\plugintest",
+      "\\tmp"
     ]
   }
 }

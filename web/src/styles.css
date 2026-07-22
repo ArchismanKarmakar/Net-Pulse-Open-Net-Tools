@@ -246,6 +246,8 @@
   .rtt b { @apply text-ink text-[15px]; }
   .rttsub { @apply text-faint text-[11px]; }
   .badge { @apply px-2 py-0.5 rounded-md text-[11px] mx-0.5 font-medium; background: color-mix(in srgb, var(--accent) 16%, var(--panel)); color: var(--accent); }
+  .btn-recheck { @apply text-[11px] px-2 py-0.5 mx-0.5 font-medium; }
+  .btn-recheck:disabled { opacity: .5; cursor: default; }
 
   .cfgstrip { @apply flex items-center gap-3.5 px-3 py-2 mt-1.5 bg-panel border border-border rounded-xl text-xs text-muted flex-wrap; box-shadow: var(--shadow-sm), var(--shadow-inset); }
   .cfgstrip .cfglabel { @apply font-bold tracking-wider text-faint text-[10px]; }
@@ -341,6 +343,15 @@
 aside li:hover .card-pause, aside li.sel .card-pause { opacity: .8; }
 .card-pause:hover { opacity: 1 !important; background: color-mix(in srgb, var(--accent) 18%, var(--panel));
   color: var(--accent); box-shadow: none; }
+
+/* Per-card force-recheck button (added) */
+.card-recheck { opacity: .0; margin-left: 2px; background: transparent; border: none;
+  color: var(--muted); font-size: 12px; line-height: 1; padding: 2px 5px; border-radius: 6px;
+  cursor: pointer; transition: opacity .12s, background .12s, color .12s; }
+aside li:hover .card-recheck, aside li.sel .card-recheck { opacity: .8; }
+.card-recheck:hover { opacity: 1 !important; background: color-mix(in srgb, var(--accent) 18%, var(--panel));
+  color: var(--accent); box-shadow: none; }
+.card-recheck:disabled { opacity: .35 !important; cursor: default; }
 
 /* About dialog (added) */
 .about-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.5); display: flex;

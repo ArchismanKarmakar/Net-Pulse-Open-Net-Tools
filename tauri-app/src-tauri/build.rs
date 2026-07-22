@@ -18,18 +18,60 @@
 //     core/include/netpulse/obfuscate.hpp) through the `obfuscate` Cargo
 //     feature — works with any compiler, no special toolchain required.
 use std::path::PathBuf;
-use tauri_build::{AppManifest, Attributes};
+use tauri_build::{AppManifest, Attributes, WindowsAttributes};
 
 const COMMANDS: &[&str] = &[
     "add_target", "update_target", "pause_target", "stop_target", "remove_target",
+    "force_recheck",
     "get_state", "list_interfaces", "engine_build",
+    "export_target_csv", "export_all_targets_csv",
     "dns_lookup", "reverse_lookup", "port_scan",
     "ping_start", "ping_stop",
+    "write_file", "read_file",
 ];
+
+// Raw ICMP (SOCK_RAW — the only ICMP mode this app uses on any platform, see
+// transport.cpp) requires Administrator on Windows; there is no unprivileged
+// alternative (SOCK_DGRAM+ICMP, which Linux supports, simply doesn't exist
+// in Winsock). This does NOT mean the whole app should require elevation,
+// though — that was tried here previously (requireAdministrator) and caused
+// two real problems: (1) it broke `tauri dev` outright, since Windows can't
+// silently elevate a child process launched with redirected stdout — which
+// is exactly how the dev orchestrator spawns this exe to stream logs, so
+// every dev run failed with "the requested operation requires elevation"
+// (os error 740) even though the identical exe launched fine standalone;
+// (2) it meant a UAC prompt on literally every app launch for every user,
+// directly contradicting the NSIS installer hooks (windows/hooks.nsh) built
+// specifically to avoid that — those add the Windows Firewall exceptions at
+// INSTALL time (already elevated) so raw sockets just work without any
+// per-launch prompt. The reactive path (the in-app error banner + firewall-
+// detection hint when a socket() call fails) already covers the case where
+// elevation genuinely wasn't granted; asInvoker + that existing reactive UX
+// is strictly better than forcing elevation on every launch regardless of
+// whether the user is even using a feature that needs it.
+const WINDOWS_MANIFEST: &str = r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*" />
+    </dependentAssembly>
+  </dependency>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <asmv3:windowsSettings xmlns="http://schemas.microsoft.com/SMI/2024/WindowsSettings">
+      <supportedArchitectures>amd64 arm64</supportedArchitectures>
+    </asmv3:windowsSettings>
+    <security>
+      <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>"#;
 
 fn main() {
     tauri_build::try_build(
-        Attributes::new().app_manifest(AppManifest::new().commands(COMMANDS)),
+        Attributes::new()
+            .app_manifest(AppManifest::new().commands(COMMANDS))
+            .windows_attributes(WindowsAttributes::new().app_manifest(WINDOWS_MANIFEST)),
     )
     .expect("failed to run tauri-build (app manifest / command permissions)");
 
@@ -47,6 +89,7 @@ fn main() {
         .file(core_src.join("stats.cpp"))
         .file(core_src.join("transport.cpp"))
         .file(core_src.join("session.cpp"))
+        .file(core_src.join("ping_run.cpp"))
         .include(&core_include)
         .include(&native_dir)
         .std("c++20");

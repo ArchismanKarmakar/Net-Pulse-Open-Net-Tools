@@ -3,216 +3,25 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
 } from 'recharts'
 import * as bgp from './bgp'
-import ReactDOM from 'react-dom'
 
-const FOCUS = [
-  ['Last 5 sec', 5], ['Last 10 sec', 10], ['Last 30 sec', 30],
-  ['Last 1 min', 60], ['Last 2 min', 120], ['Last 5 min', 300], ['Last 10 min', 600],
-  ['Last 30 min', 1800], ['Last 1 hour', 3600], ['Last 3 hours', 10800],
-  ['Last 6 hours', 21600], ['Last 12 hours', 43200], ['Last 24 hours', 86400], ['All', 'all'],
-]
-const SCALE_STEPS = [25, 50, 75, 100, 150, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000]
-
-// Transport: ALL data flows through window.netpulse — the in-process C++
-// engine bridged over Electron IPC by preload.js. There is no HTTP fallback:
-// this app never opens a socket, a port, or a WebSocket for its own data path.
-// preload.js injects window.netpulse into every window this app creates
-// (whether the page is loaded from file:// in production or from the Vite dev
-// server during development), so a fallback was never actually reachable —
-// removing it makes that guarantee explicit instead of implicit.
-const api = async (path, opts) => {
-  const np = (typeof window !== 'undefined') && window.netpulse
-  if (!np) throw new Error('Net Pulse native engine (window.netpulse) is not available — this UI must run inside the Net Pulse — Open Net Tools desktop app.')
-  if (!path.startsWith('/api/')) throw new Error(`api(): unexpected path ${path}`)
-  const [base, qs] = path.split('?')
-  const q = {}; new URLSearchParams(qs || '').forEach((v, k) => { q[k] = v })
-  switch (base) {
-    case '/api/state': return np.getState(q.focus && q.focus !== 'all' ? Number(q.focus) : undefined)
-    case '/api/interfaces': return np.listInterfaces()
-    case '/api/add': return { id: await np.addTarget({ target: q.target, family: q.family, probe: Number(q.probe), trace: Number(q.trace), timeout: Number(q.timeout), payload: Number(q.payload), maxhops: Number(q.maxhops), raw: q.raw !== '0', src: q.src || '' }) }
-    case '/api/update': { const o = {}; ['probe', 'timeout', 'payload', 'maxhops'].forEach((k) => { if (q[k] != null) o[k] = Number(q[k]) }); if (q.family) o.family = q.family; if (q.src != null) o.src = q.src; if (q.pausedHops != null) o.pausedHops = q.pausedHops === '' ? [] : q.pausedHops.split(',').map(Number).filter((n) => Number.isFinite(n)); await np.updateTarget(Number(q.id), o); return { ok: true } }
-    case '/api/pause': await np.pauseTarget(Number(q.id), q.on !== '0'); return {}
-    case '/api/stop': await np.stopTarget(Number(q.id)); return {}
-    case '/api/remove': await np.removeTarget(Number(q.id)); return {}
-    default: throw new Error(`api(): unknown endpoint ${base}`)
-  }
-}
-const fmt = (v) => (v === null || v === undefined ? '—' : Number(v).toFixed(1))
-const timeFmt = (s) => new Date(s * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-
-function hopColor(i, sel) {
-  if (sel) return '#3a82f6'
-  const h = (i * 0.61803398875) % 1
-  return `hsl(${Math.round(h * 360)}, 60%, 60%)`
-}
-function latColor(ms, alertMs) {
-  if (ms == null) return '#7a8699'
-  const t = Math.max(0, Math.min(1, ms / Math.max(1, alertMs)))
-  const r = t < 0.5 ? Math.round(t * 2 * 255) : 230
-  const g = t < 0.5 ? 200 : Math.round(200 * (1 - (t - 0.5) * 2))
-  return `rgb(${r},${g},60)`
-}
-function lossBg(loss) {
-  return loss > 0 ? `rgba(248,81,73,${(0.10 + 0.24 * loss / 100).toFixed(3)})` : 'rgba(63,185,80,0.10)'
-}
-function niceCeil(v) {
-  for (const s of SCALE_STEPS) if (v <= s) return s
-  return Math.ceil(v / 1000) * 1000
-}
-function download(name, text, type = 'text/plain') {
-  const blob = new Blob([text], { type })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a'); a.href = url; a.download = name; a.click()
-  URL.revokeObjectURL(url)
-}
-
-const Sparkline = React.memo(function Sparkline({ points, color, w = 96, h = 22 }) {
-  if (!points || points.length < 2) return <svg width={w} height={h} />
-  const rtts = points.filter((p) => p[1] != null).map((p) => p[1])
-  if (rtts.length < 2) return <svg width={w} height={h} />
-  const lo = Math.min(...rtts), hi = Math.max(...rtts), span = hi - lo || 1, n = points.length
-  const xy = (i, v) => [((i / (n - 1)) * (w - 2) + 1).toFixed(1), (h - 1 - ((v - lo) / span) * (h - 2)).toFixed(1)]
-  const segs = []; let cur = []
-  points.forEach((p, i) => { if (p[1] == null) { if (cur.length) { segs.push(cur); cur = [] } } else cur.push(xy(i, p[1]).join(',')) })
-  if (cur.length) segs.push(cur)
-  return (
-    <svg width={w} height={h}>
-      {points.map((p, i) => p[1] == null
-        ? <line key={i} x1={(i / (n - 1)) * (w - 2) + 1} x2={(i / (n - 1)) * (w - 2) + 1} y1="0" y2={h} stroke="rgba(240,70,70,.3)" />
-        : null)}
-      {segs.map((s, i) => <polyline key={i} points={s.join(' ')} fill="none" stroke={color} strokeWidth="1.3" />)}
-    </svg>
-  )
-})
-
-// PingPlotter-style shared-scale latency graph: min–max whisker, avg circle,
-// cur ✕, row shaded by loss, and a red line threading consecutive hops.
-function LatencyGraph({ h, prevAvg, nextAvg, scaleMax, alertMs, w = 360, hgt = 24 }) {
-  const X = (ms) => Math.max(0, Math.min(1, ms / scaleMax)) * (w - 10) + 5
-  const yc = hgt / 2
-  return (
-    <svg width={w} height={hgt} className="latgraph">
-      <rect x="0" y="0" width={w} height={hgt} fill={lossBg(h.loss)} />
-      {h.avg != null && prevAvg != null && <line x1={X(prevAvg)} y1="0" x2={X(h.avg)} y2={yc} stroke="#e5484d" strokeWidth="1.4" />}
-      {h.avg != null && nextAvg != null && <line x1={X(h.avg)} y1={yc} x2={X(nextAvg)} y2={hgt} stroke="#e5484d" strokeWidth="1.4" />}
-      {h.min != null && h.max != null && (
-        <g stroke="#9aa7b8">
-          <line x1={X(h.min)} x2={X(h.max)} y1={yc} y2={yc} />
-          <line x1={X(h.min)} x2={X(h.min)} y1={yc - 4} y2={yc + 4} />
-          <line x1={X(h.max)} x2={X(h.max)} y1={yc - 4} y2={yc + 4} />
-        </g>
-      )}
-      {h.avg != null && <circle cx={X(h.avg)} cy={yc} r="3.6" fill="#0e1116" stroke={latColor(h.avg, alertMs)} strokeWidth="1.8" />}
-      {h.cur != null && <text x={X(h.cur)} y={yc + 4} fill={latColor(h.cur, alertMs)} fontSize="12" textAnchor="middle">✕</text>}
-    </svg>
-  )
-}
-
-function RpkiBadge({ status }) {
-  if (!status) return null
-  const m = { valid: ['#3fb950', 'RPKI valid'], invalid: ['#f85149', 'RPKI invalid'], 'unknown': ['#d29922', 'RPKI unknown'] }
-  const [c, t] = m[status] || ['#7a8699', `RPKI ${status}`]
-  return <span className="chip" style={{ borderColor: c, color: c }}>{t}</span>
-}
-
-function Drawer({ detail, onClose }) {
-  if (!detail) return null
-  const d = detail.data
-  return (
-    <div className="drawer">
-      <div className="drawer-head">
-        <b>{detail.ip}</b>
-        <button className="x" onClick={onClose}>✕</button>
-      </div>
-      {detail.private ? <div className="muted">Private / non-routable address — no BGP data.</div>
-        : detail.loading ? <div className="muted"><span className="spinner sm" /> Querying RIPEstat…</div>
-        : !d ? <div className="muted">No data (offline, or not in the routing table).</div>
-        : (
-          <div className="drawer-body">
-            <div className="kv"><span>ASN</span><b>{d.asn ? `AS${d.asn}` : '—'}</b></div>
-            <div className="kv"><span>Network</span><b>{d.holder || d.netname || '—'}</b></div>
-            <div className="kv"><span>Prefix</span><b>{d.prefix || '—'}</b></div>
-            <div className="kv"><span>Routing</span><b>{d.announced === true ? 'announced' : d.announced === false ? 'not announced' : '—'}</b></div>
-            <div className="kv"><span>RPKI</span><b><RpkiBadge status={d.rpki} /></b></div>
-            <div className="kv"><span>Location</span><b>{[d.city, d.country].filter(Boolean).join(', ') || '—'}</b></div>
-            {d.descr && <div className="kv"><span>Owner</span><b>{d.descr}</b></div>}
-            {d.paths && d.paths.length > 0 && (
-              <div className="paths">
-                <div className="paths-h">Sample BGP AS-paths (RIS)</div>
-                {d.paths.map((p, i) => <div key={i} className="aspath">{p}</div>)}
-              </div>
-            )}
-            <div className="drawer-links">
-              {d.asn && <a href={bgp.links.heAsn(d.asn)} target="_blank" rel="noreferrer">bgp.he.net AS{d.asn}</a>}
-              <a href={bgp.links.heIp(detail.ip)} target="_blank" rel="noreferrer">he.net IP</a>
-              {d.asn && <a href={bgp.links.peeringdb(d.asn)} target="_blank" rel="noreferrer">PeeringDB</a>}
-              <a href={bgp.links.ripestat(detail.ip)} target="_blank" rel="noreferrer">RIPEstat</a>
-            </div>
-          </div>
-        )}
-    </div>
-  )
-}
-
-// ── Config field limits ─────────────────────────────────────────────────────
-// Mirrors the engine's clamps (napi.cpp). The engine still clamps defensively,
-// but validating here gives immediate feedback and stops obviously-bad values.
-const CFG_LIMITS = {
-  probe:   { min: 0.1, max: 3600,  step: 0.1, label: 'Probe interval (s)' },
-  trace:   { min: 1,   max: 86400, step: 1,   label: 'Trace interval (s)' },
-  timeout: { min: 0,   max: 3600,  step: 0.1, label: 'Timeout (s, 0 = auto)' },
-  payload: { min: 0,   max: 65500, step: 1,   label: 'Payload (bytes)' },
-  maxhops: { min: 1,   max: 64,    step: 1,   label: 'Max hops' },
-}
-// Returns a { field: message } map of any out-of-range / non-numeric values.
-function validateCfg(cfg) {
-  const errs = {}
-  for (const k of Object.keys(CFG_LIMITS)) {
-    if (cfg[k] == null || cfg[k] === '') continue
-    const v = Number(cfg[k]); const L = CFG_LIMITS[k]
-    if (!Number.isFinite(v)) errs[k] = `${L.label} must be a number`
-    else if (v < L.min || v > L.max) errs[k] = `${L.label} must be between ${L.min} and ${L.max}`
-  }
-  return errs
-}
+import { FOCUS, CFG_LIMITS, validateCfg } from './lib/constants'
+import { fmt, timeFmt, agoFmt, hopColor, latColor, niceCeil, download } from './lib/format'
+import { api, ctrl, toolsApi } from './lib/api'
+import MenuBar from './components/MenuBar'
+import Modal from './components/Modal'
+import BgpDrawer, { RpkiBadge } from './components/BgpDrawer'
+import Sparkline from './components/charts/Sparkline'
+import LatencyGraph from './components/charts/LatencyGraph'
+import PingPage from './components/tools/PingPage'
+import { IconImage, IconCsv, IconRoute, IconBackupTable, IconTableChart, IconSave, IconUpload, IconDataObject } from './components/icons/MaterialIcons'
+import DnsPage from './components/tools/DnsPage'
+import PortScanPage from './components/tools/PortScanPage'
+import TargetPanel from './components/TargetPanel'
 
 // ── Top menu bar ────────────────────────────────────────────────────────────
 // Lightweight click-to-open menus (File / Targets / View / Tools / Help). Each
 // item is { label, onClick, checked?, sep?, disabled?, hint? }.
-function MenuBar({ menus }) {
-  const [open, setOpen] = useState(null)
-  const ref = useRef(null)
-  useEffect(() => {
-    if (open == null) return
-    const away = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(null) }
-    const esc = (e) => { if (e.key === 'Escape') setOpen(null) }
-    window.addEventListener('mousedown', away); window.addEventListener('keydown', esc)
-    return () => { window.removeEventListener('mousedown', away); window.removeEventListener('keydown', esc) }
-  }, [open])
-  return (
-    <nav className="menubar" ref={ref}>
-      {menus.map((m, i) => (
-        <div key={i} className={'menu' + (open === i ? ' open' : '')}>
-          <button className="menu-top" onClick={() => setOpen(open === i ? null : i)}
-            onMouseEnter={() => open != null && setOpen(i)}>{m.label}</button>
-          {open === i && (
-            <div className="menu-drop">
-              {m.items.filter(Boolean).map((it, j) => it.sep
-                ? <div key={j} className="menu-sep" />
-                : (
-                  <button key={j} className="menu-item" disabled={it.disabled}
-                    onClick={() => { setOpen(null); it.onClick && it.onClick() }} title={it.hint || ''}>
-                    <span className="menu-check">{it.checked ? '✓' : ''}</span>
-                    <span className="menu-label">{it.label}</span>
-                  </button>
-                ))}
-            </div>
-          )}
-        </div>
-      ))}
-    </nav>
-  )
-}
+
 
 export default function App() {
   const [form, setForm] = useState({ target: '', family: 'auto', probe: 1, trace: 30, timeout: 0, payload: 56, maxhops: 30, raw: true })
@@ -229,6 +38,10 @@ export default function App() {
   const [view, setView] = useState({ trend: true, latency: false })
   const [editing, setEditing] = useState(false)
   const [editForm, setEditForm] = useState(null)
+  const [updateInfo, setUpdateInfo] = useState(null)
+  const [updateBusy, setUpdateBusy] = useState(false)
+  const [updateProgress, setUpdateProgress] = useState(null)
+  const [updateDismissed, setUpdateDismissed] = useState(false)
   const [tool, setTool] = useState(null)
   const [tab, setTab] = useState('path') // 'path' (traceroute/MTR home) | 'ping' | 'dns' | 'ports'
   const [theme, setTheme] = useState(() => { try { return localStorage.getItem('np-theme') || 'dark' } catch { return 'dark' } })
@@ -250,27 +63,87 @@ export default function App() {
   // ---- resizable panels (sidebar width, table/chart split) ----
   const [sidebarWidth, setSidebarWidth] = useState(() => { const v = Number(localStorage.getItem('np-sidebar-w')); return v >= 230 ? v : 300 })
   const [tablePct, setTablePct] = useState(() => { const v = Number(localStorage.getItem('np-table-pct')); return v >= 15 && v <= 70 ? v : 38 })
+  // Which panel (if any) is actively being drag-resized right now. Purely
+  // so the CSS can turn OFF the width transition for the duration of the
+  // drag — see the `.target-panel.resizing` rule. That transition exists
+  // for state-driven width changes (opening/closing a target, "in sync
+  // with the dashboard animation"), not for a value that's being pushed
+  // by raw mouse coordinates 60+ times a second; animating every one of
+  // those over .32s is exactly what made dragging feel laggy, since the
+  // rendered width was perpetually chasing the cursor instead of matching
+  // it 1:1.
+  const [resizing, setResizing] = useState(null) // null | 'sidebar' | 'table'
+  // ---- dashboard filter/sort (target list) ----
+  const [targetSearch, setTargetSearch] = useState('')
+  // { done, total } while a fleet-wide Excel export is running, null
+  // otherwise — drives the button label in TargetPanel.jsx (see
+  // exportAllTargetsFullXlsx for why this is meaningful now: it's a real
+  // per-target loop, not a single opaque call).
+  const [xlsxExportProgress, setXlsxExportProgress] = useState(null)
+  const [dashSortCol, setDashSortCol] = useState('status')
+  const [dashSortDir, setDashSortDir] = useState(1) // 1 = asc-ish (worst/first first for status), -1 = flipped
   const dragRef = useRef(null)
-  const onDrag = (e) => {
+  const dragRafRef = useRef(null)
+  // Direct DOM handles for the two resizable elements. Writing to these
+  // during a drag (see applyDrag below) is what keeps the drag from
+  // triggering a React re-render on every frame — a re-render of App
+  // cascades into every TargetCard in the list (each mounting Sparkline/
+  // LatencyGraph/MiniVisualPath SVG subtrees), which is real work that has
+  // nothing to do with the drag and is what made it feel laggy.
+  const sidebarElRef = useRef(null)
+  const tableWrapElRef = useRef(null)
+  // Targets the <table> element itself, not its scrollable .tablewrap
+  // wrapper — html-to-image renders the target node's own natural size
+  // (via a cloned foreignObject), so capturing the table directly gets
+  // every hop regardless of what's currently scrolled into view; capturing
+  // the wrapper instead would crop to whatever's visible right now.
+  const hopTableRef = useRef(null)
+  // Applies the latest tracked mouse position exactly once per animation
+  // frame, however many mousemove events fired since the last one, writing
+  // straight to the DOM node's style — no setState, no React re-render,
+  // so the edge tracks the cursor 1:1 regardless of list size. The final
+  // value is committed to React state (and localStorage) once, in endDrag.
+  const applyDrag = () => {
+    dragRafRef.current = null
     const d = dragRef.current; if (!d) return
     if (d.kind === 'sidebar') {
-      setSidebarWidth(Math.min(520, Math.max(230, d.startW + (e.clientX - d.startX))))
+      const w = Math.min(520, Math.max(230, d.startW + (d.lastX - d.startX)))
+      d.value = w
+      if (sidebarElRef.current) sidebarElRef.current.style.width = w + 'px'
     } else {
       const total = d.box ? d.box.clientHeight : 600
-      setTablePct(Math.min(70, Math.max(15, d.startPct + ((e.clientY - d.startY) / total) * 100)))
+      const pct = Math.min(70, Math.max(15, d.startPct + ((d.lastY - d.startY) / total) * 100))
+      d.value = pct
+      if (tableWrapElRef.current) tableWrapElRef.current.style.maxHeight = pct + '%'
     }
   }
+  const onDrag = (e) => {
+    const d = dragRef.current; if (!d) return
+    d.lastX = e.clientX; d.lastY = e.clientY
+    if (dragRafRef.current == null) dragRafRef.current = requestAnimationFrame(applyDrag)
+  }
   const endDrag = () => {
+    if (dragRafRef.current != null) { cancelAnimationFrame(dragRafRef.current); dragRafRef.current = null }
+    const d = dragRef.current
     dragRef.current = null
+    setResizing(null)
     document.body.style.cursor = ''
-    localStorage.setItem('np-sidebar-w', String(sidebarWidth))
-    localStorage.setItem('np-table-pct', String(tablePct))
+    if (d && d.value != null) {
+      if (d.kind === 'sidebar') {
+        setSidebarWidth(d.value)
+        localStorage.setItem('np-sidebar-w', String(d.value))
+      } else {
+        setTablePct(d.value)
+        localStorage.setItem('np-table-pct', String(d.value))
+      }
+    }
     window.removeEventListener('mousemove', onDrag)
     window.removeEventListener('mouseup', endDrag)
   }
   const startDrag = (kind) => (e) => {
     e.preventDefault()
-    dragRef.current = { kind, startX: e.clientX, startY: e.clientY, startW: sidebarWidth, startPct: tablePct, box: e.currentTarget.closest('main') }
+    dragRef.current = { kind, startX: e.clientX, startY: e.clientY, lastX: e.clientX, lastY: e.clientY, startW: sidebarWidth, startPct: tablePct, value: null, box: e.currentTarget.closest('main') }
+    setResizing(kind)
     document.body.style.cursor = kind === 'sidebar' ? 'col-resize' : 'row-resize'
     window.addEventListener('mousemove', onDrag)
     window.addEventListener('mouseup', endDrag)
@@ -354,6 +227,41 @@ export default function App() {
 
   useEffect(() => { api('/api/interfaces').then((j) => setInterfaces(Array.isArray(j) ? j : [])).catch(() => {}) }, [])
 
+  useEffect(() => {
+    const t = setTimeout(async () => {
+      const np = typeof window !== 'undefined' ? window.netpulse : null
+      if (!np || !np.updater) return
+      const info = await np.updater.check()
+      if (info && info.available) setUpdateInfo(info)
+    }, 3000)
+    return () => clearTimeout(t)
+  }, [])
+
+  const checkForUpdatesManually = async () => {
+    const np = typeof window !== 'undefined' ? window.netpulse : null
+    if (!np || !np.updater) return
+    const info = await np.updater.check()
+    if (info && info.available) {
+      setUpdateInfo(info); setUpdateDismissed(false)
+      await showModal({ title: 'Update available', message: `Version ${info.version} is ready to install.`, details: info.body || '' })
+    } else {
+      await showModal({ title: 'No updates', message: "You're on the latest version." })
+    }
+  }
+
+  const installUpdateNow = async () => {
+    const np = typeof window !== 'undefined' ? window.netpulse : null
+    if (!np || !np.updater || !updateInfo) return
+    setUpdateBusy(true); setUpdateProgress(null)
+    const res = await np.updater.install(updateInfo, (p) => setUpdateProgress(p))
+    if (!res.ok) {
+      setUpdateBusy(false)
+      await showModal({ title: 'Update failed', message: res.error || 'Unknown error — please try again later or download the installer manually from GitHub.' })
+    }
+    // On success the app relaunches itself (see updater.install in
+    // tauri-bridge.js) — nothing further to do here.
+  }
+
   // Shared fetch, used by both the periodic poller and addTarget() below —
   // addTarget calls this directly right after adding, instead of waiting up
   // to 600ms for the next scheduled tick. Without that, there was a window
@@ -391,7 +299,47 @@ export default function App() {
   }
 
   const targets = state.targets || []
-  const sel = targets.find((t) => t.id === selId) || targets[0]
+  const sel = targets.find((t) => t.id === selId)
+
+  // Single source of truth for leaving the target-detail view and returning
+  // to the full-width dashboard. Every "close"/"back" control in the detail
+  // pane (the ✕ button, the "← Dashboard" link, Escape) calls this — not
+  // setSelId(null) directly — so closing always fully resets the detail-only
+  // UI state (selected hop, open config editor, open BGP drawer). Previously
+  // some paths only cleared selId, which could leave a stale editing/drawer
+  // state armed for whichever target was opened next.
+  const closeTarget = () => {
+    setSelId(null)
+    setSelHop(null)
+    setEditing(false)
+    setEditForm(null)
+    setDetail(null)
+  }
+
+  // Open a target's detail view (id) or return to the dashboard (null).
+  // Passed to TargetPanel as a single callback so it doesn't need to know
+  // about setSelId/setSelHop/closeTarget individually.
+  const selectTarget = (id) => {
+    if (id == null) { closeTarget(); return }
+    setSelId(id); setSelHop(null)
+  }
+
+  // Remove a target from the dashboard table or sidebar strip. `wasSelected`
+  // lets the sidebar strip close the detail view if the target being removed
+  // is the one currently open; the dashboard table never has a selection to
+  // clear, so it always passes false.
+  const removeTarget = (id, wasSelected) => {
+    ctrl(id, 'remove').then(() => { if (wasSelected) closeTarget(); refreshState() })
+  }
+
+  // Esc closes the open target detail view and returns to the dashboard —
+  // the same keyboard convention as the BGP drawer and modals.
+  useEffect(() => {
+    if (!selId) return
+    const onKey = (e) => { if (e.key === 'Escape') closeTarget() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [selId])
 
   const isAlerting = (h) => alerts.on && ((h.avg != null && h.avg > alerts.ms) || (h.sent > 0 && h.loss > alerts.loss))
 
@@ -464,7 +412,7 @@ export default function App() {
     if (minorLoss) return 'okloss'           // light green — occasional loss
     return 'ok'
   }
-  const STATE_LABEL = { discovering: 'discovering', ok: 'ok', okloss: 'minor loss', warn: 'path', bad: 'high latency/loss', down: 'unreachable' }
+  const STATE_LABEL = { discovering: 'discovering', ok: 'ok', okloss: 'loss', warn: 'path', bad: 'degraded', down: 'down' }
 
   // ============================================================================
   // TWO-LAMP SIGNAL — implements the meanings in the project's lamp diagram.
@@ -588,6 +536,173 @@ export default function App() {
     return 'ok'
   }
 
+  // ── Manual/custom target order ──────────────────────────────────────────
+  // Drag-and-drop and the ▲/▼ move buttons both write into this single
+  // ordered array of target ids. Either interaction also flips the active
+  // sort to 'custom' (both the sidebar dropdown and the dashboard table's
+  // sort column) so the reordered position is immediately what's
+  // displayed. The array is persisted so a manual arrangement survives
+  // restarts.
+  const [customOrder, setCustomOrder] = useState(() => {
+    try { const v = JSON.parse(localStorage.getItem('np-custom-order') || '[]'); return Array.isArray(v) ? v : [] } catch { return [] }
+  })
+  useEffect(() => { try { localStorage.setItem('np-custom-order', JSON.stringify(customOrder)) } catch {} }, [customOrder])
+  // Keep customOrder in sync with the live target set: newly-added targets
+  // are appended at the end (so they don't silently jump to the top/bottom
+  // of a manual arrangement), removed targets drop out. Keyed on the *set*
+  // of ids (sorted+joined), not the targets array reference, so this only
+  // runs when a target is actually added/removed — not on every 600ms poll
+  // tick that merely refreshes hop stats.
+  const targetIdKey = targets.map((t) => t.id).sort((a, b) => a - b).join(',')
+  useEffect(() => {
+    const liveIds = targets.map((t) => t.id)
+    const live = new Set(liveIds)
+    setCustomOrder((prev) => {
+      const kept = prev.filter((id) => live.has(id))
+      const missing = liveIds.filter((id) => !kept.includes(id))
+      if (missing.length === 0 && kept.length === prev.length) return prev
+      return [...kept, ...missing]
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targetIdKey])
+  const orderIndex = (id) => { const i = customOrder.indexOf(id); return i === -1 ? Number.MAX_SAFE_INTEGER : i }
+  // Drag-to-reorder — Motion's <Reorder.Group> (TargetPanel.jsx) owns the
+  // actual drag gesture and hands back the fully reordered `rows` array
+  // directly; this just needs to fold that back into customOrder (the
+  // persisted ordering — see above) and switch to custom sort, same as the
+  // old moveTarget()/reorderTo() did. Previously this whole area was a
+  // hand-rolled mouse-event drag implementation (raw mousemove tracking,
+  // live DOM sibling queries, a requestAnimationFrame busy-gate) — replaced
+  // entirely rather than patched again, since Tauri's webview intercepting
+  // native HTML5 drag events was never actually the hard part; getting a
+  // robust drag GESTURE right (distinguishing a tap from a drag, handling
+  // fast multi-item moves, keeping displaced rows animating smoothly) is a
+  // solved problem in a maintained library and isn't worth re-solving by
+  // hand. Motion's Reorder is pointer-event-based internally, so it isn't
+  // affected by Tauri's native-dragstart interception either.
+  //
+  // newRows only contains whatever's currently visible (filtered/sorted) —
+  // ids not in newRows (hidden by a search filter, say) keep their existing
+  // relative position, appended after the reordered visible ones, same
+  // fallback behavior the old reorderTo() had for an id it didn't know about.
+  const handleReorder = (newRows) => {
+    const newIds = newRows.map((t) => t.id)
+    const newIdSet = new Set(newIds)
+    setCustomOrder((prev) => {
+      const rest = prev.filter((id) => !newIdSet.has(id))
+      return [...newIds, ...rest]
+    })
+    setDashSortCol('custom')
+  }
+
+  // ── Dashboard: summary counts + filtered/sorted list ────────────────────
+  // Two separate counts — one per lamp — instead of one combined status,
+  // since destination health and path health are genuinely different
+  // signals (see targetState/destLamp/pathLamp above) and collapsing them
+  // into a single number hides which one is actually the problem.
+  const lampSummary = (lampFn) => {
+    const counts = { total: targets.length, ok: 0, settling: 0, warn: 0, bad: 0, down: 0, discovering: 0 }
+    for (const t of targets) {
+      const s = lampFn(t)
+      if (s === 'discovering') counts.discovering++
+      else if (s === 'settling') counts.settling++
+      else if (s === 'down') counts.down++
+      else if (s === 'bad') counts.bad++
+      else if (s === 'warn') counts.warn++
+      else counts.ok++ // ok / okloss
+    }
+    return counts
+  }
+  const destSummary = useMemo(() => lampSummary(destLamp), [targets, alerts])
+  const pathSummary = useMemo(() => lampSummary(pathLamp), [targets, alerts])
+  const lampBucket = (lampFn, t) => {
+    const s = lampFn(t)
+    return ['discovering', 'settling', 'down', 'bad', 'warn'].includes(s) ? s : 'ok'
+  }
+  // Clicking a summary card filters the list to that lamp+bucket; clicking
+  // the same one again clears it. { dim: 'dest'|'path', status: 'ok'|'settling'|'warn'|'bad'|'down'|'discovering' }
+  const [statusFilter, setStatusFilter] = useState(null)
+  const toggleStatusFilter = (dim, status) => {
+    setStatusFilter((f) => (f && f.dim === dim && f.status === status) ? null : { dim, status })
+  }
+
+  const filteredTargets = useMemo(() => {
+    const q = targetSearch.trim().toLowerCase()
+    let list = !q ? targets : targets.filter((t) =>
+      t.name.toLowerCase().includes(q) || (t.dest_ip || '').toLowerCase().includes(q))
+    if (statusFilter) {
+      const lampFn = statusFilter.dim === 'dest' ? destLamp : pathLamp
+      list = list.filter((t) => lampBucket(lampFn, t) === statusFilter.status)
+    }
+    return list
+  }, [targets, targetSearch, statusFilter])
+
+
+  const STATUS_RANK = { down: 0, bad: 0, warn: 1, okloss: 1, discovering: 2, settling: 2, ok: 3 }
+
+
+  // direction), distinct from the sidebar's dropdown sort above since a real
+  // table's UX is "click the header", not "pick from a select".
+  const dashboardRows = useMemo(() => {
+    return [...filteredTargets].sort((a, b) => {
+      const da = destHopOf(a), db = destHopOf(b)
+      let cmp = 0
+      switch (dashSortCol) {
+        case 'custom':
+          cmp = orderIndex(a.id) - orderIndex(b.id)
+          break
+        case 'status': {
+          const ra = STATUS_RANK[targetState(a)] ?? 4, rb = STATUS_RANK[targetState(b)] ?? 4
+          cmp = ra - rb
+          break
+        }
+        case 'latency': {
+          const la = da ? (da.med ?? da.avg) : null, lb = db ? (db.med ?? db.avg) : null
+          if (la == null && lb == null) cmp = 0
+          else if (la == null) cmp = 1
+          else if (lb == null) cmp = -1
+          else cmp = la - lb
+          break
+        }
+        case 'loss':
+          cmp = (da ? da.loss : -1) - (db ? db.loss : -1)
+          break
+        case 'jitter': {
+          const ja = da ? da.jitter : null, jb = db ? db.jitter : null
+          if (ja == null && jb == null) cmp = 0
+          else if (ja == null) cmp = 1
+          else if (jb == null) cmp = -1
+          else cmp = ja - jb
+          break
+        }
+        case 'hops':
+          cmp = (a.hops?.length || 0) - (b.hops?.length || 0)
+          break
+        default:
+          cmp = a.name.localeCompare(b.name)
+      }
+      if (cmp === 0) cmp = a.name.localeCompare(b.name)
+      // Custom order has no "direction" to flip — it's a manually placed
+      // sequence, not a sortable column with a header to click twice. Any
+      // dashSortDir left over from a PREVIOUS column sort (e.g. someone
+      // clicked "Latency" twice for descending, then dragged a card) would
+      // otherwise silently reverse what's rendered relative to what
+      // customOrder's array actually says, while handleReorder folds
+      // whatever's CURRENTLY rendered straight back into customOrder — a
+      // mismatch that's invisible with 2 rows (a reversed swap still just
+      // trades the same two rows) but corrupts the persisted order with 3+.
+      return dashSortCol === 'custom' ? cmp : cmp * dashSortDir
+    })
+  }, [filteredTargets, dashSortCol, dashSortDir, alerts, customOrder])
+
+  const toggleDashSort = (col) => {
+    if (dashSortCol === col) setDashSortDir((d) => -d)
+    else { setDashSortCol(col); setDashSortDir(1) }
+  }
+  // Used by the compact panel's <select> — always sets the column outright
+  // (a dropdown pick isn't a "click the same header again" gesture).
+  const selectDashSort = (col) => { setDashSortCol(col); setDashSortDir(1) }
+
 
   useEffect(() => { if (sel && selHop === null) { const d = sel.hops.find((h) => h.is_dest); if (d) setSelHop(d.hop) } }, [sel, selHop])
 
@@ -614,7 +729,7 @@ export default function App() {
     })()
     return () => { alive = false }
   }, [ipKey])
-  const hostOf = (h) => h.hostname || hostCache[h.address] || ''
+  const hostOf = (h) => h.hostname || hostCache[h.address] || h.stale_hostname || ''
   useEffect(() => {
     if (!ipKey) return
     ipKey.split(',').filter(Boolean).forEach(async (ip) => {
@@ -630,10 +745,10 @@ export default function App() {
   const addTargetHost = async (host) => {
     host = String(host || '').trim()
     if (!host) return
-    if (targets.some((t) => t.name === host)) { const ex = targets.find((t) => t.name === host); if (ex) { setSelId(ex.id); setSelHop(null) }; return }
+    if (targets.some((t) => t.name === host)) { const ex = targets.find((t) => t.name === host); if (ex) selectTarget(ex.id); return }
     const q = new URLSearchParams({ target: host, family: 'auto', probe: 1, trace: 30, timeout: 0, payload: 56, maxhops: 30, raw: '1' })
     const r = await api(`/api/add?${q}`, { method: 'POST' })
-    if (r && r.id) { await refreshState(); setSelId(r.id); setSelHop(null) }
+    if (r && r.id) { await refreshState(); selectTarget(r.id) }
   }
 
   const addTarget = async () => {
@@ -741,7 +856,7 @@ export default function App() {
     setForm({ ...form, target: '' })
     if (r.id) {
       await refreshState() // ensure `targets` contains the new one before selecting it
-      setSelId(r.id); setSelHop(null)
+      selectTarget(r.id)
     }
   }
 
@@ -776,7 +891,12 @@ export default function App() {
   const npCryptoKey = () => crypto.subtle.importKey('raw', NP_KEY_RAW, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt'])
 
   // Serialize targets to the export payload (full config + display name).
-  const targetListPayload = () => targets.map((t) => ({
+  // Sorted by customOrder (not raw creation order) so Save list / Export
+  // JSON reflect whatever arrangement the user actually left the sidebar
+  // in — orderIndex() already falls back to "end of list" for any id that
+  // somehow isn't in customOrder, so this is safe even if that array is
+  // momentarily out of sync with `targets`.
+  const targetListPayload = () => [...targets].sort((a, b) => orderIndex(a.id) - orderIndex(b.id)).map((t) => ({
     target: t.name,
     family: t.config?.family ?? 'auto',
     probe:   t.config?.probe   ?? 1,
@@ -786,6 +906,36 @@ export default function App() {
     raw:     t.config?.raw     ?? true,
     src:     t.config?.src     ?? '',
   }))
+
+  // Native "Save As…" for exported files — routes through the real OS save
+  // dialog (window.netpulse.saveFile, backed by @tauri-apps/plugin-dialog)
+  // and writes with window.netpulse.writeFile (a plain std::fs::write on the
+  // Rust side — see commands.rs), instead of the old `<a download>` trick
+  // every export function here used to use. That trick was inherited from
+  // the legacy browser/Electron builds: in a real browser it hands off to
+  // the browser's own download manager, but inside a Tauri webview it has no
+  // equivalent to hand off to — no dialog, no user-chosen name or location,
+  // and on some platforms no file at all, silently. saveFile()/writeFile()
+  // already existed in tauri-bridge.js and were simply never wired up to any
+  // of the export functions below.
+  // Returns true if a file was actually written, false if the user
+  // cancelled the dialog (not an error — callers shouldn't show a modal for
+  // that, only for a real write failure).
+  const saveViaDialog = async (defaultName, filters, data) => {
+    if (typeof window === 'undefined' || !window.netpulse?.saveFile) {
+      throw new Error('Save dialog is unavailable — NetPulse is not running inside the Tauri app window.')
+    }
+    const path = await window.netpulse.saveFile(defaultName, filters)
+    if (!path) return false // user cancelled — not an error
+    const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data
+    await window.netpulse.writeFile(path, bytes)
+    return true
+  }
+  // Target/host names are free text (an IP, a hostname, whatever the user
+  // typed) and end up in a suggested filename — strip characters that are
+  // invalid (Windows) or awkward (everywhere) in a filename so the save
+  // dialog never opens with a name it would itself reject.
+  const sanitizeFilename = (s) => String(s || 'target').replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 80)
 
   const exportTargetList = async () => {
     const plain = new TextEncoder().encode(JSON.stringify({ version: 1, targets: targetListPayload() }))
@@ -802,13 +952,20 @@ export default function App() {
     new Uint8Array(buf, 6, 12).set(iv)
     dv.setUint32(18, ctLen,      false)
     new Uint8Array(buf, 22).set(ctBytes)
-    const blob = new Blob([buf], { type: 'application/octet-stream' })
-    const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: 'netpulse_targets.npulse' })
-    a.click(); URL.revokeObjectURL(a.href)
+    try {
+      await saveViaDialog('netpulse_targets.npulse', [{ name: 'NetPulse target list', extensions: ['npulse'] }], new Uint8Array(buf))
+    } catch (e) {
+      await showModal({ title: 'Save failed', message: String(e?.message || e) })
+    }
   }
 
-  const exportTargetsJson = () => {
-    download('netpulse_targets.json', JSON.stringify({ version: 1, targets: targetListPayload() }, null, 2), 'application/json')
+  const exportTargetsJson = async () => {
+    try {
+      await saveViaDialog('netpulse_targets.json', [{ name: 'JSON', extensions: ['json'] }],
+        JSON.stringify({ version: 1, targets: targetListPayload() }, null, 2))
+    } catch (e) {
+      await showModal({ title: 'Save failed', message: String(e?.message || e) })
+    }
   }
 
   const importTargetList = async (file) => {
@@ -832,6 +989,7 @@ export default function App() {
       if (!Array.isArray(list)) throw new Error('Invalid target list format')
 
       let added = 0, skipped = 0
+      const importedOrder = [] // new ids, in the order this file lists them
       for (const entry of list) {
         if (!entry.target) continue
         // respect the duplicate rule: same host + same config = skip
@@ -856,10 +1014,20 @@ export default function App() {
           maxhops: entry.maxhops ?? 30, raw: (entry.raw ?? true) ? '1' : '0',
         })
         if (entry.src) q.set('src', entry.src)
-        await api(`/api/add?${q}`, { method: 'POST' })
+        const { id: newId } = await api(`/api/add?${q}`, { method: 'POST' })
+        if (newId != null) importedOrder.push(newId)
         added++
       }
       await refreshState()
+      // New ids get appended in the file's own order rather than whatever
+      // order the engine happens to report them back in — the "keep
+      // newly-added targets in sync" effect above already appends any
+      // *unlisted* id to the end, but does so in engine-report order, which
+      // is what silently scrambled a freshly-loaded list's arrangement.
+      if (importedOrder.length) {
+        setCustomOrder((prev) => [...prev.filter((id) => !importedOrder.includes(id)), ...importedOrder])
+        setDashSortCol('custom')
+      }
       const msg = [`Imported ${added} target${added !== 1 ? 's' : ''}.`, skipped ? `${skipped} skipped (already traced with same config).` : ''].filter(Boolean).join(' ')
       await showModal({ title: 'Import complete', message: msg, buttons: [{ label: 'OK', value: true, primary: true }] })
     } catch (e) {
@@ -868,12 +1036,25 @@ export default function App() {
   }
   // ─────────────────────────────────────────────────────────────────────────
 
-  const ctrl = (id, ep, extra = '') => api(`/api/${ep}?id=${id}${extra}`, { method: 'POST' })
-
   // ── Global target controls (used by the menu bar and sidebar) ──────────────
   const allPaused = targets.length > 0 && targets.every((t) => t.paused)
   const pauseAll = (on) => Promise.all(targets.map((t) => ctrl(t.id, 'pause', `&on=${on ? 1 : 0}`))).then(refreshState).catch(() => {})
   const pauseOne = (t) => ctrl(t.id, 'pause', `&on=${t.paused ? 0 : 1}`).then(refreshState).catch(() => {})
+  // Force-recheck: engine-side this immediately re-verifies every already-
+  // known hop's identity (see core Session::force_recheck) — the same
+  // non-destructive periodic re-probe the engine already runs to notice
+  // route changes from a VPN toggle or network switch, just triggered on
+  // demand instead of waiting out the timer. It does NOT clear hops/state,
+  // so the UI only ever updates in place, never resets. Since there's no
+  // reset snapshot for isDiscovering() to react to, track a brief local
+  // "requested" pulse per target id so the button still gives immediate
+  // visible feedback that a recheck is in flight.
+  const [recheckRequested, setRecheckRequested] = useState(() => new Set())
+  const forceRecheckOne = (t) => {
+    setRecheckRequested((s) => new Set(s).add(t.id))
+    setTimeout(() => setRecheckRequested((s) => { const n = new Set(s); n.delete(t.id); return n }), 2500)
+    ctrl(t.id, 'recheck').then(refreshState).catch(() => {})
+  }
   const removeAll = async () => {
     if (!targets.length) return
     const ok = await showModal({
@@ -885,10 +1066,16 @@ export default function App() {
       ],
     })
     if (!ok) return
-    Promise.all(targets.map((t) => ctrl(t.id, 'remove'))).then(() => { setSelId(null); refreshState() }).catch(() => {})
+    Promise.all(targets.map((t) => ctrl(t.id, 'remove'))).then(() => { closeTarget(); refreshState() }).catch(() => {})
   }
   const quickAdd = (host) => { setForm((f) => ({ ...f, target: host })); setTimeout(() => addTargetHost(host), 0) }
   const [about, setAbout] = useState(false)
+  const [appVersion, setAppVersion] = useState(null)
+  useEffect(() => {
+    if (!about || appVersion) return
+    const np = (typeof window !== 'undefined') && window.netpulse
+    if (np && np.getVersion) np.getVersion().then((v) => v && setAppVersion(v)).catch(() => {})
+  }, [about, appVersion])
   const openDetail = (ip) => {
     if (!bgp.isPublicIp(ip)) { setDetail({ ip, private: true, loading: false }); return }
     setDetail({ ip, loading: true })
@@ -943,25 +1130,248 @@ export default function App() {
   }, [chartData, clipOutliers])
 
 
-  const exportPng = () => {
-    const svg = chartRef.current?.querySelector('svg'); if (!svg) return
-    const xml = new XMLSerializer().serializeToString(svg); const img = new Image()
+  // Captures the currently-shown latency chart as PNG bytes (a Promise
+  // wrapper around the canvas/blob callback dance), used by exportPng below.
+  const captureChartPng = () => new Promise((resolve) => {
+    const svg = chartRef.current?.querySelector('svg')
+    if (!svg) { resolve(null); return }
+    const xml = new XMLSerializer().serializeToString(svg)
+    const img = new Image()
     img.onload = () => {
       const c = document.createElement('canvas'); c.width = svg.clientWidth * 2; c.height = svg.clientHeight * 2
       const ctx = c.getContext('2d'); ctx.fillStyle = '#0e1116'; ctx.fillRect(0, 0, c.width, c.height); ctx.scale(2, 2); ctx.drawImage(img, 0, 0)
-      const a = document.createElement('a'); a.href = c.toDataURL('image/png'); a.download = 'netpulse_graph.png'; a.click()
+      c.toBlob(async (blob) => {
+        if (!blob) { resolve(null); return }
+        resolve(new Uint8Array(await blob.arrayBuffer()))
+      }, 'image/png')
     }
+    img.onerror = () => resolve(null)
     img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(xml)))
+  })
+  const exportPng = async () => {
+    try {
+      const bytes = await captureChartPng()
+      if (!bytes) { await showModal({ title: 'Nothing to export', message: 'No chart is currently visible.' }); return }
+      await saveViaDialog(`netpulse_graph_${sanitizeFilename(sel?.name)}.png`, [{ name: 'PNG image', extensions: ['png'] }], bytes)
+    } catch (e) {
+      await showModal({ title: 'Save failed', message: String(e?.message || e) })
+    }
   }
-  const exportHopsCsv = () => {
+  const exportHopsCsv = async () => {
     if (!sel) return
-    const head = 'hop,address,hostname,asn,network,loss_pct,cur,avg,min,max,jitter,std,sent,recv,is_dest,alerting\n'
+    const head = 'hop,address,hostname,asn,network,loss_pct,cur,avg,min,max,jitter,std,sent,recv,is_dest,alerting,stale_address,stale_last_seen_unix\n'
     const rows = sel.hops.map((h) => {
-      const a = asn[h.address] || {}
-      return [h.hop, h.address, h.hostname, a.asn ? `AS${a.asn}` : '', (a.holder || '').replace(/,/g, ' '), h.loss.toFixed(2), h.cur ?? '', h.avg ?? '', h.min ?? '', h.max ?? '', (h.jitter ?? 0).toFixed(2), h.std.toFixed(2), h.sent, h.recv, h.is_dest, isAlerting(h)].join(',')
+      const displayAddr = h.address !== '*' ? h.address : (h.stale_address || h.address)
+      const a = asn[displayAddr] || {}
+      return [h.hop, h.address, h.hostname, a.asn ? `AS${a.asn}` : '', (a.holder || '').replace(/,/g, ' '), h.loss.toFixed(2), h.cur ?? '', h.avg ?? '', h.min ?? '', h.max ?? '', (h.jitter ?? 0).toFixed(2), (h.std ?? 0).toFixed(2), h.sent, h.recv, h.is_dest, isAlerting(h), h.address === '*' ? (h.stale_address || '') : '', h.address === '*' ? (h.stale_since ?? '') : ''].join(',')
     }).join('\n')
-    download('netpulse_hops.csv', `# ${sel.name} ${sel.dest_ip}\n` + head + rows, 'text/csv')
+    try {
+      await saveViaDialog(`netpulse_hops_${sanitizeFilename(sel.name)}.csv`, [{ name: 'CSV', extensions: ['csv'] }],
+        `# ${sel.name} ${sel.dest_ip}\n` + head + rows)
+    } catch (e) {
+      await showModal({ title: 'Save failed', message: String(e?.message || e) })
+    }
   }
+  // A picture of the hop table itself — the "traceroute report" — distinct
+  // from exportPng above (which captures the latency-over-time chart, not
+  // the table). html-to-image (not the more common html2canvas) is used
+  // deliberately: html2canvas has a long-standing, still-unresolved bug
+  // failing to parse oklch()/color-mix() (SheetJS-unrelated, separate
+  // library — see github.com/niklasvh/html2canvas/issues/3269), and this
+  // app's CSS uses color-mix() throughout its theme variables (Tailwind
+  // v4's default palette). html-to-image sidesteps the whole problem by
+  // rendering through an SVG foreignObject — the browser's own CSS engine
+  // paints it, rather than the library re-implementing CSS color parsing —
+  // so it handles this app's actual stylesheet correctly.
+  const exportHopsTablePng = async () => {
+    if (!sel || !hopTableRef.current) return
+    try {
+      const { toPng } = await import('html-to-image')
+      const dataUrl = await toPng(hopTableRef.current, { backgroundColor: '#0e1116', pixelRatio: 2 })
+      const res = await fetch(dataUrl)
+      const bytes = new Uint8Array(await res.arrayBuffer())
+      await saveViaDialog(`netpulse_traceroute_${sanitizeFilename(sel.name)}.png`, [{ name: 'PNG image', extensions: ['png'] }], bytes)
+    } catch (e) {
+      await showModal({ title: 'Export failed', message: String(e?.message || e) })
+    }
+  }
+
+  // Full-history export: every raw sample this target (or all targets) has
+  // ever recorded, not just the current summary row per hop — see
+  // Manager::export_target_full_csv's doc comment (manager.hpp) for why
+  // this is a dedicated backend call reading ColdStore directly rather than
+  // reusing the chart's already-downsampled series data. Long-format (one
+  // row per sample, not per hop), so it opens straight into a pivot table.
+  const exportTargetFullCsv = async () => {
+    if (!sel || typeof window === 'undefined' || !window.netpulse?.exportTargetCsv) return
+    try {
+      const csv = await window.netpulse.exportTargetCsv(sel.id)
+      if (!csv) { await showModal({ title: 'Nothing to export', message: 'No history recorded for this target yet.' }); return }
+      await saveViaDialog(`netpulse_full_${sanitizeFilename(sel.name)}.csv`, [{ name: 'CSV', extensions: ['csv'] }], csv)
+    } catch (e) {
+      await showModal({ title: 'Export failed', message: String(e?.message || e) })
+    }
+  }
+  const exportAllTargetsFullCsv = async () => {
+    if (typeof window === 'undefined' || !window.netpulse?.exportAllTargetsCsv) return
+    try {
+      const csv = await window.netpulse.exportAllTargetsCsv()
+      if (!csv) { await showModal({ title: 'Nothing to export', message: 'No targets with recorded history yet.' }); return }
+      await saveViaDialog('netpulse_full_all_targets.csv', [{ name: 'CSV', extensions: ['csv'] }], csv)
+    } catch (e) {
+      await showModal({ title: 'Export failed', message: String(e?.message || e) })
+    }
+  }
+
+  // Wraps a worker using the streaming start/append/finish protocol (see
+  // workers/xlsxWorker.js) — used by both Excel exports below. append()
+  // can be called once (single target) or many times (fleet export, once
+  // per target, so progress can be reported and no single call/transfer
+  // scales with fleet size) before finish(). Each append's CSV text is
+  // encoded to bytes and TRANSFERRED (not passed as a plain string):
+  // postMessage structured-clones a string argument, meaning a synchronous
+  // COPY on the main thread before the worker ever sees it — for a large
+  // chunk that copy alone costs real, blocking time even though the actual
+  // parsing happens off-thread. A transferred ArrayBuffer hands over
+  // ownership instead of copying — O(1) regardless of size.
+  const createXlsxWorker = () => {
+    const worker = new Worker(new URL('./workers/xlsxWorker.js', import.meta.url), { type: 'module' })
+    const encoder = new TextEncoder()
+    let pending = null
+    worker.onmessage = (e) => {
+      if (e.data.type === 'done' && pending) {
+        const { resolve, reject } = pending; pending = null
+        if (e.data.ok) resolve(e.data.buffer)
+        else reject(new Error(e.data.error))
+      }
+    }
+    worker.onerror = (err) => { if (pending) { pending.reject(new Error(err.message || 'Worker error')); pending = null } }
+    return {
+      start(sheets, historySheetName) { worker.postMessage({ type: 'start', sheets, historySheetName }) },
+      append(csvText) {
+        const bytes = encoder.encode(csvText)
+        worker.postMessage({ type: 'append', bytes: bytes.buffer }, [bytes.buffer])
+      },
+      finish() {
+        return new Promise((resolve, reject) => { pending = { resolve, reject }; worker.postMessage({ type: 'finish' }) })
+      },
+      terminate() { worker.terminate() },
+    }
+  }
+
+  // Excel export — everything the CSV full-history export has, PLUS the
+  // current summary and config context, organized as separate sheets in one
+  // workbook instead of three separate files. Reuses the exact same backend
+  // data (window.netpulse.exportTargetCsv) rather than a new export path.
+  const exportTargetFullXlsx = async () => {
+    if (!sel || typeof window === 'undefined' || !window.netpulse?.exportTargetCsv) return
+    const xw = createXlsxWorker()
+    try {
+      const csv = await window.netpulse.exportTargetCsv(sel.id)
+      if (!csv) { await showModal({ title: 'Nothing to export', message: 'No history recorded for this target yet.' }); return }
+
+      const configRows = [
+        ['Field', 'Value'],
+        ['Target', sel.name],
+        ['Destination IP', sel.dest_ip || ''],
+        ['Family', familyLabel(sel.family, sel.config?.family)],
+        ['Probe interval (s)', sel.config?.probe ?? ''],
+        ['Timeout (s)', sel.config?.timeout === 0 ? 'auto' : (sel.config?.timeout ?? '')],
+        ['Payload (bytes)', sel.config?.payload ?? ''],
+        ['Max hops', sel.config?.maxhops ?? ''],
+        ['Interface', sel.config?.src || 'auto'],
+        ['Exported at', new Date().toLocaleString()],
+      ]
+
+      const summaryHead = ['hop', 'address', 'hostname', 'asn', 'network', 'loss_pct', 'cur', 'avg', 'min', 'max', 'jitter', 'std', 'sent', 'recv', 'is_dest', 'alerting']
+      const summaryRows = sel.hops.map((h) => {
+        const displayAddr = h.address !== '*' ? h.address : (h.stale_address || h.address)
+        const a = asn[displayAddr] || {}
+        return [h.hop, h.address, h.hostname || '', a.asn ? `AS${a.asn}` : '', a.holder || '', Number(h.loss.toFixed(2)), h.cur ?? '', h.avg ?? '', h.min ?? '', h.max ?? '', Number((h.jitter ?? 0).toFixed(2)), Number((h.std ?? 0).toFixed(2)), h.sent, h.recv, h.is_dest, isAlerting(h)]
+      })
+
+      xw.start([
+        { name: 'Config', rows: configRows },
+        { name: 'Hop Summary', rows: [summaryHead, ...summaryRows] },
+      ], 'Full History')
+      xw.append(csv)
+      const buf = await xw.finish()
+      await saveViaDialog(`netpulse_full_${sanitizeFilename(sel.name)}.xlsx`, [{ name: 'Excel workbook', extensions: ['xlsx'] }], new Uint8Array(buf))
+    } catch (e) {
+      await showModal({ title: 'Export failed', message: String(e?.message || e) })
+    } finally {
+      xw.terminate()
+    }
+  }
+
+  // Dashboard-level Excel export — every target, every hop's current
+  // summary, AND every target's full raw history, in one workbook.
+  //
+  // THIS is the one that scales with fleet size, and it's built to stay
+  // responsive regardless: instead of one backend call for the whole fleet
+  // (window.netpulse.exportAllTargetsCsv — the OLD approach), it reuses the
+  // existing, already-small/bounded per-target exportTargetCsv(id) command
+  // in a sequential loop, one target at a time. Three things fall out of
+  // that on their own, without any backend changes:
+  //   - each backend call, each Tauri IPC decode, and each transfer into
+  //     the worker is bounded by ONE target's data, never the whole fleet's
+  //     — so none of those steps individually scales with fleet size into
+  //     a single freeze-sized chunk of work;
+  //   - each `await` naturally yields back to the browser between targets,
+  //     so the UI gets many small breathing gaps instead of one long
+  //     uninterrupted block — this is the actual fix for the freeze, not
+  //     just moving work to a worker;
+  //   - real per-target progress becomes available for free, shown on the
+  //     button itself via xlsxExportProgress (see TargetPanel.jsx).
+  // Sequential, not parallel (Promise.all) on purpose — concurrent calls
+  // would all contend for the same backend locks (Manager::listMtx_ plus
+  // each target's own mutex) at once; one at a time is the safer default
+  // at real fleet scale, and it's what makes the per-target progress UI
+  // meaningful in the first place.
+  const exportAllTargetsFullXlsx = async () => {
+    if (typeof window === 'undefined' || !window.netpulse?.exportTargetCsv) return
+    if (!targets.length) { await showModal({ title: 'Nothing to export', message: 'No targets yet.' }); return }
+
+    const xw = createXlsxWorker()
+    setXlsxExportProgress({ done: 0, total: targets.length })
+    try {
+      const overviewHead = ['id', 'name', 'dest_ip', 'family', 'paused', 'error', 'hop_count', 'probe_interval_s', 'timeout_s', 'payload_bytes', 'max_hops', 'interface']
+      const overviewRows = targets.map((t) => [
+        t.id, t.name, t.dest_ip || '', familyLabel(t.family, t.config?.family), !!t.paused, t.error || '',
+        t.hops?.length || 0, t.config?.probe ?? '', t.config?.timeout ?? '', t.config?.payload ?? '', t.config?.maxhops ?? '', t.config?.src || 'auto',
+      ])
+
+      const hopsHead = ['target_id', 'target_name', 'hop', 'address', 'hostname', 'asn', 'network', 'loss_pct', 'cur', 'avg', 'min', 'max', 'jitter', 'std', 'sent', 'recv', 'is_dest']
+      const hopsRows = []
+      for (const t of targets) {
+        for (const h of (t.hops || [])) {
+          const displayAddr = h.address !== '*' ? h.address : (h.stale_address || h.address)
+          const a = asn[displayAddr] || {}
+          hopsRows.push([t.id, t.name, h.hop, h.address, h.hostname || '', a.asn ? `AS${a.asn}` : '', a.holder || '', Number(h.loss.toFixed(2)), h.cur ?? '', h.avg ?? '', h.min ?? '', h.max ?? '', Number((h.jitter ?? 0).toFixed(2)), Number((h.std ?? 0).toFixed(2)), h.sent, h.recv, h.is_dest])
+        }
+      }
+
+      xw.start([
+        { name: 'Targets Overview', rows: [overviewHead, ...overviewRows] },
+        { name: 'All Hops Summary', rows: [hopsHead, ...hopsRows] },
+      ], 'Full History')
+
+      for (let i = 0; i < targets.length; i++) {
+        const csv = await window.netpulse.exportTargetCsv(targets[i].id)
+        if (csv) xw.append(csv)
+        setXlsxExportProgress({ done: i + 1, total: targets.length })
+      }
+
+      const buf = await xw.finish()
+      await saveViaDialog('netpulse_full_all_targets.xlsx', [{ name: 'Excel workbook', extensions: ['xlsx'] }], new Uint8Array(buf))
+    } catch (e) {
+      await showModal({ title: 'Export failed', message: String(e?.message || e) })
+    } finally {
+      xw.terminate()
+      setXlsxExportProgress(null)
+    }
+  }
+
   const exportTargets = (json) => {
     if (json) download('netpulse_targets.json', JSON.stringify(targets.map((t) => ({ id: t.id, target: t.name, dest_ip: t.dest_ip })), null, 2), 'application/json')
     else download('netpulse_targets.csv', 'id,target,dest_ip\n' + targets.map((t) => `${t.id},${t.name},${t.dest_ip}`).join('\n'), 'text/csv')
@@ -1033,6 +1443,11 @@ export default function App() {
             { label: 'Load target list (.npulse)…', onClick: () => document.getElementById('np-import-input')?.click() },
             { sep: true },
             { label: 'Export hops CSV (selected)…', onClick: () => sel && exportHopsCsv && exportHopsCsv(), disabled: !sel },
+            { label: 'Export FULL history CSV (selected target)…', onClick: exportTargetFullCsv, disabled: !sel, hint: 'Every recorded sample, all hops, all history' },
+            { label: 'Export FULL history CSV (all targets)…', onClick: exportAllTargetsFullCsv, disabled: !targets.length, hint: 'Every recorded sample, every target' },
+            { sep: true },
+            { label: 'Export to Excel (selected target)…', onClick: exportTargetFullXlsx, disabled: !sel, hint: 'Config + hop summary + full history, one workbook' },
+            { label: 'Export to Excel (all targets)…', onClick: exportAllTargetsFullXlsx, disabled: !targets.length, hint: 'Every target — overview + all hops + full history' },
           ],
         },
         {
@@ -1040,8 +1455,10 @@ export default function App() {
             { label: allPaused ? 'Resume all' : 'Pause all', onClick: () => pauseAll(!allPaused), disabled: !targets.length },
             { label: sel ? (sel.paused ? 'Resume selected' : 'Pause selected') : 'Pause selected', onClick: () => sel && pauseOne(sel), disabled: !sel },
             { sep: true },
-            { label: 'Remove selected', onClick: () => sel && ctrl(sel.id, 'remove').then(() => { setSelId(null); refreshState() }), disabled: !sel },
+            { label: 'Remove selected', onClick: () => sel && ctrl(sel.id, 'remove').then(() => { closeTarget(); refreshState() }), disabled: !sel },
             { label: 'Remove all…', onClick: removeAll, disabled: !targets.length },
+            { sep: true },
+            { label: 'Force recheck selected', onClick: () => sel && forceRecheckOne(sel), disabled: !sel },
           ],
         },
         {
@@ -1072,6 +1489,7 @@ export default function App() {
         {
           label: 'Help', items: [
             { label: 'About Net Pulse — Open Net Tools', onClick: () => setAbout(true) },
+            { label: 'Check for Updates…', onClick: checkForUpdatesManually },
             { label: 'Project on GitHub', onClick: () => { try { window.open('https://github.com/ArchismanKarmakar/Net-Pulse-Open-Net-Tools', '_blank') } catch {} } },
           ],
         },
@@ -1080,9 +1498,41 @@ export default function App() {
         <div className="about-overlay" onClick={() => setAbout(false)}>
           <div className="about-box" onClick={(e) => e.stopPropagation()}>
             <h2 style={{ margin: '0 0 6px' }}>Net Pulse — Open Net Tools</h2>
-            <p style={{ margin: '0 0 10px', opacity: 0.75 }}>Cross-platform path-latency &amp; network diagnostics. Native C++ probe engine + Electron UI.</p>
+            <p className="about-version" style={{ margin: '0 0 10px' }}>
+              {appVersion ? `v${appVersion}` : 'Version —'}
+            </p>
+            <p style={{ margin: '0 0 10px', opacity: 0.75 }}>Cross-platform path-latency &amp; network diagnostics. Native C++ probe engine (via Rust/C++ FFI) + Tauri UI.</p>
+            <p style={{ margin: '0 0 14px' }}>
+              <a
+                href="https://github.com/ArchismanKarmakar/Net-Pulse-Open-Net-Tools"
+                target="_blank" rel="noreferrer"
+                onClick={(e) => { e.preventDefault(); try { window.open('https://github.com/ArchismanKarmakar/Net-Pulse-Open-Net-Tools', '_blank') } catch {} }}
+              >
+                github.com/ArchismanKarmakar/Net-Pulse-Open-Net-Tools
+              </a>
+            </p>
+            <p style={{ margin: '0 0 14px', opacity: 0.6, fontSize: 12 }}>
+              AGPL-3.0 &middot; © Archisman Karmakar
+            </p>
             <button className="primary" onClick={() => setAbout(false)}>Close</button>
           </div>
+        </div>
+      )}
+      {updateInfo && updateInfo.available && !updateDismissed && (
+        <div className="update-banner">
+          <span>🔔 Net Pulse {updateInfo.version} is available.</span>
+          {updateBusy ? (
+            <span className="muted">
+              {updateProgress && updateProgress.total
+                ? `Downloading… ${Math.round((updateProgress.downloaded / updateProgress.total) * 100)}%`
+                : 'Downloading…'}
+            </span>
+          ) : (
+            <>
+              <button className="primary" onClick={installUpdateNow}>Update &amp; Restart</button>
+              <button onClick={() => setUpdateDismissed(true)}>Later</button>
+            </>
+          )}
         </div>
       )}
       <nav className="tabbar">
@@ -1128,8 +1578,7 @@ export default function App() {
           <label title="Route re-discovery interval, seconds (1–86400)">Trace<input type="number" min="1" max="86400" step="1" value={form.trace} onChange={(e) => setForm({ ...form, trace: e.target.value })} /></label>
           <label title="Per-probe timeout, seconds; 0 = auto (0–3600)">Timeout<input type="number" min="0" max="3600" step="0.1" value={form.timeout} onChange={(e) => setForm({ ...form, timeout: e.target.value })} /></label>
           <label title="ICMP payload bytes (0–65500; &gt;~1472 is fragmented)">Payload<input type="number" min="0" max="65500" step="1" value={form.payload} onChange={(e) => setForm({ ...form, payload: e.target.value })} /></label>
-          <label title="Maximum hops / TTL (1–64)">Hops<input type="number" min="1" max="64" step="1" value={form.maxhops} onChange={(e) => setForm({ ...form, maxhops: e.target.value })} /></label>
-          <label className="cb"><input type="checkbox" checked={form.raw} onChange={(e) => setForm({ ...form, raw: e.target.checked })} />Raw</label>
+          <label title="Maximum hops / TTL (1–255)">Hops<input type="number" min="1" max="255" step="1" value={form.maxhops} onChange={(e) => setForm({ ...form, maxhops: e.target.value })} /></label>
           <label>Interface
             <select value={iface} onChange={(e) => setIface(e.target.value)}>
               <option value="">Auto (default route)</option>
@@ -1157,107 +1606,98 @@ export default function App() {
       </header>
 
       <div className="body">
-        <aside style={{ width: sidebarWidth }} className="shrink-0 relative">
-          <h3>Targets</h3>
-          <ul>
-            {targets.map((t) => {
-              const st = targetState(t)
-              const d = destHopOf(t)
-              const isSel = sel && t.id === sel.id
-              return (
-                <li key={t.id} className={(isSel ? 'sel ' : '') + 's-' + st} onClick={() => { setSelId(t.id); setSelHop(null) }}>
-                  <div className="flex items-center">
-                    <span className="signal">
-                      <span
-                        className={'lamp st-' + destLamp(t)}
-                        title={(() => {
-                          const s = destLamp(t)
-                          const m = { discovering: 'Route discovery in progress', settling: 'Destination healthy — latency/route changed recently, stabilising', ok: 'Destination healthy', okloss: 'Destination: occasional loss', warn: 'Destination: elevated latency or minor loss (70ms+ / PL>5%)', bad: 'Destination: high latency or loss (100ms+ / PL>10%)', down: 'Destination: unreachable, or severe latency/loss/jitter (150ms+ / PL>20% / 50ms+ swings)' }
-                          return `Target: ${m[s] || s}`
-                        })()}
-                        aria-label={`target-${destLamp(t)}`}
-                      />
-                      <span
-                        className={'lamp st-' + pathLamp(t)}
-                        title={(() => {
-                          const s = pathLamp(t)
-                          const m = { discovering: 'Route discovery in progress', ok: 'Path healthy — packets routing cleanly to the target', warn: 'Path: an intermediate hop is dropping packets or not revealing itself', bad: 'Path: routing to the target pool via BGP, but the target or a router is dropping packets', down: 'Path: no route — internet/interface down, RTO, or first hop rejecting' }
-                          return `Path: ${m[s] || s}`
-                        })()}
-                        aria-label={`path-${pathLamp(t)}`}
-                      />
-                    </span>
-                    <span className="truncate flex-1">{t.name}</span>
-                    {STATE_LABEL[st] && <span className={'statelabel st-' + st}>{STATE_LABEL[st]}</span>}
-                    {/* Per-target pause/resume — selectively freeze one target */}
-                    <button
-                      className="card-pause"
-                      title={t.paused ? 'Resume this target' : 'Pause this target'}
-                      onClick={(e) => { e.stopPropagation(); pauseOne(t) }}
-                    >{t.paused ? '▶' : '⏸'}</button>
-                    {/* Delete button lives in the card so each target is self-contained */}
-                    <button
-                      className="card-del"
-                      title="Remove target"
-                      onClick={(e) => { e.stopPropagation(); ctrl(t.id, 'remove').then(() => { if (isSel) setSelId(null); refreshState() }) }}
-                    >✕</button>
-                  </div>
-                  <small>{t.dest_ip} {familyLabel(t.family, t.config?.family)}{t.paused ? ' · paused' : ''}</small>
-                  {d && (
-                    <div className="grid grid-cols-3 gap-x-2.5 gap-y-0.5 mt-1.5 pt-1.5 border-t border-border text-[10px] font-mono text-muted">
-                      <span>min <b className="text-ink">{fmt(d.min)}</b></span>
-                      <span>avg <b className="text-ink">{fmt(d.avg)}</b></span>
-                      <span>med <b className="text-ink">{fmt(d.med)}</b></span>
-                      <span>max <b className="text-ink">{fmt(d.max)}</b></span>
-                      <span>jit <b className="text-ink">{fmt(d.jitter)}</b></span>
-                      <span>pl <b className={d.loss > 0 ? '' : 'text-ink'} style={d.loss > 0 ? { color: 'var(--bad)' } : undefined}>{d.loss.toFixed(0)}%</b></span>
-                    </div>
-                  )}
-                </li>
-              )
-            })}
-          </ul>
-          {targets.length > 0 && (
-            <div className="row">
-              <button className={allPaused ? 'primary' : ''} onClick={() => pauseAll(!allPaused)}
-                title="Pause or resume ALL targets">{allPaused ? '▶ Resume all' : '⏸ Pause all'}</button>
-            </div>
-          )}
-          {/* ── Export / Import ─────────────────────────────────────────── */}
-          <div className="sidebar-actions">
-            <button onClick={exportTargetList} title="Save target list + config to a protected .npulse file (only NetPulse can open it)">⬇ Save list (.npulse)</button>
-            <button onClick={exportTargetsJson} title="Export target list + config as human-readable JSON">⬇ Export JSON</button>
-            <label className="import-btn" title="Load a .npulse target list (auto-starts tracing, skips exact duplicates)">
-              ⬆ Load list (.npulse)
-              <input id="np-import-input" type="file" accept=".npulse" style={{ display: 'none' }} onChange={(e) => { if (e.target.files[0]) importTargetList(e.target.files[0]); e.target.value = '' }} />
-            </label>
-          </div>
-          <div
-            onMouseDown={startDrag('sidebar')}
-            title="Drag to resize"
-            className="resize-handle-x absolute top-0 right-0 h-full w-1.5"
-          />
-        </aside>
-
+        <TargetPanel
+          compact={!!sel}
+          sidebarWidth={sidebarWidth}
+          isResizing={resizing === 'sidebar'}
+          startDrag={startDrag}
+          panelRef={sidebarElRef}
+          targets={targets}
+          rows={dashboardRows}
+          destSummary={destSummary}
+          pathSummary={pathSummary}
+          statusFilter={statusFilter}
+          toggleStatusFilter={toggleStatusFilter}
+          targetSearch={targetSearch}
+          setTargetSearch={setTargetSearch}
+          dashSortCol={dashSortCol}
+          dashSortDir={dashSortDir}
+          toggleDashSort={toggleDashSort}
+          selectDashSort={selectDashSort}
+          onQuickAdd={quickAdd}
+          onOpenTool={setTab}
+          onReorder={handleReorder}
+          forceRecheckOne={forceRecheckOne}
+          pauseOne={pauseOne}
+          removeTarget={removeTarget}
+          openTarget={selectTarget}
+          targetState={targetState}
+          destLamp={destLamp}
+          pathLamp={pathLamp}
+          destHopOf={destHopOf}
+          familyLabel={familyLabel}
+          fmt={fmt}
+          STATE_LABEL={STATE_LABEL}
+          view={view}
+          alertMs={alerts.ms}
+          sel={sel}
+          allPaused={allPaused}
+          pauseAll={pauseAll}
+          exportTargetList={exportTargetList}
+          exportTargetsJson={exportTargetsJson}
+          importTargetList={importTargetList}
+          exportAllTargetsFullXlsx={exportAllTargetsFullXlsx}
+          xlsxExportProgress={xlsxExportProgress}
+        />
 
         <main>
-          {!sel ? <div className="empty">Add a target to begin.</div> : (
+          {sel && (
             <>
-              <div className="statusbar">
+              {(() => {
+                const stFull = targetState(sel)
+                const STATUS_TAG = { discovering: 'DISCOVERING', ok: 'OK', okloss: 'MINOR LOSS', warn: 'WARN', bad: 'BAD', down: 'DOWN' }
+                return (
+              <div className={'statusbar st-' + stFull}>
+                <button className="btn-close-target" title="Back to the dashboard (target keeps running, nothing is deleted)" onClick={closeTarget}>← Dashboard</button>
+                <span className="divider" />
+                <span className={'status-pill st-' + stFull}>{STATUS_TAG[stFull] || stFull}</span>
                 <b>{sel.name}</b> → {sel.dest_ip || 'resolving…'} <span className="badge">{familyLabel(sel.family, sel.config?.family)}</span> · {sel.hops.length} hops
-                {isDiscovering(sel) && !sel.error && (
+                <button className="btn-recheck" disabled={recheckRequested.has(sel.id)} title="Re-verify this target's route now, without resetting anything" onClick={() => forceRecheckOne(sel)}>↻ Force recheck</button>
+                {(isDiscovering(sel) || recheckRequested.has(sel.id)) && !sel.error && (
                   <span className="badge inline-flex items-center align-middle" title="Discovering the route: resolving the destination and probing each hop. Each hop's first few real replies are used only to establish its address/route and aren't shown as stats yet, so an unrepresentative first reading isn't displayed as if it were typical. Clears per-hop as soon as real data is available.">
                     <span className="spinner sm" style={{ marginRight: 5 }} />
-                    {sel.dest_ip ? 'discovering route…' : `resolving ${sel.name}…`}
+                    {recheckRequested.has(sel.id) && !isDiscovering(sel) ? 'recheck requested…' : sel.dest_ip ? 'discovering route…' : `resolving ${sel.name}…`}
                   </span>
                 )}
                 {(() => { const p = sel.hops.filter((h) => ['loss', 'warn', 'bad', 'down'].includes(hopStatus(h))); return p.length > 0 && <span className="err"> ⚠ {p.length} hop{p.length > 1 ? 's' : ''} with loss/latency</span> })()}
+                {(() => {
+                  const h1 = sel.hops[0]
+                  const firewallLikely = !sel.error && h1 && h1.sent >= 5 && h1.recv === 0
+                  return firewallLikely && (
+                    <span className="err" title="Hop 1 is your own router — it should reply almost instantly. 100% loss specifically here (not deeper hops) almost always means a local firewall or antivirus is silently dropping ICMP packets, not a real network problem.">
+                      {' '}⚠ No replies from hop 1 (your router) — likely a firewall/antivirus blocking ICMP on this PC, not a network issue.
+                      Try allowing "Net Pulse" through Windows Firewall (or reinstall — newer installers add this automatically).
+                    </span>
+                  )
+                })()}
                 {sel.error && <span className="err"> ⚠ {sel.error}</span>}
+                {sel.loopWarning && (
+                  <span className="err warn-loop" title="This is advisory, not fatal — every hop below is still measured normally. See the highlighted rows and the banner above the table for the two hops involved.">
+                    {' '}⚠ {sel.loopWarning}
+                  </span>
+                )}
                 <div className="spacer" />
                 {dest && <span className="rtt">RTT <b>{fmt(dest.med ?? dest.avg)}</b> ms <span className="rttsub">(median · avg {fmt(dest.avg)} · cur {dest.cur == null ? '*' : fmt(dest.cur)})</span></span>}
-                <button onClick={exportPng}>🖼 Graph PNG</button>
-                <button onClick={exportHopsCsv}>📄 Hops CSV</button>
+                <button className="icon-btn" onClick={exportPng} title="Graph PNG — a picture of the latency chart" aria-label="Export graph as PNG"><IconImage /></button>
+                <button className="icon-btn" onClick={exportHopsCsv} title="Hops CSV — current per-hop summary" aria-label="Export hops as CSV"><IconCsv /></button>
+                <button className="icon-btn" onClick={exportHopsTablePng} title="Traceroute PNG — a picture of the hop table itself, not the latency chart" aria-label="Export hop table as PNG"><IconRoute /></button>
+                <button className="icon-btn" onClick={exportTargetFullCsv} title="Full CSV — every recorded sample for this target, all hops, all history — not just the current summary row" aria-label="Export full history as CSV"><IconBackupTable /></button>
+                <button className="icon-btn" onClick={exportTargetFullXlsx} title="Excel — same as Full CSV, plus config and current hop summary, as one workbook with separate sheets" aria-label="Export to Excel"><IconTableChart /></button>
+                <span className="divider" />
+                <button className="btn-close-x" title="Remove this target" aria-label="Remove target" onClick={() => removeTarget(sel.id, true)}>✕</button>
               </div>
+                )
+              })()}
 
               {sel.config && (
                 <div className="cfgstrip">
@@ -1271,7 +1711,6 @@ export default function App() {
                   <span className="divider" />
                   <span>family <b>{sel.config.family}</b></span>
                   <span>iface <b>{sel.config.src || 'auto'}</b></span>
-                  <span>mode <b>{sel.config.raw ? 'raw' : 'dgram'}</b></span>
                   <div className="spacer" />
                   {!editing
                     ? <button onClick={() => { setEditForm({ probe: sel.config.probe, timeout: sel.config.timeout, payload: sel.config.payload, maxhops: sel.config.maxhops, family: sel.config.family, src: sel.config.src }); setEditing(true) }}>⚙ Edit config</button>
@@ -1284,7 +1723,7 @@ export default function App() {
                   <label>Probe (s)<input type="number" step="0.1" min="0.1" value={editForm.probe} onChange={(e) => setEditForm({ ...editForm, probe: e.target.value })} /></label>
                   <label>Timeout (s, 0=auto)<input type="number" step="0.1" min="0" value={editForm.timeout} onChange={(e) => setEditForm({ ...editForm, timeout: e.target.value })} /></label>
                   <label title="ICMP payload bytes (0–65500)">Payload<input type="number" min="0" max="65500" step="1" value={editForm.payload} onChange={(e) => setEditForm({ ...editForm, payload: e.target.value })} /></label>
-                  <label title="Maximum hops / TTL (1–64)">Max hops<input type="number" min="1" max="64" step="1" value={editForm.maxhops} onChange={(e) => setEditForm({ ...editForm, maxhops: e.target.value })} /></label>
+                  <label title="Maximum hops / TTL (1–255)">Max hops<input type="number" min="1" max="255" step="1" value={editForm.maxhops} onChange={(e) => setEditForm({ ...editForm, maxhops: e.target.value })} /></label>
                   <label>Family
                     <select value={editForm.family} onChange={(e) => setEditForm({ ...editForm, family: e.target.value })}>
                       <option value="auto">Auto</option><option value="v4">IPv4</option><option value="v6">IPv6</option>
@@ -1317,16 +1756,31 @@ export default function App() {
                   </div>
                   {/needs? admin|need admin\/root/i.test(sel.error) && (
                     <div className="loading-sub" style={{ maxWidth: 480, textAlign: 'center', marginTop: 6 }}>
-                      Raw ICMP sockets need Administrator rights on Windows (root on macOS/Linux).
-                      Relaunch Net Pulse as Administrator, or edit this target's config and
-                      turn off <b>Raw</b> — the unprivileged mode works without elevation.
+                      ICMP probing needs Administrator rights on Windows (root on macOS/Linux).
+                      Relaunch Net Pulse as Administrator to fix this.
                     </div>
                   )}
                 </div>
               ) : (
                 <>
-                  <div className="tablewrap" style={{ maxHeight: `${tablePct}%` }}>
-                    <table>
+                  {sel.loopWarning && (
+                    <div className="loop-banner" role="status">
+                      <span className="loop-banner-icon">⚠</span>
+                      <span className="loop-banner-text">
+                        {sel.loopWarning} — every hop below is still being measured normally; this only flags that hop{' '}
+                        <b>{sel.loopHop}</b> and hop <b>{sel.loopDupAt}</b> appear to share a physical path. Both rows are
+                        highlighted below.
+                      </span>
+                      {sel.loopHop != null && (
+                        <button className="loop-banner-jump" onClick={() => setSelHop(sel.loopHop)}>Jump to hop {sel.loopHop}</button>
+                      )}
+                      {sel.loopDupAt != null && (
+                        <button className="loop-banner-jump" onClick={() => setSelHop(sel.loopDupAt)}>Jump to hop {sel.loopDupAt}</button>
+                      )}
+                    </div>
+                  )}
+                  <div className="tablewrap" ref={tableWrapElRef} style={{ maxHeight: `${tablePct}%` }}>
+                    <table ref={hopTableRef}>
                       <thead><tr>
                         <th>Hop</th><th>PL%</th><th>IP</th><th>Host</th><th>ASN</th><th>Network</th>
                         <th>Sent</th><th>Recv</th><th>Loss%</th><th>Cur</th><th title="Median — stays stable through a single spike, unlike Avg/Max">Med</th><th>Avg</th><th>Min</th><th>Max</th><th>Jitter</th>
@@ -1335,7 +1789,8 @@ export default function App() {
                       </tr></thead>
                       <tbody>
                         {sel.hops.map((h, i) => {
-                          const a = asnOf(h.address)
+                          const displayAddr = h.address !== '*' ? h.address : (h.stale_address || h.address)
+                          const a = asnOf(displayAddr)
                           const prev = i > 0 ? asnOf(sel.hops[i - 1].address) : null
                           const boundary = a && prev && a.asn && prev.asn && a.asn !== prev.asn
                           const prevAvg = i > 0 ? sel.hops[i - 1].avg : null
@@ -1353,21 +1808,34 @@ export default function App() {
                           // probed either way), and the icon didn't match reality.
                           const targetPaused = !!sel.paused
                           const effPaused = targetPaused || hopPaused
+                          const isLoopHop = sel.loopHop != null && h.hop === sel.loopHop
+                          const isLoopDup = sel.loopDupAt != null && h.hop === sel.loopDupAt
                           return (
-                            <tr key={h.hop} className={(h.hop === selHop ? 'selrow' : '') + (effPaused ? ' hoppaused' : '')} onClick={() => setSelHop(h.hop)}>
+                            <tr key={h.hop} className={(h.hop === selHop ? 'selrow' : '') + (effPaused ? ' hoppaused' : '') + ((isLoopHop || isLoopDup) ? ' looprow' : '')} onClick={() => setSelHop(h.hop)}>
                               <td>
                                 <button className="hop-pause" disabled={targetPaused}
                                   title={targetPaused ? 'Target is paused — resume the target to control individual hops' : (hopPaused ? 'Resume probing this hop' : 'Pause probing this hop (reduce load)')}
                                   onClick={(e) => { e.stopPropagation(); if (!targetPaused) toggleHopPause(h.hop) }}>{effPaused ? '▶' : '⏸'}</button>
                                 <span className={'hopdot st-' + hopStatus(h)} title={hopStatus(h)} />{h.hop}{h.is_dest ? ' ◀' : ''}
+                                {(isLoopHop || isLoopDup) && (
+                                  <span className="loop-badge" title={isLoopHop
+                                    ? `Repeats the address seen at hop ${sel.loopDupAt}`
+                                    : `Its address reappears at hop ${sel.loopHop}`}>⟲</span>
+                                )}
                               </td>
                               <td><div className="plbar"><span style={{ width: `${Math.min(100, h.loss)}%` }} /></div><i className={h.loss > 0 ? 'loss' : ''}>{h.loss.toFixed(0)}</i></td>
-                              <td className="mono">{h.address}</td>
-                              <td className="host" title={hostOf(h)}>{hostOf(h)}</td>
-                              <td className={'asn' + (boundary ? ' boundary' : '')} onClick={(e) => { e.stopPropagation(); openDetail(h.address) }}>
-                                {a ? (a.loading ? '…' : a.asn ? `AS${a.asn}` : '—') : (bgp.isPublicIp(h.address) ? '…' : 'priv')}
+                              <td className={'mono' + (h.address === '*' && h.stale_address ? ' stale-cell' : '')}>
+                                {h.address !== '*' ? h.address : (h.stale_address
+                                  ? <span title={`Last confirmed ${h.stale_since ? new Date(h.stale_since * 1000).toLocaleString() : 'a while ago'} — this hop hasn't answered since, so this address is no longer being measured, just remembered.`}>
+                                      {h.stale_address}<span className="stale-tag"> (stale, {agoFmt(h.stale_since)})</span>
+                                    </span>
+                                  : '*')}
                               </td>
-                              <td className="net" title={a && a.holder} onClick={(e) => { e.stopPropagation(); openDetail(h.address) }}>{a && a.holder ? a.holder : ''}</td>
+                              <td className={'host' + (h.address === '*' && h.stale_address ? ' stale-cell' : '')} title={hostOf(h)}>{hostOf(h)}</td>
+                              <td className={'asn' + (boundary ? ' boundary' : '') + (h.address === '*' && h.stale_address ? ' stale-cell' : '')} onClick={(e) => { e.stopPropagation(); openDetail(displayAddr) }}>
+                                {a ? (a.loading ? '…' : a.asn ? `AS${a.asn}` : '—') : (bgp.isPublicIp(displayAddr) ? '…' : 'priv')}
+                              </td>
+                              <td className={'net' + (h.address === '*' && h.stale_address ? ' stale-cell' : '')} title={a && a.holder} onClick={(e) => { e.stopPropagation(); openDetail(displayAddr) }}>{a && a.holder ? a.holder : ''}</td>
                               <td>{h.sent}</td>
                               <td className={h.recv < h.sent ? 'loss' : ''}>{h.recv}</td>
                               <td className={h.loss > 0 ? 'loss' : ''}>{h.loss.toFixed(1)}%</td>
@@ -1410,200 +1878,9 @@ export default function App() {
           )}
         </main>
 
-        <Drawer detail={detail} onClose={() => setDetail(null)} />
+        <BgpDrawer detail={detail} onClose={() => setDetail(null)} />
       </div>
       </>)}
-    </div>
-  )
-}
-
-// --- Tool pages ----------------------------------------------------------
-const toolsApi = () => (typeof window !== 'undefined' && window.netpulse && window.netpulse.tools) || null
-
-function ToolUnavailable() {
-  return <div className="tool-note">These tools run in the desktop app (they use the OS network stack). Open Net&nbsp;Pulse as the Electron app to use them.</div>
-}
-
-// Cmd-style ping — streams real `ping` output from the OS.
-function PingPage() {
-  const [host, setHost] = React.useState('')
-  const [opts, setOpts] = React.useState({ count: 10, size: 56, timeout: 2000, ttl: '', interval: 1, family: 'auto', continuous: false })
-  const [lines, setLines] = React.useState([])
-  const [running, setRunning] = React.useState(false)
-  const [cmd, setCmd] = React.useState('')
-  const idRef = React.useRef(null)
-  const preRef = React.useRef(null)
-  const set = (k, v) => setOpts((o) => ({ ...o, [k]: v }))
-
-  React.useEffect(() => {
-    const t = toolsApi(); if (!t) return
-    const off1 = t.onPingLine(({ id, line }) => { if (id === idRef.current) setLines((L) => [...L, line]) })
-    const off2 = t.onPingDone(({ id }) => { if (id === idRef.current) setRunning(false) })
-    return () => { off1 && off1(); off2 && off2() }
-  }, [])
-  React.useEffect(() => { if (preRef.current) preRef.current.scrollTop = preRef.current.scrollHeight }, [lines])
-
-  const start = async () => {
-    const t = toolsApi(); if (!t || !host.trim()) return
-    setLines([]); setRunning(true)
-    const payload = { count: opts.count, size: opts.size, timeout: opts.timeout, interval: opts.interval, family: opts.family, continuous: opts.continuous }
-    if (opts.ttl !== '' && opts.ttl != null) payload.ttl = opts.ttl
-    const res = await t.pingStart(host.trim(), payload)
-    if (!res || res.error) { setLines([(res && res.error) || 'Failed to start ping']); setRunning(false); return }
-    idRef.current = res.id; setCmd(res.cmd || '')
-  }
-  const stop = async () => { const t = toolsApi(); if (t && idRef.current) await t.pingStop(idRef.current); setRunning(false) }
-
-  // Parse the streamed output into per-reply samples + running stats.
-  const text = lines.join('')
-  const stats = React.useMemo(() => {
-    const rtts = []; let replies = 0, timeouts = 0
-    const re = /time[=<]\s*([\d.]+)\s*ms/gi; let m
-    while ((m = re.exec(text))) { rtts.push(parseFloat(m[1])); replies++ }
-    timeouts = (text.match(/timed out|100% (packet )?loss|Destination host unreachable|no answer|Request timeout/gi) || []).length
-    if (!rtts.length && !timeouts) return null
-    const min = rtts.length ? Math.min(...rtts) : null
-    const max = rtts.length ? Math.max(...rtts) : null
-    const avg = rtts.length ? rtts.reduce((a, b) => a + b, 0) / rtts.length : null
-    const jit = rtts.length > 1 ? rtts.slice(1).reduce((a, b, i) => a + Math.abs(b - rtts[i]), 0) / (rtts.length - 1) : 0
-    const sent = replies + timeouts
-    const loss = sent ? (timeouts / sent) * 100 : 0
-    return { replies, timeouts, sent, loss, min, max, avg, jit, last: rtts[rtts.length - 1] }
-  }, [text])
-
-  const colorLine = (ln, i) => {
-    let cls = ''
-    if (/time[=<]/i.test(ln)) cls = 'pl-ok'
-    else if (/timed out|unreachable|100%|failure|could not find|no answer|Request timeout/i.test(ln)) cls = 'pl-bad'
-    else if (/statistics|min|avg|max|packets/i.test(ln)) cls = 'pl-stat'
-    return <span key={i} className={cls}>{ln}</span>
-  }
-
-  if (!toolsApi()) return <div className="toolpage"><h2>Ping</h2><ToolUnavailable /></div>
-  const fmt = (v) => v == null ? '—' : v.toFixed(1)
-  return (
-    <div className="toolpage wide">
-      <h2>Ping <span className="muted" style={{ fontWeight: 400, fontSize: 13 }}>— ICMP echo (OS ping)</span></h2>
-      <div className="tool-row">
-        <label style={{ flex: 1, minWidth: 260 }}>Host / IP <input className="target" value={host} placeholder="1.1.1.1, 2606:4700:4700::1111, example.com"
-          onChange={(e) => setHost(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && !running && start()} /></label>
-        {running ? <button onClick={stop}>■ Stop</button> : <button className="primary" onClick={start}>▶ Ping</button>}
-      </div>
-      <div className="tool-row ping-opts">
-        <label>Count <input type="number" min="1" max="10000" disabled={opts.continuous} value={opts.count} onChange={(e) => set('count', +e.target.value)} style={{ width: 78 }} /></label>
-        <label>Size (B) <input type="number" min="0" max="65500" value={opts.size} onChange={(e) => set('size', +e.target.value)} style={{ width: 78 }} /></label>
-        <label>Timeout (ms) <input type="number" min="100" max="60000" step="100" value={opts.timeout} onChange={(e) => set('timeout', +e.target.value)} style={{ width: 90 }} /></label>
-        <label>TTL <input type="number" min="1" max="255" value={opts.ttl} placeholder="auto" onChange={(e) => set('ttl', e.target.value)} style={{ width: 66 }} /></label>
-        <label>Interval (s) <input type="number" min="0.2" max="60" step="0.1" value={opts.interval} onChange={(e) => set('interval', +e.target.value)} style={{ width: 78 }} /></label>
-        <label>Family
-          <select value={opts.family} onChange={(e) => set('family', e.target.value)}>
-            <option value="auto">Auto</option><option value="v4">IPv4</option><option value="v6">IPv6</option>
-          </select>
-        </label>
-        <label className="cb"><input type="checkbox" checked={opts.continuous} onChange={(e) => set('continuous', e.target.checked)} />Continuous</label>
-      </div>
-      {stats && (
-        <div className="ping-stats">
-          <div><span>Sent</span><b>{stats.sent}</b></div>
-          <div><span>Recv</span><b>{stats.replies}</b></div>
-          <div className={stats.loss > 0 ? 'danger' : ''}><span>Loss</span><b>{stats.loss.toFixed(1)}%</b></div>
-          <div><span>Last</span><b>{fmt(stats.last)}</b></div>
-          <div><span>Min</span><b>{fmt(stats.min)}</b></div>
-          <div><span>Avg</span><b>{fmt(stats.avg)}</b></div>
-          <div><span>Max</span><b>{fmt(stats.max)}</b></div>
-          <div><span>Jitter</span><b>{fmt(stats.jit)}</b></div>
-        </div>
-      )}
-      {cmd && <div className="muted" style={{ fontSize: 11, margin: '2px 0 6px', fontFamily: 'ui-monospace, monospace' }}>$ {cmd}</div>}
-      <pre ref={preRef} className="tool-console">{lines.length ? lines.map(colorLine) : 'Set options and press Ping.'}</pre>
-    </div>
-  )
-}
-
-// Forward + reverse DNS.
-function DnsPage() {
-  const [q, setQ] = React.useState('')
-  const [fwd, setFwd] = React.useState(null)
-  const [rev, setRev] = React.useState(null)
-  const [busy, setBusy] = React.useState(false)
-  const isIp = (s) => /:/.test(s) || /^\d{1,3}(\.\d{1,3}){3}$/.test(s)
-  const run = async () => {
-    const t = toolsApi(); if (!t || !q.trim()) return
-    setBusy(true); setFwd(null); setRev(null)
-    const query = q.trim()
-    try {
-      if (isIp(query)) { setRev(await t.reverse(query)); const names = (await t.reverse(query)).names; if (names && names[0]) setFwd(await t.dns(names[0])) }
-      else { setFwd(await t.dns(query)); const a = (await t.dns(query)); const first = (a.a[0] || a.aaaa[0]); if (first) setRev(await t.reverse(first)) }
-    } catch (e) { setFwd({ error: String(e) }) }
-    setBusy(false)
-  }
-  if (!toolsApi()) return <div className="toolpage"><h2>DNS Lookup</h2><ToolUnavailable /></div>
-  return (
-    <div className="toolpage">
-      <h2>DNS Lookup <span className="muted" style={{ fontWeight: 400 }}>— forward &amp; reverse</span></h2>
-      <div className="tool-row">
-        <label>Host or IP <input className="target" value={q} placeholder="example.com or 1.1.1.1"
-          onChange={(e) => setQ(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && run()} /></label>
-        <button className="primary" onClick={run} disabled={busy}>{busy ? 'Looking up…' : 'Lookup'}</button>
-      </div>
-      {fwd && (
-        <div className="tool-card">
-          <h4>Forward {fwd.name ? `(${fwd.name})` : ''}</h4>
-          {fwd.error ? <div className="danger">{fwd.error}</div> : (
-            <div className="dns-recs">
-              <div><span className="rec-t">A</span>{(fwd.a && fwd.a.length) ? fwd.a.map((x, i) => <code key={i}>{x}</code>) : <span className="muted">none</span>}</div>
-              <div><span className="rec-t">AAAA</span>{(fwd.aaaa && fwd.aaaa.length) ? fwd.aaaa.map((x, i) => <code key={i}>{x}</code>) : <span className="muted">none</span>}</div>
-              {fwd.cname && fwd.cname.length > 0 && <div><span className="rec-t">CNAME</span>{fwd.cname.map((x, i) => <code key={i}>{x}</code>)}</div>}
-            </div>
-          )}
-        </div>
-      )}
-      {rev && (
-        <div className="tool-card">
-          <h4>Reverse ({rev.addr})</h4>
-          {rev.error ? <div className="muted">{rev.error}</div>
-            : (rev.names && rev.names.length) ? <div className="dns-recs"><div><span className="rec-t">PTR</span>{rev.names.map((x, i) => <code key={i}>{x}</code>)}</div></div>
-            : <span className="muted">no PTR record</span>}
-        </div>
-      )}
-    </div>
-  )
-}
-
-// TCP connect port scanner.
-function PortScanPage() {
-  const [host, setHost] = React.useState('')
-  const [start, setStart] = React.useState(1)
-  const [end, setEnd] = React.useState(1024)
-  const [res, setRes] = React.useState(null)
-  const [busy, setBusy] = React.useState(false)
-  const COMMON = { 20: 'ftp-data', 21: 'ftp', 22: 'ssh', 23: 'telnet', 25: 'smtp', 53: 'dns', 80: 'http', 110: 'pop3', 143: 'imap', 443: 'https', 445: 'smb', 3306: 'mysql', 3389: 'rdp', 5432: 'postgres', 6379: 'redis', 8080: 'http-alt', 8443: 'https-alt' }
-  const run = async () => {
-    const t = toolsApi(); if (!t || !host.trim()) return
-    setBusy(true); setRes(null)
-    setRes(await t.portscan(host.trim(), start, end))
-    setBusy(false)
-  }
-  if (!toolsApi()) return <div className="toolpage"><h2>Port Scanner</h2><ToolUnavailable /></div>
-  return (
-    <div className="toolpage">
-      <h2>Port Scanner <span className="muted" style={{ fontWeight: 400 }}>— TCP connect</span></h2>
-      <div className="tool-row">
-        <label>Host / IP <input className="target" value={host} placeholder="192.168.1.1 or example.com"
-          onChange={(e) => setHost(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && !busy && run()} /></label>
-        <label>From <input type="number" min="1" max="65535" value={start} onChange={(e) => setStart(+e.target.value)} style={{ width: 80 }} /></label>
-        <label>To <input type="number" min="1" max="65535" value={end} onChange={(e) => setEnd(+e.target.value)} style={{ width: 80 }} /></label>
-        <button className="primary" onClick={run} disabled={busy}>{busy ? 'Scanning…' : 'Scan'}</button>
-      </div>
-      <div className="muted" style={{ fontSize: 12, margin: '2px 0 8px' }}>Ranges are capped at 2048 ports per scan. Scan only hosts you own or are authorized to test.</div>
-      {res && (res.error ? <div className="danger">{res.error}</div> : (
-        <div className="tool-card">
-          <h4>{res.open.length} open {res.open.length === 1 ? 'port' : 'ports'} in {res.scanned[0]}–{res.scanned[1]} on {res.host}</h4>
-          {res.open.length === 0 ? <span className="muted">No open TCP ports found in range.</span> : (
-            <div className="ports">{res.open.map((p) => <span key={p} className="port-chip"><b>{p}</b>{COMMON[p] ? <em>{COMMON[p]}</em> : null}</span>)}</div>
-          )}
-        </div>
-      ))}
     </div>
   )
 }

@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+# Grants CAP_NET_RAW to the installed binary so raw ICMP (traceroute/MTR)
+# works without requiring the app to run as root on every launch — this
+# script itself already runs as root (dpkg/apt maintainer scripts always
+# do), so this is a one-time grant using elevation the user already gave,
+# exactly mirroring the Windows NSIS installer hooks' approach.
+#
+# setcap failing (e.g. libcap2-bin missing on a minimal system, or a
+# filesystem that doesn't support extended attributes, like some overlay/
+# network filesystems) must NOT abort the whole package install over this —
+# raw ICMP just won't work without it, same degraded-but-installed state as
+# if the user runs the AppImage without setcap.
+if command -v setcap >/dev/null 2>&1; then
+    setcap cap_net_raw+ep /usr/bin/netpulse || true
+fi
+
+exit 0

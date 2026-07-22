@@ -34,6 +34,7 @@ const api = async (path, opts) => {
     case '/api/pause': await np.pauseTarget(Number(q.id), q.on !== '0'); return {}
     case '/api/stop': await np.stopTarget(Number(q.id)); return {}
     case '/api/remove': await np.removeTarget(Number(q.id)); return {}
+    case '/api/recheck': await np.forceRecheck(Number(q.id)); return {}
     default: throw new Error(`api(): unknown endpoint ${base}`)
   }
 }
@@ -115,6 +116,31 @@ function RpkiBadge({ status }) {
   return <span className="chip" style={{ borderColor: c, color: c }}>{t}</span>
 }
 
+// Non-toast route-leak signal — a small clickable chip, consistent with
+// RpkiBadge, per the user's explicit "no popup" requirement.
+function RouteLeakBadge({ leak, onClick }) {
+  if (!leak) return null
+  return (
+    <span className="chip" style={{ borderColor: '#f85149', color: '#f85149', cursor: 'pointer' }}
+      title={`Possible BGP route leak/hijack: ${leak}. Click for AS-path detail.`} onClick={onClick}>
+      ⚠ route leak: {leak}
+    </span>
+  )
+}
+
+// Small inline uptime chip, styled like RpkiBadge/RouteLeakBadge — derived
+// purely from the engine's own reachability signal (see manager.hpp's
+// state_json uptime block), no separate panel/log.
+function UptimeChip({ uptime }) {
+  if (!uptime) return null
+  const c = uptime.up ? '#3fb950' : '#f85149'
+  return (
+    <span className="chip" style={{ borderColor: c, color: c }} title="Derived from the destination hop's own reachability history">
+      {uptime.up ? '●' : '○'} {fmt(uptime.pct)}% uptime
+    </span>
+  )
+}
+
 function Drawer({ detail, onClose }) {
   if (!detail) return null
   const d = detail.data
@@ -136,10 +162,27 @@ function Drawer({ detail, onClose }) {
             <div className="kv"><span>RPKI</span><b><RpkiBadge status={d.rpki} /></b></div>
             <div className="kv"><span>Location</span><b>{[d.city, d.country].filter(Boolean).join(', ') || '—'}</b></div>
             {d.descr && <div className="kv"><span>Owner</span><b>{d.descr}</b></div>}
+            {d.routing && d.routing.firstSeen && (
+              <div className="kv"><span>First seen</span><b>{new Date(d.routing.firstSeen).toLocaleDateString()}</b></div>
+            )}
+            {d.routing && d.routing.observedNeighbours != null && (
+              <div className="kv"><span>Peers observing</span><b>{d.routing.observedNeighbours}</b></div>
+            )}
+            {d.abuse && d.abuse.contacts && d.abuse.contacts.length > 0 && (
+              <div className="kv"><span>Abuse contact</span><b>{d.abuse.contacts.join(', ')}</b></div>
+            )}
             {d.paths && d.paths.length > 0 && (
               <div className="paths">
                 <div className="paths-h">Sample BGP AS-paths (RIS)</div>
                 {d.paths.map((p, i) => <div key={i} className="aspath">{p}</div>)}
+              </div>
+            )}
+            {d.bgpState && d.bgpState.length > 0 && (
+              <div className="paths">
+                <div className="paths-h">Live BGP state (RIS route collectors)</div>
+                {d.bgpState.map((e, i) => (
+                  <div key={i} className="aspath">{e.path.join(' → ')}{e.sourceId ? ` (${e.sourceId})` : ''}</div>
+                ))}
               </div>
             )}
             <div className="drawer-links">
@@ -625,6 +668,36 @@ export default function App() {
     })
   }, [ipKey]) // eslint-disable-line
 
+  // ---- BGP route-leak alerting ----
+  // Baseline is captured once per target from the first fresh AS-path summary
+  // seen for its destination, kept in-memory only — nothing here is persisted
+  // to disk. Rechecked on a coarse timer — RIS/RIPEstat data doesn't change
+  // sub-second and the API has rate limits, so this must NOT ride the 600ms
+  // poll.
+  const routeLeakBaseline = useRef({})
+  const [leakAlerts, setLeakAlerts] = useState({})
+  const targetsRef = useRef(targets)
+  useEffect(() => { targetsRef.current = targets })
+  useEffect(() => {
+    let alive = true
+    const checkLeaks = async () => {
+      for (const t of targetsRef.current) {
+        const d = destHopOf(t)
+        if (!d || !bgp.isPublicIp(d.address)) continue
+        const paths = await bgp.bgpStateFresh(d.address)
+        const summary = bgp.summarizeAsPaths(paths)
+        if (!summary || !alive) continue
+        const baseline = routeLeakBaseline.current[t.id]
+        if (!baseline) { routeLeakBaseline.current[t.id] = summary; continue }
+        const leak = bgp.detectRouteLeak(baseline, summary)
+        if (alive) setLeakAlerts((la) => ({ ...la, [t.id]: leak }))
+      }
+    }
+    checkLeaks()
+    const h = setInterval(checkLeaks, 300000)
+    return () => { alive = false; clearInterval(h) }
+  }, [])
+
   // Quick-add a host directly (menu shortcuts) using default config, without
   // touching the add form. Skips exact-duplicate hosts already being traced.
   const addTargetHost = async (host) => {
@@ -874,6 +947,21 @@ export default function App() {
   const allPaused = targets.length > 0 && targets.every((t) => t.paused)
   const pauseAll = (on) => Promise.all(targets.map((t) => ctrl(t.id, 'pause', `&on=${on ? 1 : 0}`))).then(refreshState).catch(() => {})
   const pauseOne = (t) => ctrl(t.id, 'pause', `&on=${t.paused ? 0 : 1}`).then(refreshState).catch(() => {})
+  // Force-recheck: engine-side this immediately re-verifies every already-
+  // known hop's identity (see core Session::force_recheck) — the same
+  // non-destructive legacy re-probe the engine already runs periodically
+  // (kHopRecheckSecs) to notice route changes from a VPN toggle or network
+  // switch, just triggered on demand instead of waiting out the timer. It
+  // does NOT clear hops/state, so the UI only ever updates in place, never
+  // resets. Since there's no reset snapshot for isDiscovering() to react
+  // to, track a brief local "requested" pulse per target id so the button
+  // still gives immediate visible feedback that a recheck is in flight.
+  const [recheckRequested, setRecheckRequested] = useState(() => new Set())
+  const forceRecheckOne = (t) => {
+    setRecheckRequested((s) => new Set(s).add(t.id))
+    setTimeout(() => setRecheckRequested((s) => { const n = new Set(s); n.delete(t.id); return n }), 2500)
+    ctrl(t.id, 'recheck').then(refreshState).catch(() => {})
+  }
   const removeAll = async () => {
     if (!targets.length) return
     const ok = await showModal({
@@ -1042,6 +1130,8 @@ export default function App() {
             { sep: true },
             { label: 'Remove selected', onClick: () => sel && ctrl(sel.id, 'remove').then(() => { setSelId(null); refreshState() }), disabled: !sel },
             { label: 'Remove all…', onClick: removeAll, disabled: !targets.length },
+            { sep: true },
+            { label: 'Force recheck selected', onClick: () => sel && forceRecheckOne(sel), disabled: !sel },
           ],
         },
         {
@@ -1189,6 +1279,12 @@ export default function App() {
                     </span>
                     <span className="truncate flex-1">{t.name}</span>
                     {STATE_LABEL[st] && <span className={'statelabel st-' + st}>{STATE_LABEL[st]}</span>}
+                    {/* Force a route-discovery recheck without touching pause state */}
+                    <button
+                      className="card-recheck"
+                      title="Re-verify this target's route now, without resetting anything"
+                      onClick={(e) => { e.stopPropagation(); forceRecheckOne(t) }}
+                    >↻</button>
                     {/* Per-target pause/resume — selectively freeze one target */}
                     <button
                       className="card-pause"
@@ -1245,16 +1341,19 @@ export default function App() {
             <>
               <div className="statusbar">
                 <b>{sel.name}</b> → {sel.dest_ip || 'resolving…'} <span className="badge">{familyLabel(sel.family, sel.config?.family)}</span> · {sel.hops.length} hops
-                {isDiscovering(sel) && !sel.error && (
+                {(isDiscovering(sel) || recheckRequested.has(sel.id)) && !sel.error && (
                   <span className="badge inline-flex items-center align-middle" title="Discovering the route: resolving the destination and probing each hop. Each hop's first few real replies are used only to establish its address/route and aren't shown as stats yet, so an unrepresentative first reading isn't displayed as if it were typical. Clears per-hop as soon as real data is available.">
                     <span className="spinner sm" style={{ marginRight: 5 }} />
-                    {sel.dest_ip ? 'discovering route…' : `resolving ${sel.name}…`}
+                    {recheckRequested.has(sel.id) && !isDiscovering(sel) ? 'recheck requested…' : sel.dest_ip ? 'discovering route…' : `resolving ${sel.name}…`}
                   </span>
                 )}
                 {(() => { const p = sel.hops.filter((h) => ['loss', 'warn', 'bad', 'down'].includes(hopStatus(h))); return p.length > 0 && <span className="err"> ⚠ {p.length} hop{p.length > 1 ? 's' : ''} with loss/latency</span> })()}
                 {sel.error && <span className="err"> ⚠ {sel.error}</span>}
+                <RouteLeakBadge leak={leakAlerts[sel.id]} onClick={() => dest && openDetail(dest.address)} />
                 <div className="spacer" />
+                <UptimeChip uptime={sel.uptime} />
                 {dest && <span className="rtt">RTT <b>{fmt(dest.med ?? dest.avg)}</b> ms <span className="rttsub">(median · avg {fmt(dest.avg)} · cur {dest.cur == null ? '*' : fmt(dest.cur)})</span></span>}
+                <button className="btn-recheck" disabled={recheckRequested.has(sel.id)} title="Re-verify this target's route now, without resetting anything" onClick={() => forceRecheckOne(sel)}>↻ Force recheck</button>
                 <button onClick={exportPng}>🖼 Graph PNG</button>
                 <button onClick={exportHopsCsv}>📄 Hops CSV</button>
               </div>
@@ -1342,7 +1441,15 @@ export default function App() {
                                 <span className={'hopdot st-' + hopStatus(h)} title={hopStatus(h)} />{h.hop}{h.is_dest ? ' ◀' : ''}
                               </td>
                               <td><div className="plbar"><span style={{ width: `${Math.min(100, h.loss)}%` }} /></div><i className={h.loss > 0 ? 'loss' : ''}>{h.loss.toFixed(0)}</i></td>
-                              <td className="mono">{h.address}</td>
+                              <td className="mono">
+                                {h.address}
+                                {h.mpls && h.mpls.length > 0 && (
+                                  <div className="chip" style={{ marginTop: 2, borderColor: '#7a8699', color: '#7a8699', fontSize: 10 }}
+                                    title="MPLS label stack from RFC 4950 ICMP extension (top of stack first)">
+                                    MPLS: {h.mpls.map((m) => m.label).join(', ')}
+                                  </div>
+                                )}
+                              </td>
                               <td className="host" title={hostOf(h)}>{hostOf(h)}</td>
                               <td className={'asn' + (boundary ? ' boundary' : '')} onClick={(e) => { e.stopPropagation(); openDetail(h.address) }}>
                                 {a ? (a.loading ? '…' : a.asn ? `AS${a.asn}` : '—') : (bgp.isPublicIp(h.address) ? '…' : 'priv')}
@@ -1446,9 +1553,12 @@ function PingPage() {
     const max = rtts.length ? Math.max(...rtts) : null
     const avg = rtts.length ? rtts.reduce((a, b) => a + b, 0) / rtts.length : null
     const jit = rtts.length > 1 ? rtts.slice(1).reduce((a, b, i) => a + Math.abs(b - rtts[i]), 0) / (rtts.length - 1) : 0
+    const std = rtts.length > 1 && avg != null
+      ? Math.sqrt(rtts.reduce((a, v) => a + (v - avg) ** 2, 0) / rtts.length)
+      : 0
     const sent = replies + timeouts
     const loss = sent ? (timeouts / sent) * 100 : 0
-    return { replies, timeouts, sent, loss, min, max, avg, jit, last: rtts[rtts.length - 1] }
+    return { replies, timeouts, sent, loss, min, max, avg, jit, std, last: rtts[rtts.length - 1] }
   }, [text])
 
   const colorLine = (ln, i) => {
@@ -1492,6 +1602,7 @@ function PingPage() {
           <div><span>Avg</span><b>{fmt(stats.avg)}</b></div>
           <div><span>Max</span><b>{fmt(stats.max)}</b></div>
           <div><span>Jitter</span><b>{fmt(stats.jit)}</b></div>
+          <div><span>Std dev</span><b>{fmt(stats.std)}</b></div>
         </div>
       )}
       {cmd && <div className="muted" style={{ fontSize: 11, margin: '2px 0 6px', fontFamily: 'ui-monospace, monospace' }}>$ {cmd}</div>}
@@ -1534,6 +1645,9 @@ function DnsPage() {
               <div><span className="rec-t">A</span>{(fwd.a && fwd.a.length) ? fwd.a.map((x, i) => <code key={i}>{x}</code>) : <span className="muted">none</span>}</div>
               <div><span className="rec-t">AAAA</span>{(fwd.aaaa && fwd.aaaa.length) ? fwd.aaaa.map((x, i) => <code key={i}>{x}</code>) : <span className="muted">none</span>}</div>
               {fwd.cname && fwd.cname.length > 0 && <div><span className="rec-t">CNAME</span>{fwd.cname.map((x, i) => <code key={i}>{x}</code>)}</div>}
+              {fwd.mx && fwd.mx.length > 0 && <div><span className="rec-t">MX</span>{fwd.mx.map((x, i) => <code key={i}>{x}</code>)}</div>}
+              {fwd.ns && fwd.ns.length > 0 && <div><span className="rec-t">NS</span>{fwd.ns.map((x, i) => <code key={i}>{x}</code>)}</div>}
+              {fwd.txt && fwd.txt.length > 0 && <div><span className="rec-t">TXT</span>{fwd.txt.map((x, i) => <code key={i}>{x}</code>)}</div>}
             </div>
           )}
         </div>

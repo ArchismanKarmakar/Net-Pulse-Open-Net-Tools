@@ -52,17 +52,145 @@ export async function ipInfo(ip) {
   return { asn, holder: (ov && ov.holder) || null, prefix }
 }
 
+// Live AS-path / next-hop table for a prefix, straight from RIS route
+// collectors (distinct from the sampled paths in looking-glass below).
+export async function bgpState(prefix) {
+  if (!prefix) return null
+  const d = await getJson('bgp-state', prefix)
+  if (!d || !Array.isArray(d.bgp_state)) return null
+  return d.bgp_state.slice(0, 8).map((e) => ({
+    path: Array.isArray(e.path) ? e.path : [],
+    community: Array.isArray(e.community) ? e.community : [],
+    sourceId: e.source_id || null,
+  }))
+}
+
+// Same call as bgpState(), but ALWAYS issues a live fetch instead of
+// short-circuiting through the permanent per-URL `cache` above. Route-leak
+// detection needs to observe change over time (has the origin/upstream ASN
+// shifted since we last looked?) — the cached bgpState() would forever
+// return the first answer it ever saw for a prefix, which would make every
+// leak check compare the baseline against itself and never fire.
+export async function bgpStateFresh(prefix) {
+  if (!prefix) return null
+  const url = `${BASE}/bgp-state/data.json?resource=${encodeURIComponent(prefix)}&${APP}`
+  const d = await fetch(url)
+    .then((r) => (r.ok ? r.json() : null))
+    .then((j) => (j && j.data) || null)
+    .catch(() => null)
+  if (!d || !Array.isArray(d.bgp_state)) return null
+  return d.bgp_state.slice(0, 8).map((e) => ({
+    path: Array.isArray(e.path) ? e.path : [],
+    community: Array.isArray(e.community) ? e.community : [],
+    sourceId: e.source_id || null,
+  }))
+}
+
+// Reduces a bgpStateFresh()-shaped array down to { originAsn, upstreamAsns }
+// for route-leak comparison: origin = last hop of each path (closest to the
+// prefix), upstream = second-to-last hop (who's announcing it to the world).
+// Takes the MAJORITY origin across all reporting peers/paths rather than just
+// the first path, since a single stale/minority peer shouldn't flip the
+// baseline or trigger a false alert.
+export function summarizeAsPaths(paths) {
+  if (!paths || !paths.length) return null
+  const originCounts = new Map()
+  const upstreamsByOrigin = new Map()
+  for (const p of paths) {
+    if (!p.path || p.path.length < 1) continue
+    const origin = p.path[p.path.length - 1]
+    const upstream = p.path.length >= 2 ? p.path[p.path.length - 2] : null
+    originCounts.set(origin, (originCounts.get(origin) || 0) + 1)
+    if (upstream) {
+      if (!upstreamsByOrigin.has(origin)) upstreamsByOrigin.set(origin, new Set())
+      upstreamsByOrigin.get(origin).add(upstream)
+    }
+  }
+  if (!originCounts.size) return null
+  let originAsn = null
+  let best = -1
+  for (const [asn, count] of originCounts) {
+    if (count > best) { best = count; originAsn = asn }
+  }
+  return { originAsn, upstreamAsns: upstreamsByOrigin.get(originAsn) || new Set() }
+}
+
+// Compares a fresh AS-path summary against a previously captured baseline
+// and returns a short human-readable alert string, or null if nothing looks
+// wrong. Two distinct signals, per RFC-leak-alerting best practice:
+//  - origin ASN changed entirely -> possible hijack (someone else now
+//    originates a prefix that used to be ours).
+//  - same origin, but a NEW upstream not seen in the baseline -> possible
+//    leak (the prefix is now reaching the world through an unexpected path).
+export function detectRouteLeak(baseline, fresh) {
+  if (!baseline || !fresh || !fresh.originAsn) return null
+  if (fresh.originAsn !== baseline.originAsn) {
+    return `origin ASN changed: AS${baseline.originAsn} → AS${fresh.originAsn}`
+  }
+  for (const up of fresh.upstreamAsns) {
+    if (!baseline.upstreamAsns.has(up)) {
+      return `unexpected upstream ASN AS${up}`
+    }
+  }
+  return null
+}
+
+// Visibility / first-seen for a prefix — answers "is this actually announced,
+// and since when" independent of the per-ASN as-overview.
+export async function routingStatus(prefix) {
+  if (!prefix) return null
+  const d = await getJson('routing-status', prefix)
+  if (!d) return null
+  return {
+    announced: !!d.announced,
+    firstSeen: (d.first_seen && d.first_seen.time) || null,
+    observedNeighbours: d.observed_neighbours ?? null,
+    visibility: d.visibility || null,
+  }
+}
+
+// Other prefixes announced by an ASN — used for "this network also announces
+// N other prefixes" context rather than a full prefix list in the drawer.
+export async function announcedPrefixes(asn) {
+  if (!asn) return null
+  const d = await getJson('announced-prefixes', `AS${asn}`)
+  if (!d || !Array.isArray(d.prefixes)) return null
+  return d.prefixes.map((p) => p.prefix).filter(Boolean)
+}
+
+// ASNs registered/routed in a country — a coarser, network/country-level tool
+// (not tied to a specific hop), exposed for the Tools area.
+export async function countryAsns(countryCode) {
+  if (!countryCode) return null
+  const d = await getJson('country-asns', countryCode, '&lod=1')
+  if (!d || !Array.isArray(d.countries) || !d.countries[0]) return null
+  const c = d.countries[0]
+  const routed = (c.asns && c.asns.routed) || []
+  return { country: c.country || countryCode, routedCount: routed.length, routed: routed.slice(0, 50) }
+}
+
+// Abuse-contact lookup for an IP/prefix — the "who do I report this to" tool.
+export async function abuseContact(resource) {
+  if (!resource) return null
+  const d = await getJson('abuse-contact-finder', resource)
+  if (!d) return null
+  return { contacts: Array.isArray(d.abuse_contacts) ? d.abuse_contacts : [], rir: d.authoritative_rir || null }
+}
+
 // Full drawer details: ASN, holder, prefix, RPKI status, geo, sample BGP paths.
 export async function hopDetails(ip) {
   const ni = await getJson('network-info', ip)
   const asn = ni && ni.asns && ni.asns.length ? ni.asns[0] : null
   const prefix = (ni && ni.prefix) || null
-  const [ov, rpki, geo, lg, whois] = await Promise.all([
+  const [ov, rpki, geo, lg, whois, routing, abuse, bgpst] = await Promise.all([
     asn ? getJson('as-overview', `AS${asn}`) : null,
     asn && prefix ? getJson('rpki-validation', `AS${asn}`, `&prefix=${encodeURIComponent(prefix)}`) : null,
     getJson('maxmind-geo-lite', ip),
     prefix ? getJson('looking-glass', prefix) : null,
     getJson('whois', ip),
+    prefix ? routingStatus(prefix) : null,
+    abuseContact(ip),
+    prefix ? bgpState(prefix) : null,
   ])
 
   // distinct sample AS-paths from RIS route collectors
@@ -110,6 +238,9 @@ export async function hopDetails(ip) {
     netname,
     descr,
     paths,
+    routing,
+    abuse,
+    bgpState: bgpst,
   }
 }
 

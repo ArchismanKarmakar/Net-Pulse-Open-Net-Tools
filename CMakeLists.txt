@@ -1,4 +1,19 @@
 cmake_minimum_required(VERSION 3.16)
+
+# Must be set BEFORE project() to take effect — CMake reads this during
+# compiler/platform detection triggered by project(), not after. Same root
+# cause as tauri-app/src-tauri/build.rs's identical fix: core/src/stats.cpp
+# uses std::filesystem (ColdStore's on-disk persistence), which Apple's
+# libc++ marks explicitly UNAVAILABLE below macOS 10.15 (Catalina) — without
+# an explicit deployment target, CMake/Xcode can fall back to a much older
+# default that doesn't support it, turning every std::filesystem use into a
+# hard compile error rather than a warning. if(NOT DEFINED ...) so an
+# explicit -DCMAKE_OSX_DEPLOYMENT_TARGET=... from the command line (e.g. a
+# packager targeting something newer) is never silently overridden.
+if(APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15" CACHE STRING "Minimum macOS version")
+endif()
+
 project(netpulse_core LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

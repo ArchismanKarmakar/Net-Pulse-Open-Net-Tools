@@ -16,6 +16,7 @@
     ]
   },
   "bundle": {
-    "publisher": "Archisman Karmakar (Canary/Test Build — not for distribution)"
+    "publisher": "Archisman Karmakar (Canary/Test Build — not for distribution)",
+    "createUpdaterArtifacts": false
   }
 }

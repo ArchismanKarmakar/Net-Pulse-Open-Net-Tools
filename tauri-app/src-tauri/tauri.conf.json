@@ -58,6 +58,9 @@
       "nsis": {
         "installerHooks": "windows/hooks.nsh"
       }
+    },
+    "macOS": {
+      "minimumSystemVersion": "10.15"
     }
   },
   "plugins": {

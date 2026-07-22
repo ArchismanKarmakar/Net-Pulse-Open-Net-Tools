@@ -82,6 +82,25 @@ fn main() {
     let core_src = repo_root.join("core/src");
     let native_dir = manifest_dir.join("native");
 
+    // std::filesystem (stats.cpp — ColdStore's on-disk persistence) is
+    // marked explicitly UNAVAILABLE by Apple's libc++ when the deployment
+    // target is below macOS 10.15 (Catalina — the first version with actual
+    // OS-level support for it); Clang then treats every use as a hard
+    // compile error, not a warning. Nothing in this project was explicitly
+    // setting a deployment target, so cc-rs (which cxx_build uses
+    // internally) fell back to a very old default (10.13) that can't
+    // support it. Setting this BEFORE constructing the build below is what
+    // actually matters — cc-rs reads MACOSX_DEPLOYMENT_TARGET from the
+    // environment to decide which -mmacosx-version-min flag to emit, so
+    // this is the single source of truth rather than an extra flag that
+    // could conflict with whatever cc-rs would otherwise add on its own.
+    if cfg!(target_os = "macos") && std::env::var_os("MACOSX_DEPLOYMENT_TARGET").is_none() {
+        // SAFETY: this runs single-threaded, at the very start of the build
+        // script, before any other code (including cc-rs's own build steps)
+        // could be reading the environment concurrently.
+        unsafe { std::env::set_var("MACOSX_DEPLOYMENT_TARGET", "10.15") };
+    }
+
     let mut build = cxx_build::bridge("src/ffi.rs");
     build
         .file(native_dir.join("netpulse_ffi.cpp"))

@@ -1120,7 +1120,17 @@ export default function App() {
   const { yDomain, clippedSpikes } = useMemo(() => {
     const vals = []
     for (const row of chartData) for (const k in row) if (k !== 'ts' && row[k] != null) vals.push(row[k])
-    if (!vals.length || !clipOutliers) return { yDomain: [0, 'auto'], clippedSpikes: 0 }
+    // Overlay mode mixes several hops' values together, and different hops
+    // have legitimately different baseline latencies (a near hop and the
+    // destination aren't "outliers" of each other, they're just different
+    // points on the path) — a single combined median across all of them
+    // isn't a meaningful "typical value" the way it is for one hop's own
+    // history. Skip clipping entirely here rather than compute a threshold
+    // that would silently push an entire hop's normal data off the top of
+    // the chart (confirmed: this is exactly what was happening — a
+    // low near-hop-weighted median was clipping the destination hop's
+    // completely ordinary ~30ms readings out of the visible range).
+    if (!vals.length || !clipOutliers || overlay) return { yDomain: [0, 'auto'], clippedSpikes: 0 }
     vals.sort((a, b) => a - b)
     const max = vals[vals.length - 1]
     // Median-based ratio test instead of a percentile INDEX (e.g. 95th
@@ -1139,7 +1149,7 @@ export default function App() {
     if (max <= baseline * 6 || max < 100) return { yDomain: [0, 'auto'], clippedSpikes: 0 }
     const top = Math.max(Math.ceil(baseline * 3), 10)
     return { yDomain: [0, top], clippedSpikes: vals.filter((v) => v > top).length }
-  }, [chartData, clipOutliers])
+  }, [chartData, clipOutliers, overlay])
 
 
   // Captures the currently-shown latency chart as PNG bytes (a Promise

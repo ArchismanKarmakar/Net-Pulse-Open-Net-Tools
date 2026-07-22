@@ -92,6 +92,18 @@ export default function App() {
   // nothing to do with the drag and is what made it feel laggy.
   const sidebarElRef = useRef(null)
   const tableWrapElRef = useRef(null)
+  // The ONE hidden <input type="file"> for loading a .npulse list (rendered
+  // once, near the end of this component — see the JSX below) — shared by
+  // the File menu, the dashboard toolbar, and the compact sidebar, all of
+  // which just call importInputRef.current?.click(). Previously each of
+  // those three triggered it a different way (two separate native
+  // label+hidden-input pairs, plus the File menu doing its own
+  // document.getElementById('np-import-input')?.click()) — the dashboard
+  // toolbar's input never actually had that id, so the File menu's lookup
+  // silently found nothing and did nothing. One ref, one input, one click
+  // path removes that whole class of "which surface has the id" bug rather
+  // than just patching the missing one.
+  const importInputRef = useRef(null)
   // Targets the <table> element itself, not its scrollable .tablewrap
   // wrapper — html-to-image renders the target node's own natural size
   // (via a cloned foreignObject), so capturing the table directly gets
@@ -1440,7 +1452,7 @@ export default function App() {
             { sep: true },
             { label: 'Save target list (.npulse)…', onClick: exportTargetList, disabled: !targets.length },
             { label: 'Export targets as JSON…', onClick: exportTargetsJson, disabled: !targets.length },
-            { label: 'Load target list (.npulse)…', onClick: () => document.getElementById('np-import-input')?.click() },
+            { label: 'Load target list (.npulse)…', onClick: () => importInputRef.current?.click() },
             { sep: true },
             { label: 'Export hops CSV (selected)…', onClick: () => sel && exportHopsCsv && exportHopsCsv(), disabled: !sel },
             { label: 'Export FULL history CSV (selected target)…', onClick: exportTargetFullCsv, disabled: !sel, hint: 'Every recorded sample, all hops, all history' },
@@ -1645,9 +1657,16 @@ export default function App() {
           pauseAll={pauseAll}
           exportTargetList={exportTargetList}
           exportTargetsJson={exportTargetsJson}
-          importTargetList={importTargetList}
+          onLoadListClick={() => importInputRef.current?.click()}
           exportAllTargetsFullXlsx={exportAllTargetsFullXlsx}
           xlsxExportProgress={xlsxExportProgress}
+        />
+        <input
+          ref={importInputRef}
+          type="file"
+          accept=".npulse"
+          style={{ display: 'none' }}
+          onChange={(e) => { if (e.target.files[0]) importTargetList(e.target.files[0]); e.target.value = '' }}
         />
 
         <main>

@@ -30,7 +30,7 @@ export default function TargetPanel({
   forceRecheckOne, pauseOne, removeTarget, openTarget,
   targetState, destLamp, pathLamp, destHopOf, familyLabel, fmt, STATE_LABEL,
   view, alertMs, sel,
-  allPaused, pauseAll, exportTargetList, exportTargetsJson, importTargetList, exportAllTargetsFullXlsx, xlsxExportProgress,
+  allPaused, pauseAll, exportTargetList, exportTargetsJson, onLoadListClick, exportAllTargetsFullXlsx, xlsxExportProgress,
 }) {
   return (
     <div
@@ -117,10 +117,9 @@ export default function TargetPanel({
                 <button className="dash-action-pill" onClick={exportAllTargetsFullXlsx} disabled={!!xlsxExportProgress} title="Every target — overview, current hop summary, and full recorded history — one Excel workbook">
                   <IconTableChart /> {xlsxExportProgress ? `Exporting ${xlsxExportProgress.done}/${xlsxExportProgress.total}…` : 'Export all to Excel'}
                 </button>
-                <label className="dash-action-pill" title="Load a .npulse target list (auto-starts tracing, skips exact duplicates)">
+                <button className="dash-action-pill" onClick={onLoadListClick} title="Load a .npulse target list (auto-starts tracing, skips exact duplicates)">
                   <IconUpload /> Load list (.npulse)
-                  <input type="file" accept=".npulse" style={{ display: 'none' }} onChange={(e) => { if (e.target.files[0]) importTargetList(e.target.files[0]); e.target.value = '' }} />
-                </label>
+                </button>
               </div>
             )}
           </div>
@@ -128,7 +127,7 @@ export default function TargetPanel({
       )}
 
       {targets.length === 0 ? (
-        !compact && <EmptyState onQuickAdd={onQuickAdd} onOpenTool={onOpenTool} />
+        !compact && <EmptyState onQuickAdd={onQuickAdd} onOpenTool={onOpenTool} onLoadListClick={onLoadListClick} />
       ) : (targetSearch.trim() || statusFilter) && rows.length === 0 ? (
         <div className="empty">No targets match the current filter{targetSearch.trim() ? ` "${targetSearch}"` : ''}.{statusFilter && <button className="link-btn" onClick={() => toggleStatusFilter(statusFilter.dim, statusFilter.status)}>Clear status filter</button>}</div>
       ) : (
@@ -170,10 +169,9 @@ export default function TargetPanel({
           <button onClick={exportAllTargetsFullXlsx} disabled={!!xlsxExportProgress} title="Every target — overview, current hop summary, and full recorded history — one Excel workbook">
             <IconTableChart /> {xlsxExportProgress ? `Exporting ${xlsxExportProgress.done}/${xlsxExportProgress.total}…` : 'Export all to Excel'}
           </button>
-          <label className="import-btn" title="Load a .npulse target list (auto-starts tracing, skips exact duplicates)">
+          <button className="import-btn" onClick={onLoadListClick} title="Load a .npulse target list (auto-starts tracing, skips exact duplicates)">
             <IconUpload /> Load list (.npulse)
-            <input id="np-import-input" type="file" accept=".npulse" style={{ display: 'none' }} onChange={(e) => { if (e.target.files[0]) importTargetList(e.target.files[0]); e.target.value = '' }} />
-          </label>
+          </button>
         </div>
       )}
       {compact && (

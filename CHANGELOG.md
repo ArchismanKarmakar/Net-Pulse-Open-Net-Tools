@@ -1,11 +1,368 @@
 # Changelog
 
+## 1.0.8
+
+### Single source of truth for the version number
+
+`/VERSION` at the repo root is now the one canonical version string, with
+`scripts/sync-version.mjs` propagating it into the three files that each
+need their own literal copy (`tauri-app/src-tauri/tauri.conf.json`,
+`tauri-app/src-tauri/Cargo.toml`, `tauri-app/package.json` — none of Cargo,
+npm, or Tauri's bundler support reading their `version` field from an
+external file, so each still needs it written in directly). `node
+scripts/sync-version.mjs` rewrites all three; `--check` verifies they
+already match without changing anything, which is what CI now calls instead
+of duplicating the same three-way comparison inline. `tauri-version-
+release.yml` was updated to watch `/VERSION` (not `tauri.conf.json`) and to
+call the script's own `--check` rather than re-implementing the same
+consistency logic a second time — two copies of that logic drifting apart
+from each other was exactly the kind of thing this system exists to
+prevent.
+
+### Path/MTR and Ping: TCP and UDP measurement accuracy
+
+A long series of root-caused, individually-verified fixes to the actual
+correctness of TCP/UDP/HTTP measurement, most surfaced only once the app
+was exercised on real hardware and real networks rather than a sandboxed
+loopback:
+
+- **TCP/HTTP RTT quantization (100ms floor).** `run_tcp`/`run_http` sent a
+  probe, then unconditionally blocked up to 100ms on the ICMP inbox before
+  ever checking `poll_completions()` — but TCP/HTTP replies never arrive
+  through that inbox at all, so every pass measured the sleep, not the
+  network. Both a LAN router and 8.8.8.8 read a suspiciously flat ~100ms.
+  Fixed with an adaptive wait (2ms while a probe is in flight, 100ms when
+  idle). The identical bug independently existed a second time in the
+  standalone Ping tool's own engine (`ping_run.cpp`) and was missed on the
+  first pass — found later from a live report showing 8.8.8.8 and 1.1.1.1,
+  genuinely different real RTTs, both reading an identical ~50ms; fixed the
+  same way there.
+- **TCP/HTTP hop-correlation bug (unchecked `bind()`).** On Windows, `bind()`
+  to an ephemeral port in the Hyper-V/WSL2-reserved range (49152+) can fail
+  (`WSAEACCES`) — the original code never checked this, so the probe left
+  from a random port the router's Time-Exceeded didn't match, and
+  intermediate hops silently never resolved even though the destination
+  still worked. Fixed by confirming the actual bound port via
+  `getsockname()` *after* `connect()` and correlating on that instead of
+  arithmetic.
+- **HTTP negative RTT (`-0.1ms`).** `poll_completions()` used the caller's
+  `now` (captured before the probe was even sent) instead of a fresh
+  timestamp, so `now - sent_at` could go negative. Fixed to compute `now`
+  fresh, matching how the TCP path already did it.
+- **ICMP MTR hop starvation after sleep/wake.** The already-answered-hop
+  keepalive phase iterated hops in a fixed, non-rotating order under a
+  shared global pacer; hop 1 could consume every available token every
+  pass, starving hops 9+ entirely under contention. Fixed with a rotating
+  cursor for that phase, mirroring the one the unanswered-hop phase already
+  had.
+- **Monotonic clock for RTT.** TCP/HTTP RTT and timeout comparisons used
+  wall-clock (`system_clock`), vulnerable to NTP corrections and sleep/wake
+  jumps corrupting every in-flight probe's measured time. Split into a
+  wall-clock timestamp (kept for the reported sample time) and a separate
+  monotonic one (`steady_clock`) used only for RTT/timeout math.
+- **Windows raw-socket ICMP delivery.** Root cause of TCP/UDP hop discovery
+  never working on Windows at all: a raw `SOCK_RAW`/`IPPROTO_ICMP` socket
+  there does not receive ICMP errors generated in response to a *different*
+  socket's traffic (the router's Time-Exceeded for a TCP/UDP probe never
+  reaches it) unless the socket is both bound to a real local address *and*
+  put into `SIO_RCVALL` receive-all mode. Implemented, logged either
+  outcome explicitly (`SIO_RCVALL enabled`/`FAILED`) so this is diagnosable
+  rather than a silent dead end, and — after an earlier version incorrectly
+  claimed this doesn't work for IPv6 with no actual source for that
+  restriction — extended to IPv6 too, since the ioctl itself doesn't encode
+  an address family and the call is already fully best-effort.
+- **UDP-mode port-allocation collision (the most severe of these).**
+  `allocate_flow_port_block()` handed out one of only 64 fixed port blocks
+  via a blind, process-wide, never-resetting round-robin counter — every
+  MTR target and every Ping run consumes one call, so 64 *cumulative*
+  allocations (not 64 simultaneous ones, which the original code's own
+  comment incorrectly claimed) is trivially reached over a real working
+  session. Once the counter wrapped, a brand-new session could be handed
+  the exact same block as a still-running one, silently overwriting its
+  ICMP-reply-routing registry entries — explaining a live report of UDP
+  ping working for one target and then completely failing for others
+  moments later, unrelated to the actual destination. Fixed by checking
+  registry occupancy before committing to a candidate block, falling back
+  to the old round-robin choice only if every one of the 64 is genuinely
+  occupied. Verified against the *actual* pre-fix code, not just reasoned
+  about: an executable test simulating realistic sustained use (a
+  long-lived session plus 80 short-lived ones cycling through) reproduces
+  a real collision at exactly call #63 against the old allocator and shows
+  zero collisions against the fixed one.
+- **UDP base-port collisions with real services.** Choosing an unusually
+  low UDP base port (e.g. 50) means a mid-range hop offset can land on a
+  well-known service port (50+3 = 53, DNS) that has something genuinely
+  listening — the destination silently discards the malformed non-DNS
+  payload instead of replying with Port-Unreachable, which looks like a
+  bug but is a direct, predictable consequence of not using an
+  intentionally-obscure base port the way classic `traceroute` does.
+  Confirmed by reproducing the exact scenario against a real listener on
+  that port.
+- **Stale, permanent "N automatic reconnect attempts" banner.** The counter
+  behind this banner (`silence_rebuild_count_`) only ever incremented and
+  was never reset anywhere, despite existing specifically to answer "is
+  this session actively retrying right now" — a session that briefly lost
+  ICMP (e.g. a VPN toggle) and then fully recovered kept the banner pinned
+  at its outage-time value forever, contradicting hop data that was
+  simultaneously showing a fully healthy path. Fixed by resetting it
+  alongside the existing, already-correct local counters it should have
+  mirrored from the start. Verified live: genuinely blocked ICMP via
+  `iptables`, watched the counter climb, removed the block, watched it
+  reset to zero within seconds of a real reply.
+
+### Ping tool: TCP and UDP added, NMAP-style reply detail, validation
+
+- **TCP and UDP ping**, alongside the existing ICMP mode — new
+  `PingProtocol::Tcp`/`Udp` in the shared `PingRun` engine, wired through
+  the full stack (native FFI, Rust command, JS bridge, UI). TCP ping needs
+  no elevation or capture driver on any platform (the SYN-ACK/RST answer
+  arrives on the TCP socket itself, not as an ICMP message); UDP ping's
+  reply is an ICMP Port-Unreachable, which does need elevated privileges to
+  receive.
+- **NMAP-style reply detail.** A TCP reply used to render with the exact
+  same generic "Reply from…" text ICMP uses, even though the underlying
+  evidence is completely different — the C++ layer already distinguished a
+  completed handshake from a refused connection internally and was simply
+  discarding that distinction before it reached the UI. Now shown plainly:
+  "Connected (port open)" vs. "Port closed, but host responded (RST) — host
+  is reachable".
+- **Local/remote port shown in every reply and timeout line**, both TCP and
+  UDP, including on a timeout (previously a `Request timed out` line
+  carried zero identifying detail — exactly the missing piece needed to
+  diagnose the base-port-collision issue above from a log alone).
+- **Full input validation before starting a probe.** Count/Size/Timeout/
+  Interval/TTL/remote-port only ever had soft HTML5 `min`/`max` hints,
+  which do not actually stop the browser from using an out-of-range typed
+  value — nothing validated them before launching. Now checked against
+  explicit limits before every run, blocking with a native warning dialog
+  (and the OS alert sound) listing every problem at once rather than
+  starting with silently-clamped or nonsensical values.
+
+### Diagnostic logging
+
+A new, opt-in file-based logging system for exactly the class of bug this
+whole line of fixes came from — the state that's easiest to misdiagnose
+from the UI alone.
+
+- **Toggle lives in Tools → Diagnostic logging**, not an environment
+  variable: `NETPULSE_DEBUG=1` cannot be set for a "Run as Administrator"
+  relaunch at all (a fresh elevated process inherits none of the launching
+  terminal's environment), which is exactly the scenario most in need of
+  diagnosing. The file-based toggle works no matter how the app was
+  started.
+- **Persistent file handle, not fopen/fclose per line.** The very first
+  version of this reopened the log file on every single call — including
+  from the shared RX dispatcher's hot path, hit by every incoming packet
+  across every active session. Over a long session with several targets,
+  that's tens of thousands of raw file-open syscalls, and on Windows
+  specifically each one is a real-time-antivirus-scan hook opportunity.
+  Fixed with one handle kept open and flushed (not closed) after each
+  write, plus a 20MB size cap so a long session degrades to "logging
+  stops" rather than filling the disk.
+- **UTF-8 BOM + timestamps.** A real log file showed messages like `SIO_
+  RCVALL enabled ΓÇö raw socket...` — the classic signature of a correct
+  UTF-8 em-dash being decoded as CP1252 by a viewer with no other signal
+  about the file's encoding. Fixed by writing a UTF-8 BOM as the first
+  bytes of a newly-created log file (written exactly once, verified not to
+  duplicate across a disable/re-enable cycle), and every line now carries a
+  `[HH:MM:SS.mmm]` timestamp automatically.
+- **NMAP-style "filtered" logging on every timeout**, across TCP/UDP/HTTP
+  hop discovery, with the specific hop, target, and local/remote port —
+  the same detail level added to the Ping tool's own timeout lines.
+
+### Protocol prerequisite detection and prompts
+
+- **Real capability detection**, not guesses: `process_is_elevated()`
+  (Windows token check / `geteuid()`) and `capture_driver_present()` (tries
+  to actually load `wpcap.dll`, including Npcap's non-default search path
+  — proving the driver is genuinely usable now, not just that a registry
+  key an uninstall could have left behind still exists).
+- Selecting UDP or TCP now checks prerequisites **immediately**, before a
+  host is even typed, rather than only at "Add" time; "Add" still
+  re-checks authoritatively as a safety net, since capabilities can change
+  between selection and click (elevating in another window, installing
+  Npcap).
+- **"Restart as Administrator"** actually restarts the app elevated
+  (PowerShell `Start-Process -Verb RunAs`, chosen specifically to avoid a
+  new `windows-sys` dependency); declining the UAC prompt leaves the
+  running instance untouched rather than treating it as a crash.
+- Every prerequisite/IP-translation/update dialog is genuinely blocking —
+  an earlier version could be dismissed by an accidental outside click,
+  which for two of the IP-translation dialogs meant the click silently
+  triggered the same *fallback-and-proceed* path a deliberate button choice
+  would have, rather than actually canceling. Reworked to three explicit
+  outcomes (Cancel / a real fallback choice / the primary action) with an
+  executable test proving all four ways of resolving the dialog (including
+  the dialog's own × close button) do what they're supposed to.
+
+### In-app modal system
+
+The generic confirmation dialog used throughout the app went through
+several real, found-and-fixed bugs of its own while being extended:
+
+- **The modal was never actually rendered at all.** `showModal()`/
+  `closeModal()` worked by resolving a Promise only when a rendered
+  button's `onClose` ran — but the `<Modal>` component itself was defined
+  and never once placed in the render tree. Every one of the ~30 call
+  sites across the app hung forever, silently, with no error — this is
+  what a live report of "TCP/UDP alerts never appear, and clicking Add
+  does nothing" turned out to be, unrelated to protocol logic entirely.
+- **Missing CSS.** Even after fixing the render, none of `.modal-overlay`/
+  `.modal-box`/etc. had a single CSS rule anywhere — an unstyled block in
+  normal document flow, effectively invisible. Both had to be fixed
+  together; fixing only one would have looked identical to the original
+  bug.
+- **Constant remount ("flashing").** `Modal` was declared *inside* the
+  `App()` component body — a new function value on every single App
+  re-render, which happens continuously while a session streams live data.
+  React treats a changed component identity as "unmount and remount",
+  invisible before any CSS entrance animation existed, but very visible
+  once one did: every remount replayed the open animation. Fixed by
+  hoisting it to module scope (it never closed over anything from `App`'s
+  own scope, so this was always safe). Hoisting it also surfaced a second,
+  pre-existing bug: a stale, never-actually-used duplicate `Modal.jsx` file
+  had been silently shadowed by the in-component one this whole time —
+  deleted rather than left as a second, drifting copy.
+- **No close animation.** The close transition reused the *same*
+  `@keyframes` name as the open one with `animation-direction: reverse` —
+  once an animation with a given name has already finished on an element,
+  changing only its direction/duration via a class swap does not reliably
+  restart it in Chromium/WebView2; the element just sat at its settled end
+  state until JS removed it. Fixed with genuinely distinct keyframe names
+  for open vs. close, which forces a real restart. The delayed-unmount
+  timing this depends on (keep the element mounted long enough for the CSS
+  transition to actually play) had its own subtle bug: resolving the
+  dialog's Promise *before* that delay let a caller show a follow-up dialog
+  mid-animation, which the first dialog's own pending cleanup would then
+  incorrectly null out from under it — proven with an executable
+  reproduction before and after the fix, not just reasoned about.
+- **× close button**, always available even on a blocking dialog (a
+  deliberate click is not the accidental-outside-click case blocking
+  exists to guard against), and the same animation/blocking treatment
+  extended to the separate About dialog.
+- **Native OS alert sound**, decoupled from showing a native OS dialog box:
+  `play_alert_sound(kind)` plays only the platform sound (Windows
+  `MessageBeep`, tiered info/warning/error; macOS `AudioServicesPlay
+  SystemSound`; an honest no-op on Linux, which has no single standard
+  API across desktop environments) with no dialog shown at all — added
+  specifically so the app's own styled, resizable modal could get the same
+  attention-getting sound a native dialog gets for free, without giving up
+  control over the dialog's own appearance (a native OS dialog's text size
+  cannot be influenced by the app at all). Along the way, found and removed
+  an entirely separate, ad-hoc synthesized WebAudio beep `showModal()` had
+  always played on every call — meaning some dialogs were briefly playing
+  two unrelated sounds simultaneously once the real OS sound was added
+  alongside it.
+- **Semantic button colors** — teal/confirm, amber/warning, burnt-orange/
+  danger, plain/neutral — replacing a single color used for every action
+  regardless of how consequential it was. Two rounds of real fixes here:
+  the first color choice used bright, high-saturation fills that read as
+  glare next to white text even though they numerically passed WCAG
+  contrast; darkened and unified across both themes. Separately, a CSS
+  specificity bug (`.modal-actions button`, an element+class selector,
+  unconditionally beating a single-class `.btn-warning`/`.btn-danger`
+  regardless of source order) meant the color frequently didn't render at
+  all inside any modal — the exact same specificity trap had already been
+  found and fixed once for the primary/confirm button, but not extended to
+  its two siblings until a live screenshot showed neither had any color.
+
+### Path/MTR: Edit Config, NMAP-style port state, port visibility
+
+- **Remote port is now editable** in Edit Config (previously read-only
+  display text). Session::run_tcp()/run_udp()/run_http() were found to
+  never consult the rebuild mechanism a settings change is supposed to
+  trigger at all — only the ICMP-mode loop ever did — so a live in-place
+  port change would have silently done nothing useful while leaving stale,
+  port-specific correlation state behind. Rather than hand-write a new
+  in-place rebuild for three separate loops under time pressure, a port or
+  protocol change is routed through the already-correct, already-tested
+  remove-and-re-add path instead, with an explicit warning (hop history for
+  that target is genuinely lost, not resumed) and confirmation before it
+  happens.
+- **NMAP-style open/filtered/closed** shown per hop for TCP mode, using the
+  same SYN-ACK/RST distinction added to the Ping tool, threaded through to
+  the destination hop specifically (only the real endpoint can ever answer
+  with a genuine TCP-layer reply — an intermediate hop's only possible
+  evidence is an ICMP Time-Exceeded, which has no open/closed concept at
+  all).
+- **Local port surfaced as a per-hop tooltip**, not a single CONFIG-bar
+  summary value — a summary showing one hop's value implied a single,
+  session-wide answer that doesn't actually exist for TCP (a fresh socket
+  per probe, by design) and could go stale for UDP after a silence-
+  rebuild reassigns the session's shared socket. The per-hop tooltip reads
+  directly from that specific hop's own latest recorded value and can't be
+  misleading the same way.
+
+### Resource lifecycle and long-session stability
+
+- **`ColdStore`'s background persistence queue had no size cap at all.**
+  One thread services every target's cold-tier flush jobs; if disk I/O
+  ever fell behind generation rate (a slow disk, or real-time antivirus
+  scanning intercepting every write), jobs piled up in memory indefinitely.
+  Capped with oldest-drop-and-log rather than blocking, since blocking
+  would stall live probing, which is worse than losing some historical
+  detail.
+- **Removing a target never cleaned up its `ColdStore` state.** Neither the
+  in-memory compute cache nor the on-disk history files for a removed
+  target were ever released — invisible in a short test session, a real
+  problem for a long-running deployment where targets get added and
+  removed over days or weeks, since both grow with every target *ever*
+  added rather than every target currently active. Fixed with a proper
+  `forget_target()`, wired into removal and verified directly (pushed
+  data, confirmed it existed in both cache and on disk, removed it,
+  confirmed both were gone).
+
+### Deployment and cross-platform build parity
+
+A full read-through of the GitHub Actions release pipeline, none of which
+had been directly audited before — several real, concrete gaps found:
+
+- **macOS builds were architecture-incomplete.** The release workflow
+  specified no target at all for the macOS job; `macos-latest` runners are
+  Apple Silicon, so with nothing else specified the build produced an
+  ARM64-only binary — not "runs slower on Intel via Rosetta", genuinely
+  unable to run there at all, since Tauri does not produce a universal
+  binary unless explicitly told to. Fixed by installing both Rust targets
+  and building with `--target universal-apple-darwin`.
+- **The documented "rebuild an existing tag" workflow_dispatch input was
+  silently broken.** Neither checkout step in the release workflow
+  specified a `ref`, so triggering a rebuild for an old tag would have
+  silently built whatever `main` currently looks like instead of the
+  actual historical tagged commit. Fixed on both the build and publish
+  jobs.
+- **No `.icns` file existed anywhere** for the macOS bundle icon — absent
+  from disk and from `tauri.conf.json`'s icon list. Generated one from the
+  largest available source PNG.
+- **A referenced-but-never-created workflow.** `Cargo.toml`'s own doc
+  comment on the `canary` feature (a devtools-enabled debug build) named
+  `tauri-canary-build.yml` as how to produce one — that file never existed,
+  despite the feature flag and its dedicated Tauri config
+  (`tauri.canary.conf.json`) being real, correct, and already wired up.
+  Created it: manual-dispatch only, uploads artifacts rather than
+  publishing a Release (a debug/devtools build should never be mistaken
+  for a real release), same universal-macOS-binary treatment as the real
+  release workflow.
+- **Verification suite (`scripts/verify.sh`) expanded** to cover several
+  classes of bug found the hard way during this work and unlikely to be
+  caught by ordinary code review: every `core/src/*.cpp` and
+  `netpulse_ffi.cpp` compiled standalone (catches a missing `#include`
+  masked by a different file in the same static-library link happening to
+  provide it — this exact bug shipped once), the same files cross-compiled
+  for Windows via MinGW-w64 (catches Win32-only API/header mistakes that
+  native Linux compilation can't see at all — including a Windows-only
+  `winsock.h`/`winsock2.h` header-ordering conflict this caught directly),
+  a three-way consistency check across every Tauri command's registration
+  in `lib.rs`/`build.rs`/`capabilities/default.json` (a command missing
+  from any one of the three either fails the whole build or is silently
+  uninvokable at runtime with no compile error at all — both happened
+  during this work before this check existed), every workflow YAML file
+  parsed for validity, and version consistency across `VERSION`/
+  `tauri.conf.json`/`Cargo.toml`/`package.json`.
+
 ## 0.9.5 revised
 
-Version files (`tauri.conf.json` / `Cargo.toml` / `package.json`) are still at
-`0.9.5` — this section isn't tied to a version bump yet. When ready to ship
-it, bump all three (the `tauri-version-release.yml` workflow checks they
-match) and rename this heading.
+The work below shipped as part of the 1.0.8 release above rather than
+getting its own dedicated version bump.
 
 ### Ping tool: rebuilt on the native engine, not an OS subprocess
 

@@ -23,10 +23,25 @@
 #include <vector>
 
 #if defined(_WIN32)
-#  ifndef NOMINMAX
-#    define NOMINMAX
-#  endif
-#  include <windows.h>
+// BUG FIX: this used to #include <windows.h> directly here, with only
+// NOMINMAX defined — no WIN32_LEAN_AND_MEAN, and critically no <winsock2.h>
+// first. That is latently unsafe in EXACTLY the well-documented way: if
+// <windows.h> gets pulled in before <winsock2.h> anywhere in a translation
+// unit, it drags in the legacy, incompatible <winsock.h> itself, and a LATER
+// <winsock2.h> then collides with it in hundreds of "struct redefinition" /
+// "redefinition; different linkage" errors. This sat unnoticed for a long
+// time purely because every existing caller happened to already include
+// platform.hpp (which gets winsock2.h-then-windows.h ordering right) BEFORE
+// reaching this file — until netpulse_ffi.cpp needed something from
+// platform.hpp and included manager.hpp first, which pulled in THIS file's
+// own raw windows.h first instead, reproducing the conflict on a real
+// MSVC/Windows-SDK build. Rather than duplicate (and re-risk getting wrong)
+// the same ordering logic a second time, just reuse the one place that
+// already gets it right — this also happens to make platform.hpp\'s own
+// process_is_elevated()/capture_driver_present() available here for free,
+// which is otherwise exactly the kind of Win32 surface this file\'s own
+// resource-limit code lives beside.
+#  include "netpulse/platform.hpp"
 #elif defined(__linux__)
 #  include <sys/resource.h>
 #endif
@@ -494,6 +509,9 @@ public:
         const Settings& cfg = *s;
         const char* fam = cfg.family == FamilyPref::V4 ? "v4"
                           : cfg.family == FamilyPref::V6 ? "v6" : "auto";
+        const char* proto = cfg.protocol == Protocol::Tcp ? "tcp"
+                            : cfg.protocol == Protocol::Udp ? "udp"
+                            : cfg.protocol == Protocol::Http ? "http" : "icmp";
         std::ostringstream o;
         o << "{\"probe\":" << cfg.probe_interval
           << ",\"trace\":" << cfg.trace_interval
@@ -503,6 +521,8 @@ public:
           << ",\"raw\":" << (cfg.privileged ? "true" : "false")
           << ",\"family\":\"" << fam << "\""
           << ",\"src\":\"" << esc(cfg.source_addr) << "\""
+          << ",\"protocol\":\"" << proto << "\""
+          << ",\"destPort\":" << cfg.dest_port
           << ",\"pausedHops\":[";
         { bool first = true; for (uint8_t ph : cfg.paused_hops) { if (!first) o << ","; o << int(ph); first = false; } }
         o << "]}";
@@ -544,7 +564,23 @@ public:
     void remove(uint64_t id) {
         std::lock_guard<std::mutex> lk(listMtx_);
         for (auto it = targets_.begin(); it != targets_.end(); ++it)
-            if ((*it)->id == id) { targets_.erase(it); return; }
+            if ((*it)->id == id) {
+                targets_.erase(it);
+                // BUG FIX: this used to just erase the target from targets_
+                // and stop there. ColdStore's own per-hop compute cache and
+                // on-disk history files were never cleaned up — nothing on
+                // this path ever called reset() or an equivalent for a
+                // removed target, so every (target_id, hop) pair a target
+                // ever touched sat in RAM forever, and its files sat on disk
+                // forever, keyed on total targets EVER added across the
+                // process's whole lifetime rather than targets currently
+                // active. Harmless for a short session; a real problem for
+                // a long-running deployment where targets get added and
+                // removed over days or weeks — see forget_target()'s own
+                // doc comment (stats.hpp) for the full reasoning.
+                ColdStore::instance().forget_target(id);
+                return;
+            }
     }
 
     std::string state_json(std::optional<double> focus) {
@@ -566,10 +602,18 @@ public:
             o << "\"loopWarning\":\"" << esc(t.latest.loop_warning ? *t.latest.loop_warning : "") << "\",";
             o << "\"loopHop\":" << (t.latest.loop_hop ? std::to_string(int(*t.latest.loop_hop)) : "null") << ",";
             o << "\"loopDupAt\":" << (t.latest.loop_dup_at ? std::to_string(int(*t.latest.loop_dup_at)) : "null") << ",";
+            o << "\"silenceRebuildCount\":" << t.latest.silence_rebuild_count << ",";
+            o << "\"lastAnyReplyAt\":" << numOrNull(t.latest.last_any_reply_at) << ",";
+            // See Snapshot::protocol_hint's doc comment (session.hpp) — same
+            // non-fatal, table-stays-visible treatment as loopWarning above.
+            o << "\"protocolHint\":\"" << esc(t.latest.protocol_hint ? *t.latest.protocol_hint : "") << "\",";
             if (t.session) {
                 Settings cfg = t.session->settings_snapshot();
                 const char* fam = cfg.family == FamilyPref::V4 ? "v4"
                                   : cfg.family == FamilyPref::V6 ? "v6" : "auto";
+                const char* proto = cfg.protocol == Protocol::Tcp ? "tcp"
+                                    : cfg.protocol == Protocol::Udp ? "udp"
+                                    : cfg.protocol == Protocol::Http ? "http" : "icmp";
                 o << "\"config\":{\"probe\":" << cfg.probe_interval
                   << ",\"timeout\":" << cfg.timeout
                   << ",\"payload\":" << cfg.payload_size
@@ -577,6 +621,8 @@ public:
                   << ",\"raw\":" << (cfg.privileged ? "true" : "false")
                   << ",\"family\":\"" << fam << "\""
                   << ",\"src\":\"" << esc(cfg.source_addr) << "\""
+                  << ",\"protocol\":\"" << proto << "\""
+                  << ",\"destPort\":" << cfg.dest_port
                   << ",\"pausedHops\":[";
                 { bool first = true; for (uint8_t ph : cfg.paused_hops) { if (!first) o << ","; o << int(ph); first = false; } }
                 o << "]},";
@@ -594,13 +640,18 @@ public:
                   << ",\"stale_address\":\"" << esc(hop.stale_address ? *hop.stale_address : "") << "\""
                   << ",\"stale_hostname\":\"" << esc(hop.stale_hostname ? *hop.stale_hostname : "") << "\""
                   << ",\"stale_since\":" << numOrNull(hop.stale_since)
+                  << ",\"stale_seen_elsewhere_at\":" << numOrNull(hop.stale_seen_elsewhere_at)
                   << ",\"is_dest\":" << (hop.is_dest ? "true" : "false")
                   << ",\"loss\":" << s.loss << ",\"cur\":" << numOrNull(s.cur)
                   << ",\"avg\":" << numOrNull(s.avg) << ",\"min\":" << numOrNull(s.min)
                   << ",\"max\":" << numOrNull(s.max) << ",\"med\":" << numOrNull(s.med)
                   << ",\"std\":" << s.std
                   << ",\"jitter\":" << s.jitter
-                  << ",\"sent\":" << s.sent << ",\"recv\":" << s.recv;
+                  << ",\"sent\":" << s.sent << ",\"recv\":" << s.recv
+                  << ",\"local_port\":";
+                if (hop.local_port) o << hop.local_port; else o << "null";
+                o << ",\"tcp_port_open\":";
+                if (hop.tcp_port_open) o << (*hop.tcp_port_open ? "true" : "false"); else o << "null";
                 o << ",\"mpls\":[";
                 for (size_t li = 0; li < hop.mpls_labels.size(); ++li) {
                     uint32_t v = hop.mpls_labels[li];

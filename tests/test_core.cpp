@@ -200,6 +200,43 @@ int main() {
         CHECK(compute_max_hop(std::nullopt, uint8_t(29), 25, 30) == 30);
     }
 
+    std::printf("[udp_give_up_threshold]\n");
+    {
+        // Default-ish config (probe=1s, max_hops=30): 3 sweeps = 90s, well
+        // above the 30s floor, so the sweep math wins.
+        CHECK(udp_give_up_threshold(1.0, 30) == 90.0);
+        // Fast probing / short hop range: 3 sweeps would be tiny (e.g.
+        // 0.5s * 5 * 3 = 7.5s) — the floor protects against declaring
+        // "likely blocked" absurdly early.
+        CHECK(udp_give_up_threshold(0.5, 5) == kUdpGiveUpMinSecs);
+        // A long, slow path (probe=2s, max_hops=64) legitimately needs
+        // longer than the floor — 2*64*3 = 384s.
+        CHECK(udp_give_up_threshold(2.0, 64) == 384.0);
+        // Exactly at the floor boundary: 30s*max_hops... pick inputs that
+        // land exactly on kUdpGiveUpMinSecs to confirm the max() doesn't
+        // round or drop below it.
+        CHECK(udp_give_up_threshold(1.0, 10) == kUdpGiveUpMinSecs); // 1*10*3=30 == floor
+    }
+
+    std::printf("[silence_backoff_threshold]\n");
+    {
+        // No prior silence-triggered rebuilds: threshold is unchanged.
+        CHECK(silence_backoff_threshold(15.0, 0) == 15.0);
+        CHECK(silence_backoff_threshold(15.0, -1) == 15.0); // defensive: never negative-index the backoff
+        // Grows by kSilenceBackoffMult per consecutive rebuild...
+        CHECK(silence_backoff_threshold(15.0, 1) == 15.0 * kSilenceBackoffMult);
+        CHECK(silence_backoff_threshold(15.0, 2) == 15.0 * kSilenceBackoffMult * kSilenceBackoffMult);
+        // ...but never exceeds the cap, however many consecutive rebuilds
+        // there have been (a target stuck for weeks shouldn't wait longer
+        // than kSilenceBackoffCapSecs between retries).
+        CHECK(silence_backoff_threshold(15.0, 50) == kSilenceBackoffCapSecs);
+        CHECK(silence_backoff_threshold(60.0, 50) == kSilenceBackoffCapSecs);
+        // The exponent-growth cap (kSilenceBackoffCapAt) shouldn't matter in
+        // practice — kSilenceBackoffCapSecs is reached well before it — but
+        // confirm going past it doesn't overflow/misbehave either.
+        CHECK(silence_backoff_threshold(15.0, kSilenceBackoffCapAt + 5) == kSilenceBackoffCapSecs);
+    }
+
     std::printf("[public IP classification]\n");
     {
         CHECK(is_public_ip("1.1.1.1"));

@@ -28,6 +28,17 @@ const COMMANDS: &[&str] = &[
     "dns_lookup", "reverse_lookup", "port_scan",
     "ping_start", "ping_stop",
     "write_file", "read_file",
+    // Runtime capability probe + elevation relaunch (commands.rs). Listing a
+    // command here is what makes tauri-build GENERATE its allow-<name>/
+    // deny-<name> permissions in the first place — capabilities/default.json
+    // can only grant a permission that already exists. Missing an entry here
+    // fails the build with "Permission allow-x not found, expected one of
+    // ...", which is exactly what happened the first time these two were
+    // added: lib.rs registered the handlers and capabilities/default.json
+    // granted them, but this list — the actual source of truth for which
+    // permissions exist at all — was never updated, so the permission simply
+    // didn't exist yet for default.json to grant.
+    "capabilities", "relaunch_elevated", "set_debug_logging", "play_alert_sound",
 ];
 
 // Raw ICMP (SOCK_RAW — the only ICMP mode this app uses on any platform, see
@@ -109,6 +120,9 @@ fn main() {
         .file(core_src.join("transport.cpp"))
         .file(core_src.join("session.cpp"))
         .file(core_src.join("ping_run.cpp"))
+        .file(core_src.join("probe_tcp.cpp"))
+        .file(core_src.join("probe_udp.cpp"))
+        .file(core_src.join("probe_http.cpp"))
         .include(&core_include)
         .include(&native_dir)
         .std("c++20");
@@ -126,6 +140,34 @@ fn main() {
 
     if cfg!(windows) {
         build.define("NOMINMAX", None);
+        // BUG FIX: a real build hit a catastrophic winsock.h-vs-winsock2.h
+        // conflict (hundreds of "struct type redefinition" / "redefinition;
+        // different linkage" errors, e.g. sockaddr, fd_set, socket(),
+        // WSAStartup()) compiling netpulse_ffi.cpp specifically. Root cause:
+        // platform.hpp's own top-of-file block correctly puts <winsock2.h>
+        // before anything else WITHIN that file, but that guarantee is only
+        // as good as whichever header some OTHER, uncontrolled part of the
+        // include graph reaches <windows.h> through FIRST in a given
+        // translation unit — and <windows.h>, unless WIN32_LEAN_AND_MEAN is
+        // already defined, pulls in the legacy <winsock.h> itself, before
+        // platform.hpp ever gets a chance to. netpulse_ffi.cpp is exactly
+        // the file most exposed to this: it is the one translation unit
+        // that sits directly in cxx-bridge/Tauri's own include graph, which
+        // has its own reasons to reach <windows.h> and has no obligation to
+        // order it favorably for us.
+        //
+        // Defining this HERE, at the cc::Build level, is the fix that is
+        // actually robust to include order: it lands before the FIRST
+        // header of ANY of our .cpp files is even opened, so it no longer
+        // matters which file some other header happens to pull
+        // <windows.h> in through, or in what order. This is also the
+        // textbook Microsoft-documented fix for this exact, extremely
+        // common class of conflict — see
+        // https://learn.microsoft.com/windows/win32/winsock/include-files-2
+        // ("To avoid redefinition errors, do not include Winsock.h... if
+        // you need Winsock2.h, define WIN32_LEAN_AND_MEAN before including
+        // Windows.h, or include Winsock2.h before Windows.h").
+        build.define("WIN32_LEAN_AND_MEAN", None);
     }
 
     build.compile("netpulse_engine");
@@ -141,4 +183,37 @@ fn main() {
     println!("cargo:rerun-if-changed={}", native_dir.join("netpulse_ffi.cpp").display());
     println!("cargo:rerun-if-changed={}", native_dir.join("netpulse_ffi.hpp").display());
     println!("cargo:rerun-if-changed=src/ffi.rs");
+
+    // BUG FIX: the three lines above are the ONLY rerun-if-changed
+    // directives this build script emitted. Cargo's rule here is sharp-
+    // edged and easy to miss: a build script's DEFAULT behavior (no
+    // rerun-if-changed at all) is to watch every file in the whole crate
+    // for changes and rerun on any of them — but the INSTANT a build
+    // script emits even one rerun-if-changed line, that default is turned
+    // off entirely, and Cargo watches ONLY the paths explicitly listed
+    // from then on. Since none of the actual C++ engine sources compiled
+    // above (icmp.cpp, stats.cpp, transport.cpp, session.cpp,
+    // ping_run.cpp, probe_tcp.cpp, probe_udp.cpp, probe_http.cpp, or
+    // anything under core/include) were ever listed, editing ANY of them —
+    // every single one of the files real engine work actually happens in —
+    // was silently invisible to Cargo. `cargo run`/`tauri dev` would see
+    // nothing it's watching had changed and just relink whatever
+    // netpulse_engine.lib was already sitting in target/, however stale.
+    // No error, no warning — the build just silently succeeds against old
+    // code. This is a well-known Cargo footgun (search "cargo build script
+    // rerun-if-changed" and this exact surprising-default is the first
+    // thing everyone hits), not something specific to this project, but it
+    // means every C++-side change made so far may never have actually been
+    // exercised by a dev-mode run, regardless of how correct the change
+    // itself was.
+    //
+    // Two directories, not an enumerated file list matching the .file()
+    // calls above: Cargo has supported watching a DIRECTORY path (recursing
+    // through it) since Rust 1.50 (Feb 2021) — every toolchain this project
+    // could plausibly be built with is well past that — so this stays
+    // correct automatically as files are added/removed/renamed under
+    // core/, rather than needing to be kept in sync with the .file() list
+    // by hand every time someone adds a new .cpp.
+    println!("cargo:rerun-if-changed={}", core_src.display());
+    println!("cargo:rerun-if-changed={}", core_include.display());
 }

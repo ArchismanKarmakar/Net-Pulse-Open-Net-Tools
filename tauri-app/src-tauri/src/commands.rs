@@ -40,6 +40,15 @@ pub struct TargetConfig {
     pub src: String,
     #[serde(default)]
     pub paused_hops: Vec<u8>,
+    // "icmp" (default) | "udp" | "tcp" — see Session::run()'s doc comment
+    // (session.cpp) for why "tcp" is accepted here but currently surfaces
+    // a clear error at the engine level rather than actually probing:
+    // the C++ side already refuses it explicitly, so there's no need to
+    // duplicate that validation here and risk the two falling out of sync.
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
+    #[serde(default = "default_dest_port")]
+    pub dest_port: f64,
 }
 fn default_probe() -> f64 { 1.0 }
 fn default_trace() -> f64 { 30.0 }
@@ -47,12 +56,15 @@ fn default_payload() -> f64 { 56.0 }
 fn default_maxhops() -> f64 { 30.0 }
 fn default_raw() -> bool { true }
 fn default_family() -> String { "auto".into() }
+fn default_protocol() -> String { "icmp".into() }
+fn default_dest_port() -> f64 { 33434.0 }
 
 #[tauri::command]
 pub fn add_target(cfg: TargetConfig) -> Result<u64, String> {
     ffi::add_target(
         &cfg.target, cfg.probe, cfg.trace, cfg.timeout, cfg.payload,
         cfg.maxhops, cfg.raw, &cfg.family, &cfg.src, &cfg.paused_hops,
+        &cfg.protocol, cfg.dest_port,
     )
     .map_err(|e| e.to_string())
 }
@@ -80,6 +92,8 @@ pub struct PartialTargetConfig {
     pub family: Option<String>,
     pub src: Option<String>,
     pub paused_hops: Option<Vec<u8>>,
+    pub protocol: Option<String>,
+    pub dest_port: Option<f64>,
 }
 
 #[tauri::command]
@@ -96,10 +110,13 @@ pub fn update_target(id: u64, cfg: PartialTargetConfig) -> Result<bool, String> 
         family: cfg.family.unwrap_or(current.family),
         src: cfg.src.unwrap_or(current.src),
         paused_hops: cfg.paused_hops.unwrap_or(current.paused_hops),
+        protocol: cfg.protocol.unwrap_or(current.protocol),
+        dest_port: cfg.dest_port.unwrap_or(current.dest_port),
     };
     ffi::update_target(
         id, merged.probe, merged.trace, merged.timeout, merged.payload,
         merged.maxhops, merged.raw, &merged.family, &merged.src, &merged.paused_hops,
+        &merged.protocol, merged.dest_port,
     )
     .map_err(|e| e.to_string())
 }
@@ -127,6 +144,8 @@ fn current_config(id: u64) -> Result<TargetConfig, String> {
         raw: c.get("raw").and_then(|x| x.as_bool()).unwrap_or(true),
         family: c.get("family").and_then(|x| x.as_str()).unwrap_or("auto").to_string(),
         src: c.get("src").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        protocol: c.get("protocol").and_then(|x| x.as_str()).unwrap_or("icmp").to_string(),
+        dest_port: getf("destPort", 33434.0),
         paused_hops: c
             .get("pausedHops")
             .and_then(|x| x.as_array())
@@ -234,6 +253,12 @@ pub struct PingArgs {
     pub interval: Option<f64>,
     pub family: Option<String>,
     pub continuous: Option<bool>,
+    // "icmp" (default, matches pre-existing behavior if omitted) or "udp" —
+    // see netpulse_ffi.hpp's ping_start doc comment for what each measures.
+    pub protocol: Option<String>,
+    // UDP-only; ignored for ICMP. Same classic-traceroute default
+    // (33434) as ping_run.hpp's PingConfig itself uses when this is absent.
+    pub dest_port: Option<u32>,
 }
 
 #[derive(Serialize, Clone)]
@@ -286,13 +311,15 @@ pub async fn ping_start(app: AppHandle, host: String, args: PingArgs) -> Result<
     let ttl = args.ttl.unwrap_or(255) as f64;
     let interval_secs = args.interval.unwrap_or(1.0);
     let family = args.family.clone().unwrap_or_default();
+    let protocol = args.protocol.clone().unwrap_or_default();
+    let dest_port = args.dest_port.unwrap_or(33434) as f64;
 
     // Raw ICMP (same requirement, and same default, as the main engine —
     // see build.rs's comment on why this app doesn't run elevated by
     // default but every probe still needs a raw socket) and no explicit
     // source binding; PingPage.jsx doesn't currently expose either as a
     // user-facing option, matching its pre-existing scope.
-    let json = ffi::ping_start(&host, count, continuous, size, timeout_secs, ttl, interval_secs, &family, true, "")
+    let json = ffi::ping_start(&host, count, continuous, size, timeout_secs, ttl, interval_secs, &family, true, "", &protocol, dest_port)
         .map_err(|e| e.to_string())?;
     let parsed: serde_json::Value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
     let id = parsed.get("id").and_then(|v| v.as_u64()).ok_or_else(|| "ping_start: malformed response".to_string())?;
@@ -352,4 +379,79 @@ pub fn write_file(path: String, data: Vec<u8>) -> Result<(), String> {
 #[tauri::command]
 pub fn read_file(path: String) -> Result<Vec<u8>, String> {
     std::fs::read(&path).map_err(|e| e.to_string())
+}
+// ---------------------------------------------------------------------------
+// Capability probe + elevation relaunch.
+//
+// The UI gates protocol selection on these: UDP-style hop discovery needs
+// elevation, and TCP hop discovery on Windows additionally needs a capture
+// driver. Reporting this up front — and refusing to add a target that cannot
+// possibly work — is far better than silently spinning in "discovering".
+// ---------------------------------------------------------------------------
+#[tauri::command]
+pub fn capabilities() -> Result<String, String> {
+    ffi::capabilities_json().map_err(|e| e.to_string())
+}
+
+// Relaunch this same executable elevated, then ask the current instance to
+// exit. Windows has no way to elevate a running process in place — a new
+// process must be started via the "runas" verb, which triggers the UAC
+// prompt — so "run as administrator" is necessarily a restart, and the UI
+// says so before calling this.
+#[tauri::command]
+pub fn relaunch_elevated(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        // Deliberately shelled out through PowerShell's Start-Process -Verb
+        // RunAs rather than calling ShellExecuteW directly: that would pull in
+        // a windows-sys dependency this crate does not currently have, and the
+        // one-shot cost here is irrelevant since the process is about to exit.
+        // Same net effect — a UAC prompt, then a fresh elevated instance.
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let exe_s = exe.to_string_lossy().replace('\'', "''"); // escape for the single-quoted PS string
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command",
+                   &format!("Start-Process -FilePath '{}' -Verb RunAs", exe_s)])
+            .status()
+            .map_err(|e| format!("Could not start the elevation prompt: {e}"))?;
+        // A non-zero exit means the UAC prompt was declined (or failed). That
+        // must NOT kill the running instance — the user simply chose to stay
+        // unelevated, and the app is still perfectly usable for ICMP and TCP
+        // destination measurement.
+        if !status.success() {
+            return Err("Elevation was cancelled. Still running without administrator rights.".into());
+        }
+        app.exit(0);
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        Err("Relaunching elevated is Windows-only. On Linux/macOS start the app with sudo instead.".into())
+    }
+}
+
+// Enable/disable diagnostic logging to a file in the app data dir.
+// Deliberately file-based rather than env-var-driven: "Run as administrator"
+// launches a brand-new elevated process that inherits none of the
+// environment of whatever terminal you were in, so NETPULSE_DEBUG=1 simply
+// cannot be set for the elevated case — which is precisely the case that
+// most needs diagnosing. Returns the log file path for the UI to display.
+#[tauri::command]
+pub fn set_debug_logging(app: tauri::AppHandle, on: bool) -> Result<String, String> {
+    use tauri::Manager;
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    // The directory may not exist yet on a fresh install; the C++ side only
+    // joins a filename onto it and fopen()s, so it must exist first.
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    ffi::set_debug_logging(on, &dir.to_string_lossy()).map_err(|e| e.to_string())
+}
+
+// Plays the OS alert/notification sound alone, no dialog shown — pairs
+// with a custom in-app modal that wants the same attention-getting sound a
+// native OS dialog gets automatically, without giving up the app's own
+// consistent visual styling for a plain native message box.
+#[tauri::command]
+pub fn play_alert_sound(kind: String) {
+    ffi::play_alert_sound(&kind);
 }

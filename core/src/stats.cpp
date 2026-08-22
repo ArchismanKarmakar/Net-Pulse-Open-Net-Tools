@@ -1,4 +1,10 @@
 #include "netpulse/stats.hpp"
+#include "netpulse/session.hpp"
+// BUG FIX (see enqueue_flush() below): debug_log() lives here, and this file
+// never included it before — the exact "accidentally relies on some OTHER
+// file transitively pulling it in" trap already found and fixed once this
+// session for netpulse_ffi.cpp. Explicit here, not assumed.
+#include "netpulse/platform.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -6,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -33,6 +40,8 @@ void HopStats::set_address(const std::string& addr) {
         hostname_.reset();
         samples_.clear();
         mpls_labels_.clear(); // a route flap means a different device — its old label stack no longer applies
+        local_port_ = 0; // same reasoning — stale for a different device at this hop
+        tcp_port_open_.reset(); // same reasoning
         // A live address is about to be shown again — whatever was
         // remembered as "stale" (see clear_address()) is superseded, whether
         // this is the same device coming back or a genuinely different one.
@@ -61,6 +70,8 @@ void HopStats::clear_address() {
     hostname_.reset();
     samples_.clear();
     mpls_labels_.clear();
+    local_port_ = 0;
+    tcp_port_open_.reset();
     // Same reasoning as the flap branch in set_address() above: whatever was
     // here is no longer confirmed to be on the path, so its history no
     // longer describes what's (or isn't) at this hop.
@@ -93,12 +104,20 @@ HopStat HopStats::compute(std::optional<double> focus_secs) const {
     s.hostname = hostname_;
     s.is_dest = is_dest_;
     s.mpls_labels = mpls_labels_;
+    s.local_port = local_port_;
+    s.tcp_port_open = tcp_port_open_;
     // Only worth surfacing when there's no LIVE address to show instead —
     // see the HopStat doc comment in stats.hpp.
     if (!address_ && stale_address_) {
         s.stale_address = stale_address_;
         s.stale_hostname = stale_hostname_;
         if (last_confirmed_at_ > 0.0) s.stale_since = last_confirmed_at_;
+        // Same table shared_adopt_from() reads from in session.cpp's send
+        // loop. 30s is generous relative to typical probe intervals
+        // (default 1s), so this stays "is anyone hearing from it right
+        // now", not a long-tail memory of an address that's genuinely
+        // gone quiet everywhere.
+        s.stale_seen_elsewhere_at = shared_last_seen(*stale_address_, now_secs(), 30.0);
     }
 
     double hot_sum = 0, hot_sumsq = 0, hot_min = 0, hot_max = 0;
@@ -198,6 +217,35 @@ void ColdStore::enqueue_flush(uint64_t target_id, uint8_t hop, std::vector<Sampl
     ensure_worker_started();
     {
         std::lock_guard<std::mutex> lk(qmtx_);
+        // BUG FIX: this queue had no size cap at all. It's serviced by a
+        // SINGLE background thread for every target and every hop in the
+        // whole process — fine under light load, but if disk I/O ever falls
+        // behind the rate hot-tier samples age out at (a slow disk, or
+        // real-time antivirus scanning intercepting every file write — a
+        // live report specifically flagged Kaspersky actively monitoring
+        // this process), jobs pile up here forever. Each carries its own
+        // std::vector<Sample> payload, so this is genuinely unbounded RAM
+        // growth over a long enough session, not just a queued backlog —
+        // exactly the class of thing that looks fine in short testing and
+        // degrades hours into a real deployment. Capped here rather than
+        // blocking: blocking would stall the CALLING thread, which is a
+        // live probe session's own loop, turning a stats-persistence
+        // slowdown into a probing slowdown, which is worse. Dropping the
+        // OLDEST pending job trades a little historical cold-tier detail
+        // (never live data — flush jobs are already-aged-out samples) for
+        // guaranteed bounded memory; logged once so a real backlog is
+        // diagnosable rather than silently lossy forever.
+        if (queue_.size() >= kMaxQueuedFlushJobs) {
+            queue_.pop_front();
+            if (!drop_notice_shown_) {
+                drop_notice_shown_ = true;
+                debug_log("[netpulse] ColdStore flush queue exceeded its cap (" +
+                          std::to_string(kMaxQueuedFlushJobs) +
+                          ") -- the persistence worker is falling behind (slow disk, or "
+                          "AV real-time scanning?). Dropping oldest pending jobs to keep "
+                          "memory bounded; live stats are unaffected.\n");
+            }
+        }
         queue_.push_back(FlushJob{target_id, hop, std::move(batch)});
     }
     qcv_.notify_one();
@@ -300,6 +348,34 @@ void ColdStore::reset(uint64_t target_id, uint8_t hop) {
     std::remove(path.c_str());
     std::lock_guard<std::mutex> lk(cache_mtx_);
     cache_.erase(std::make_pair(target_id, hop));
+}
+
+void ColdStore::forget_target(uint64_t target_id) {
+    // See this method's own doc comment (stats.hpp) for why it needs to
+    // exist at all. All of a target's hop files live under one directory
+    // (path_for()'s own convention: "<root>/stats/<target_id>/<hop>.bin"),
+    // so removing that whole directory in one call is both simpler and
+    // more complete than reset()'s per-hop approach — it also catches any
+    // hop this target ever used, not just the ones happening to still be in
+    // cache_ right now.
+    {
+        ensure_configured(); // same lazy-default pattern path_for() uses
+        std::string root;
+        { std::lock_guard<std::mutex> lk(dir_mtx_); root = dir_; }
+        std::error_code ec;
+        std::filesystem::remove_all(std::filesystem::path(root) / "stats" / std::to_string(target_id), ec);
+        // Best-effort: a failure here (file locked, permissions) just means
+        // stale on-disk data for a removed target lingers a little longer,
+        // not a functional problem — the in-memory cache_ erase below is
+        // what actually matters for the leak this exists to fix.
+    }
+    std::lock_guard<std::mutex> lk(cache_mtx_);
+    // std::map<std::pair<uint64_t,uint8_t>, ...> keys sort target_id-major,
+    // so every entry for this target forms one contiguous range — erase it
+    // in one call rather than a linear scan-and-erase over the whole map.
+    auto lo = cache_.lower_bound(std::make_pair(target_id, uint8_t{0}));
+    auto hi = cache_.upper_bound(std::make_pair(target_id, std::numeric_limits<uint8_t>::max()));
+    cache_.erase(lo, hi);
 }
 
 } // namespace netpulse

@@ -8,7 +8,7 @@
 
 [package]
 name = "netpulse"
-version = "0.9.5"
+version = "1.0.8"
 description = "Net Pulse — Open Net Tools: path-latency & network diagnostics (Tauri + Rust host, C++ probe engine)"
 authors = ["Archisman Karmakar"]
 license = "AGPL-3.0-or-later"

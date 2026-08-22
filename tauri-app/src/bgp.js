@@ -7,7 +7,28 @@
 
 const BASE = 'https://stat.ripe.net/data'
 const APP = 'sourceapp=netpulse'
+// Every distinct (endpoint, resource) pair this module has ever looked up —
+// one entry per unique URL, across every hop IP / ASN / prefix the app has
+// ever shown a badge or drawer for, for as long as the page stays open. A
+// long-running session that visits many targets with real-world route churn
+// (ECMP, CDN edge rotation, IPv6 privacy addresses) can rack up hundreds to
+// thousands of distinct hop IPs over hours, and some responses here (whois
+// records, looking-glass AS-path tables) aren't small. Uncapped, this was a
+// genuine unbounded-growth leak, not a bug in any one lookup. Capped with a
+// simple FIFO eviction (Map preserves insertion order) — not true LRU, but
+// cheap, and anything actually still relevant gets re-fetched/re-cached
+// transparently on its next lookup since getJson() only ever checks
+// cache.has() first.
+const CACHE_MAX = 800
 const cache = new Map()
+function cacheSet(url, value) {
+  cache.set(url, value)
+  if (cache.size > CACHE_MAX) {
+    const excess = cache.size - CACHE_MAX
+    const it = cache.keys()
+    for (let i = 0; i < excess; i++) cache.delete(it.next().value)
+  }
+}
 
 // RFC1918 / CGNAT / loopback / link-local / ULA etc. — never sent to RIPEstat.
 export function isPublicIp(ip) {
@@ -38,7 +59,7 @@ function getJson(endpoint, resource, extra = '') {
     .then((r) => (r.ok ? r.json() : null))
     .then((j) => (j && j.data) || null)
     .catch(() => null)
-  cache.set(url, p)
+  cacheSet(url, p)
   return p
 }
 

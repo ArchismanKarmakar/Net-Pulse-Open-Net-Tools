@@ -35,7 +35,8 @@ uint64_t add_target(rust::Str target,
                      double probe, double trace, double timeout, double payload,
                      double maxhops, bool raw,
                      rust::Str family, rust::Str src,
-                     rust::Slice<const uint8_t> paused_hops);
+                     rust::Slice<const uint8_t> paused_hops,
+                     rust::Str protocol, double dest_port);
 
 // Partial update: fields not meaningfully different from the sentinel don't
 // apply — mirrors settings_from_obj(o, cur) building on the session's CURRENT
@@ -46,7 +47,8 @@ bool update_target(uint64_t id,
                     double probe, double trace, double timeout, double payload,
                     double maxhops, bool raw,
                     rust::Str family, rust::Str src,
-                    rust::Slice<const uint8_t> paused_hops);
+                    rust::Slice<const uint8_t> paused_hops,
+                    rust::Str protocol, double dest_port);
 
 void pause_target(uint64_t id, bool on);
 void stop_target(uint64_t id);
@@ -100,18 +102,64 @@ void set_data_dir(rust::Str dir);
 // new line as a Tauri event (see commands.rs), so the frontend's existing
 // event-based contract needs no cxx-callback machinery to support it.
 //
+// `protocol`: "icmp" (default/empty also means icmp) or "udp" — see
+// PingProtocol (ping_run.hpp) for what each actually measures; a UDP
+// "reply" is a Port-Unreachable from the destination itself, the closest
+// UDP analog to a successful ICMP echo. `dest_port` is UDP-only (ignored
+// for ICMP) — the base destination port probes are sent to; see
+// ProbeUdp::send_ping_probe's own doc comment for how it varies per-probe
+// for correlation.
+//
 // Returns `{"id":<u64>,"cmd":"<human-readable summary>"}` — id to correlate
 // with ping_poll() below; cmd purely for display, shown in place of the old
 // (fake, OS-specific) shell command line. Throws on an unusable host/config
 // (mirrors add_target's convention).
 rust::String ping_start(rust::Str host, double count, bool continuous,
                          double size, double timeout_secs, double ttl,
-                         double interval_secs, rust::Str family, bool raw, rust::Str src);
+                         double interval_secs, rust::Str family, bool raw, rust::Str src,
+                         rust::Str protocol, double dest_port);
 void ping_stop(uint64_t id);
 // `{"lines":[{"seq":N,"ok":bool,"rtt_ms":number|null,"from":"...","note":"..."}],"done":bool}`
 // — every line produced since the LAST poll for this id. See
 // Manager::poll_ping's doc comment (manager.hpp) for the full contract,
 // including cleanup once a run is done and fully drained.
 rust::String ping_poll(uint64_t id);
+
+
+// Runtime capability probe for the UI's protocol gating. Returns
+// {"elevated":bool,"capture":bool,"platform":"windows"|"unix"}.
+//
+// elevated — Administrator (Windows) / root. Raw-socket receive of the ICMP
+//   errors that UDP-style hop discovery depends on generally requires this.
+// capture  — a packet-capture driver (Npcap/WinPcap) is loadable. Only
+//   meaningful on Windows, where TCP hop discovery needs it; reported true
+//   elsewhere since nothing extra is needed there.
+rust::String capabilities_json();
+
+
+// Diagnostic logging toggle. Writes to a plain file in the app data dir so
+// it works no matter HOW the app was launched — crucially including "Run as
+// administrator", which spawns a fresh elevated process with none of the
+// environment of the terminal you started from, making NETPULSE_DEBUG=1
+// impossible to set for the exact scenario that most needs diagnosing.
+// Returns the resolved log file path so the UI can show/open it.
+rust::String set_debug_logging(bool on, rust::Str dir);
+
+
+// Plays the OS's own alert/notification sound WITHOUT showing any dialog
+// box at all — the pairing this exists for is a custom, app-styled in-app
+// modal (visually consistent with the rest of the UI, unlike a native OS
+// message box, which looks out of place) that ALSO needs the same
+// attention-getting sound a real native dialog gets for free. `kind`
+// mirrors the same three-tier convention capabilities_json()/nativeMessage
+// already use: "info" | "warning" | "error".
+//
+// Windows: MessageBeep() with the matching icon constant — genuinely the
+// SAME system sound a real MessageBox with that icon would play, just
+// without the box. macOS: NSBeep(). Linux has no single standard
+// equivalent across desktop environments; best-effort XBell(), silently a
+// no-op if unavailable rather than a hard failure — losing a notification
+// chime is not worth erroring the whole dialog over.
+void play_alert_sound(rust::Str kind);
 
 } // namespace netpulse_ffi

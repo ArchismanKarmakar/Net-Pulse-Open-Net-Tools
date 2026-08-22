@@ -17,7 +17,7 @@
 //    hands back a plain object, no parsing needed.
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { save as saveDialog, open as openDialog } from '@tauri-apps/plugin-dialog'
+import { save as saveDialog, open as openDialog, message as messageDialog, ask as askDialog } from '@tauri-apps/plugin-dialog'
 import { check as checkUpdate } from '@tauri-apps/plugin-updater'
 import { relaunch } from '@tauri-apps/plugin-process'
 import { getVersion as tauriGetVersion } from '@tauri-apps/api/app'
@@ -104,6 +104,27 @@ function install() {
       portscan: (host, s, e) => invoke('port_scan', { host, start: s, end: e }),
       pingStart: (host, opts) => invoke('ping_start', { host, args: toPingArgs(opts) }),
       pingStop: (id) => invoke('ping_stop', { id }),
+      // Runtime capability probe + elevation relaunch — see commands.rs.
+      capabilities: () => invoke('capabilities').then((s) => JSON.parse(s)),
+      relaunchElevated: () => invoke('relaunch_elevated'),
+      // Returns the log file path. See commands.rs for why this is a file
+      // toggle rather than an environment variable.
+      setDebugLogging: (on) => invoke('set_debug_logging', { on: !!on }),
+      // Sound only, no dialog — see commands.rs.
+      playAlertSound: (kind) => invoke('play_alert_sound', { kind: kind || 'info' }),
+      // NATIVE OS dialogs (not the in-app React modal). Used for blocking
+      // prerequisite prompts because a native dialog gives three things the
+      // custom modal structurally cannot: it is genuinely application-modal
+      // (cannot be dismissed by clicking the page behind it), it plays the
+      // platform's own alert sound, and it renders with the OS's native
+      // warning/error iconography — identically on Windows, macOS and Linux.
+      // `kind` is 'info' | 'warning' | 'error'.
+      nativeMessage: (message, { title, kind = 'warning' } = {}) => messageDialog(message, { title, kind }),
+      // Returns true/false. okLabel/cancelLabel let the two choices read as
+      // real actions ('Restart as Administrator' / 'Cancel') rather than a
+      // bare Yes/No.
+      nativeAsk: (message, { title, kind = 'warning', okLabel, cancelLabel } = {}) =>
+        askDialog(message, { title, kind, okLabel, cancelLabel }),
       onPingLine: (cb) => {
         let unlisten = null
         let cancelled = false
@@ -194,12 +215,15 @@ function toTargetConfig(opts) {
     family: opts.family || 'auto',
     src: opts.src || '',
     pausedHops: Array.isArray(opts.pausedHops) ? opts.pausedHops : [],
+    protocol: opts.protocol || 'icmp',
+    destPort: numOr(opts.destPort, 33434),
   }
 }
 function toPingArgs(opts) {
   return {
     count: opts?.count, size: opts?.size, timeout: opts?.timeout, ttl: opts?.ttl,
     interval: opts?.interval, family: opts?.family, continuous: opts?.continuous,
+    protocol: opts?.protocol, dest_port: opts?.destPort,
   }
 }
 function toPartialTargetConfig(opts) {
@@ -212,6 +236,8 @@ function toPartialTargetConfig(opts) {
   if (opts.raw !== undefined) o.raw = !!opts.raw
   if (opts.family) o.family = opts.family
   if (opts.src !== undefined) o.src = opts.src
+  if (opts.protocol) o.protocol = opts.protocol
+  if (opts.destPort != null) o.destPort = numOr(opts.destPort, undefined)
   if (Array.isArray(opts.pausedHops)) o.pausedHops = opts.pausedHops
   return o
 }

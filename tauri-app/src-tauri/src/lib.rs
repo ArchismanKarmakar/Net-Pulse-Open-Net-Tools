@@ -35,6 +35,10 @@ pub fn run() {
             commands::ping_stop,
             commands::write_file,
             commands::read_file,
+            commands::capabilities,
+            commands::relaunch_elevated,
+            commands::set_debug_logging,
+            commands::play_alert_sound,
         ])
         .setup(|app| {
             // Desktop-only (mobile has no update mechanism via this plugin —

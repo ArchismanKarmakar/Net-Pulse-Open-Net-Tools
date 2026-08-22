@@ -18,6 +18,10 @@ export const CFG_LIMITS = {
   timeout: { min: 0,   max: 3600,  step: 0.1, label: 'Timeout (s, 0 = auto)' },
   payload: { min: 0,   max: 65500, step: 1,   label: 'Payload (bytes)' },
   maxhops: { min: 1,   max: 255,   step: 1,   label: 'Max hops' },
+  // Remote port — editable for TCP/UDP only; validateCfg (below) skips it
+  // for protocols where it doesn't apply (icmp) via the same "only check
+  // fields actually present" rule every other field already follows.
+  destPort: { min: 1,  max: 65535, step: 1,   label: 'Remote port' },
 }
 
 // Returns a { field: message } map of any out-of-range / non-numeric values.
@@ -28,6 +32,39 @@ export function validateCfg(cfg) {
     const v = Number(cfg[k]); const L = CFG_LIMITS[k]
     if (!Number.isFinite(v)) errs[k] = `${L.label} must be a number`
     else if (v < L.min || v > L.max) errs[k] = `${L.label} must be between ${L.min} and ${L.max}`
+  }
+  return errs
+}
+
+// Ping tab's own field limits — separate from CFG_LIMITS above (MTR/Edit
+// Config) because the fields genuinely differ: count/size/timeout(ms)/
+// interval(s) here have no equivalent there, and MTR's timeout is in
+// SECONDS while Ping's is in MILLISECONDS — reusing one shared object
+// would risk silently validating one against the other's units. destPort
+// is intentionally NOT duplicated here — PingPage imports CFG_LIMITS.destPort
+// directly for that one, since a remote port is the same concept and the
+// same valid range in both places.
+export const PING_LIMITS = {
+  count:    { min: 1,   max: 10000, label: 'Count' },
+  size:     { min: 0,   max: 65500, label: 'Size (B)' },
+  timeout:  { min: 100, max: 60000, label: 'Timeout (ms)' },
+  interval: { min: 0.2, max: 60,    label: 'Interval (s)' },
+  ttl:      { min: 1,   max: 255,   label: 'TTL' },
+}
+
+// Same shape and behavior as validateCfg() above, scoped to PING_LIMITS.
+export function validatePingCfg(cfg) {
+  const errs = {}
+  for (const k of Object.keys(PING_LIMITS)) {
+    if (cfg[k] == null || cfg[k] === '') continue
+    const v = Number(cfg[k]); const L = PING_LIMITS[k]
+    if (!Number.isFinite(v)) errs[k] = `${L.label} must be a number`
+    else if (v < L.min || v > L.max) errs[k] = `${L.label} must be between ${L.min} and ${L.max}`
+  }
+  if (cfg.destPort != null && cfg.destPort !== '') {
+    const v = Number(cfg.destPort); const L = CFG_LIMITS.destPort
+    if (!Number.isFinite(v)) errs.destPort = `${L.label} must be a number`
+    else if (v < L.min || v > L.max) errs.destPort = `${L.label} must be between ${L.min} and ${L.max}`
   }
   return errs
 }

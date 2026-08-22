@@ -26,6 +26,8 @@ mod ffi {
             family: &str,
             src: &str,
             paused_hops: &[u8],
+            protocol: &str,
+            dest_port: f64,
         ) -> Result<u64>;
 
         #[allow(clippy::too_many_arguments)]
@@ -40,6 +42,8 @@ mod ffi {
             family: &str,
             src: &str,
             paused_hops: &[u8],
+            protocol: &str,
+            dest_port: f64,
         ) -> Result<bool>;
 
         fn pause_target(id: u64, on: bool);
@@ -60,6 +64,13 @@ mod ffi {
         // OS-`ping`-subprocess implementation (tools.rs) with the SAME
         // pooled-socket + shared-dispatcher engine the main multi-target
         // monitor uses, instead of a second, unrelated ICMP mechanism.
+        // Runtime capability probe — see netpulse_ffi.hpp's doc comment.
+        fn capabilities_json() -> Result<String>;
+        // Diagnostic logging toggle — see netpulse_ffi.hpp.
+        fn set_debug_logging(on: bool, dir: &str) -> Result<String>;
+        // Sound-only OS alert — see netpulse_ffi.hpp.
+        fn play_alert_sound(kind: &str);
+
         #[allow(clippy::too_many_arguments)]
         fn ping_start(
             host: &str,
@@ -72,6 +83,8 @@ mod ffi {
             family: &str,
             raw: bool,
             src: &str,
+            protocol: &str,
+            dest_port: f64,
         ) -> Result<String>;
         fn ping_stop(id: u64);
         fn ping_poll(id: u64) -> String;

@@ -134,8 +134,17 @@ jobs:
         shell: bash
         run: find tauri-app/src-tauri/target/release/bundle -maxdepth 2 -type f | sort
 
-      # Only ship actual installers/archives, not intermediate unpacked-app
-      # directories or debug metadata.
+      # Ship installers/archives AND the updater artifacts (createUpdaterArtifacts:
+      # true in tauri.conf.json makes `tauri build` also emit a per-platform
+      # `latest.json` + `.sig` file per bundle, alongside the installer) — NOT
+      # intermediate unpacked-app directories or debug metadata. Previously this
+      # glob only grabbed the installers, so every OS job's latest.json/.sig was
+      # silently thrown away here and never reached the release at all — the
+      # direct reason the updater endpoint 404s. Each OS's own latest.json only
+      # describes ITS OWN platform (e.g. windows-latest's only has
+      # "windows-x86_64"); renamed with an OS prefix here so all three survive
+      # side by side once downloaded into the same publish job below, where
+      # merge-latest-json.mjs combines them into one real multi-platform manifest.
       - name: Collect installer files
         shell: bash
         run: |
@@ -145,6 +154,10 @@ jobs:
             \( -name '*.exe' -o -name '*.msi' -o -name '*.dmg' -o -name '*.app.tar.gz' \
                -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) \
             -type f -exec cp -v {} collected/ \;
+          find tauri-app/src-tauri/target/release/bundle -name '*.sig' -type f \
+            -exec cp -v {} collected/ \;
+          find tauri-app/src-tauri/target/release/bundle -name 'latest.json' -type f \
+            -exec cp -v {} "collected/latest-${{ matrix.os }}.json" \;
           ls -la collected
 
       - name: Upload artifact
@@ -177,6 +190,17 @@ jobs:
 
       - name: List downloaded artifacts (diagnostic)
         run: ls -la release/
+
+      # Combine each OS's own single-platform latest.json into the one
+      # multi-platform manifest the updater's endpoint actually needs — see
+      # merge-latest-json.mjs's own doc comment for why this can't just be
+      # "upload whichever one tauri-cli produced". Runs before checksums so
+      # latest.json itself is covered by SHA256SUMS.txt too.
+      - name: Merge per-OS updater manifests into one latest.json
+        run: |
+          node .github/scripts/merge-latest-json.mjs release release/latest.json \
+            "${{ github.repository }}" "${{ inputs.tag || github.ref_name }}"
+          rm -f release/latest-*.json
 
       - name: Generate SHA256SUMS.txt
         run: node .github/scripts/checksums.mjs release release/SHA256SUMS.txt

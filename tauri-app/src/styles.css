@@ -177,11 +177,19 @@
   .controls label.cb { @apply gap-1.5; }
   .controls input[type=number] { @apply w-16; }
   .divider { @apply w-px h-5 bg-border2 mx-1; }
-  button.primary, .apply { @apply bg-accent border-accent text-[#04222b] font-semibold; }
-  button.primary:hover, .apply:hover { @apply brightness-110; }
+  /* BUG FIX: this used to use --accent directly (a bright, high-saturation
+     cyan, #22d3ee in dark theme) with dark text in dark theme but WHITE text
+     in light theme. Both technically passed WCAG contrast numerically, but a
+     large bright-saturated fill paired with white text reads as glare/too
+     vivid, not just "passes a number" — a real report specifically
+     distinguished this from a contrast-ratio complaint. Fixed with an
+     explicit, deliberately DARKER/more muted teal, same value in both
+     themes (no longer needs a light-theme override at all), which pairs
+     comfortably with white text without the brightness clash. Still
+     WCAG AA (5.02:1) against white. */
+  button.primary, .apply { background: #0f7a8c; border-color: #0f7a8c; color: #ffffff; font-weight: 600; }
+  button.primary:hover, .apply:hover { filter: brightness(1.1); }
   .themebtn { @apply bg-transparent border-none text-base px-1 ml-2; }
-  :root[data-theme=light] button.primary, :root[data-theme=light] .apply { background: var(--accent); border-color: var(--accent); color: #ffffff; }
-  :root[data-theme=light] button.primary:hover, :root[data-theme=light] .apply:hover { filter: brightness(1.05); }
 
   /* ---- Unified target panel ----
      ONE persistent element for both the full-width dashboard and the
@@ -338,9 +346,11 @@
     padding: 10px 14px; border-radius: 12px;
     background: var(--card-bg); border: 1px solid var(--card-border);
     cursor: pointer;
+    user-select: none;
     position: relative; overflow: hidden;
     transition: background-color .12s, border-color .12s, transform .1s, padding .3s ease;
   }
+  .tc-select { cursor: text; user-select: text; }
   .target-card:hover { background: var(--card-hover); border-color: var(--border2); transform: translateY(-1px); }
   .target-card.compact { padding: 8px 10px 8px 18px; }
   /* Selected cards get a bit of extra left padding beyond the shared 18px
@@ -423,6 +433,13 @@
      the IP and "IPv4 (auto)". The space in TargetCard.jsx is removed; this
      margin is now the only thing spacing them. */
   .tc-dest span { @apply ml-2; }
+  .tc-proto-badge {
+    display: inline-block; padding: 0 5px; border-radius: 4px;
+    font-size: 10px; font-weight: 600; letter-spacing: .02em;
+    background: color-mix(in srgb, var(--accent, #4a9eff) 18%, transparent);
+    color: var(--accent, #4a9eff);
+    vertical-align: middle;
+  }
   .tc-cadence { white-space: nowrap; display: inline-block; overflow: hidden; transition: opacity .28s ease; opacity: 1; }
   /* display:none, not opacity:0 — this isn't a "fade out" moment, the
      open-target strip is a fundamentally tighter layout and this text
@@ -744,6 +761,7 @@
      "remembered, not current," never mistaken for a live measurement. */
   td.stale-cell { opacity: .55; font-style: italic; }
   .stale-tag { opacity: .8; font-style: normal; font-size: 10px; margin-left: 3px; }
+  .stale-tag.stale-elsewhere { color: var(--accent, #4a9eff); opacity: .9; }
 
   /* ---- table ---- */
   .tablewrap { @apply max-h-[38%] overflow-auto border border-border rounded-xl; box-shadow: var(--shadow-sm); }
@@ -857,9 +875,21 @@
 
 /* About dialog (added) */
 .about-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.5); display: flex;
-  align-items: center; justify-content: center; z-index: 200; }
+  align-items: center; justify-content: center; z-index: 200;
+  animation: modalOverlayIn 190ms ease-out; }
+/* Same fix as .modal-overlay.closing (below, in the main modal system):
+   distinct @keyframes name, not `reverse` on the same one — the latter
+   doesn't reliably restart once the open animation has already finished. */
+.about-overlay.closing {
+  animation: modalOverlayOut 160ms ease-in;
+  pointer-events: none;
+}
 .about-box { background: var(--panel); border: 1px solid var(--border2); border-radius: 12px;
-  box-shadow: var(--shadow-md); padding: 20px 22px; max-width: 380px; }
+  box-shadow: var(--shadow-md); padding: 20px 22px; max-width: 380px;
+  animation: modalBoxIn 190ms cubic-bezier(0.16, 1, 0.3, 1); }
+.about-box.closing {
+  animation: modalBoxOut 160ms cubic-bezier(0.4, 0, 1, 1);
+}
 .about-version { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
 .about-box a { color: var(--accent); text-decoration: none; font-size: 13px; word-break: break-all; }
 .about-box a:hover { text-decoration: underline; }
@@ -952,3 +982,264 @@ tr.hoppaused .hop-pause { color: var(--accent); }
 .tool-console .pl-ok { color: #86efac; }
 .tool-console .pl-bad { color: #fca5a5; }
 .tool-console .pl-stat { color: #93c5fd; }
+/* Protocol dependency notice (Path/MTR options bar + Ping tab).
+   Deliberately low-key: this is standing context about a platform
+   limitation, not an error the user caused or can fix in-app, so it
+   should read as a footnote rather than compete with real alerts. */
+.proto-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  line-height: 1.35;
+  padding: 3px 9px;
+  border-radius: 999px;
+  color: var(--muted, #9aa4b2);
+  background: color-mix(in srgb, var(--warn, #e0a030) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warn, #e0a030) 28%, transparent);
+  cursor: help;
+  max-width: 560px;
+}
+.ping-opts .proto-note { margin-left: 2px; }
+
+/* Protocol prerequisite alert (Ping tab). More prominent than .proto-note —
+   this represents something that actually blocks the action (or, for the
+   "soft" variant, something worth knowing but not blocking), not just
+   background context, so it needs to read as a real alert with a real next
+   step, not a footnote. */
+.proto-alert {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12.5px;
+  line-height: 1.4;
+  padding: 10px 14px;
+  border-radius: 8px;
+  margin: -2px 0 10px;
+  color: var(--text, #e6e9ef);
+  background: color-mix(in srgb, var(--danger, #e0503a) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger, #e0503a) 35%, transparent);
+}
+.proto-alert-soft {
+  background: color-mix(in srgb, var(--warn, #e0a030) 10%, transparent);
+  border-color: color-mix(in srgb, var(--warn, #e0a030) 30%, transparent);
+}
+.proto-alert-title { font-weight: 600; }
+.proto-alert-actions { display: flex; align-items: center; gap: 10px; }
+.proto-alert-actions button {
+  background: var(--accent, #4f8cff);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.proto-alert-actions button:disabled { opacity: 0.6; cursor: default; }
+
+/* Modal dialog.
+   BUG FIX: none of these classes existed. The Modal component in App.jsx
+   referenced .modal-overlay/.modal-box/etc. and NOT ONE had a rule anywhere
+   in this file, so even once the component was correctly rendered it would
+   have been an unstyled, unpositioned block in normal document flow — no
+   backdrop, no centering, no z-index — i.e. effectively invisible behind
+   or below the app chrome. That would have looked identical to the original
+   "no dialog ever appears" symptom, so fixing the missing render alone was
+   not enough. Explicit high z-index because this dialog is used for blocking
+   prerequisite prompts that the user genuinely must answer before the action
+   proceeds. */
+/* Open/close animation, matching how Windows/macOS system dialogs feel:
+   backdrop fades, the box itself fades+scales+rises slightly. Timings are
+   deliberately asymmetric — opening a touch slower reads as more solid,
+   closing faster reads as responsive rather than sluggish — the same
+   asymmetry most OS-native dialogs use. The JS-side delayed-unmount in
+   closeModal() (App.jsx) is what actually keeps the .closing class on
+   screen long enough for this transition to play at all; without it React
+   would remove the element before a single frame rendered. 160ms here
+   MUST match the setTimeout duration there. */
+@keyframes modalOverlayIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes modalOverlayOut { from { opacity: 1; } to { opacity: 0; } }
+@keyframes modalBoxIn {
+  from { opacity: 0; transform: translateY(10px) scale(0.96); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes modalBoxOut {
+  from { opacity: 1; transform: translateY(0) scale(1); }
+  to   { opacity: 0; transform: translateY(10px) scale(0.96); }
+}
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+  padding: 24px;
+  animation: modalOverlayIn 190ms ease-out;
+}
+/* BUG FIX: this used to reuse the SAME animation-name (modalOverlayIn) with
+   `reverse` for closing, differing only in duration/timing-function/
+   direction. A live report confirmed the close never actually animated at
+   all — open played fine, close was instant. This is a known CSS
+   behavior: once an animation with a given name has already completed on
+   an element, changing only its duration/direction/timing-function via a
+   class swap does not reliably restart it in Chromium/WebView2 — the
+   element just stays at its settled end state until JS removes it,
+   invisible even though the animation shorthand's computed value did
+   change. A genuinely distinct @keyframes name (not just `reverse` on the
+   same one) forces the browser to treat it as an unambiguously new
+   animation, which does restart correctly. */
+.modal-overlay.closing {
+  animation: modalOverlayOut 160ms ease-in;
+  pointer-events: none; /* a click during the closing animation must not re-trigger anything */
+}
+.modal-box {
+  animation: modalBoxIn 190ms cubic-bezier(0.16, 1, 0.3, 1);
+  background: var(--panel, #161b22);
+  color: var(--text, #e6edf3);
+  border: 1px solid var(--border, #30363d);
+  border-radius: 12px;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.55);
+  padding: 20px 22px;
+  width: min(560px, 100%);
+  max-height: 80vh;
+  overflow: auto;
+}
+/* Same fix as .modal-overlay.closing above. */
+.modal-box.closing {
+  animation: modalBoxOut 160ms cubic-bezier(0.4, 0, 1, 1);
+}
+.modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.modal-title { margin: 0 0 8px; font-size: 16px; font-weight: 650; }
+.modal-x {
+  background: transparent;
+  border: none;
+  color: var(--muted, #8b949e);
+  font-size: 15px;
+  line-height: 1;
+  padding: 4px 6px;
+  margin: -4px -6px 0 0;
+  border-radius: 6px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+/* BUG FIX/FEATURE: hover was plain neutral gray — a live request specifically
+   asked for danger-tinted treatment here too, matching how many OS close
+   buttons behave (e.g. the red-on-hover title-bar close button convention).
+   Kept as a HOVER-only tint rather than a permanent fill: this is a minimal
+   icon control users see on every single dialog, including completely
+   routine ones, so making it permanently red would be alarm fatigue, not
+   signal. Same underlying color family as .btn-danger, translucent rather
+   than solid to stay proportionate to how minor an icon button is. */
+.modal-x:hover { background: color-mix(in srgb, #a13d1f 22%, transparent); color: #e0653a; }
+.modal-message { font-size: 13.5px; line-height: 1.5; }
+.modal-details {
+  margin-top: 10px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  opacity: 0.9;
+  border-top: 1px solid var(--border, #30363d);
+  padding-top: 10px;
+}
+.modal-details a { color: var(--accent, #4f8cff); }
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 18px;
+}
+/* Semantic button colors, distinct from plain .primary -- a live report
+   pointed out that ONE color for every "confirm" action (cyan, used for
+   everything from "OK" to "Restart as Administrator") doesn't communicate
+   how consequential an action actually is. Four intents now: OK/confirm
+   (teal, see button.primary above), warning/critical (amber, for things
+   that need real attention but aren't destructive -- elevating, installing
+   a driver), danger/denial (burnt orange, for destructive or declining
+   choices), and neutral (plain, the default -- Cancel, dismiss).
+   BUG FIX: the first version of this used BRIGHT, high-saturation fills
+   (#e6a817, #e0653a) with dark text -- passed WCAG numerically, but a live
+   report specifically pushed back that bright saturated fills read as
+   glare regardless of the text color paired with them. Darkened both,
+   unified across themes (no more light-theme-specific override needed),
+   paired with white text -- comfortable rather than vivid, still WCAG AA:
+   warning 5.04:1, danger 6.56:1 against white. */
+.btn-warning {
+  background: #96650c; border-color: #96650c; color: #ffffff; font-weight: 600;
+}
+.btn-warning:hover { filter: brightness(1.15); }
+.btn-danger {
+  background: #a13d1f; border-color: #a13d1f; color: #ffffff; font-weight: 600;
+}
+.btn-danger:hover { filter: brightness(1.15); }
+.modal-actions button {
+  background: var(--panel-2, #21262d);
+  color: var(--text, #e6edf3);
+  border: 1px solid var(--border, #30363d);
+  border-radius: 7px;
+  padding: 7px 14px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.modal-actions button:hover { border-color: var(--accent, #4f8cff); }
+/* BUG FIX: this duplicated (and, being more specific than) the general
+   button.primary rule above -- .modal-actions button.primary always won
+   the CSS specificity contest, meaning the earlier darker-teal fix never
+   actually applied inside any modal at all, only outside one. Same
+   darker, muted color now, not re-derived separately -- one definition,
+   not two that can silently drift apart again. */
+.modal-actions button.primary {
+  background: #0f7a8c;
+  border-color: #0f7a8c;
+  color: #fff;
+  font-weight: 600;
+}
+/* BUG FIX: same specificity trap as button.primary above, just never
+   applied to these two — a live screenshot confirmed neither "Translate
+   to IPv6" nor "Restart as Administrator" showed ANY color at all, both
+   rendering as plain .modal-actions button gray. .modal-actions button
+   (element+class, specificity 0,1,1) unconditionally beats .btn-warning/
+   .btn-danger (a single class, specificity 0,1,0) — CSS specificity wins
+   over source order regardless of which rule is written later in the
+   file. Same fix: qualify the selector to match or exceed it. */
+.modal-actions button.btn-warning {
+  background: #96650c;
+  border-color: #96650c;
+  color: #ffffff;
+  font-weight: 600;
+}
+.modal-actions button.btn-danger {
+  background: #a13d1f;
+  border-color: #a13d1f;
+  color: #ffffff;
+  font-weight: 600;
+}
+
+/* NMAP-style port-state badge (open/closed/filtered), TCP mode hop table.
+   Distinct in meaning from the coloured status dot: that's about loss/
+   latency, this is specifically about what kind of TCP-layer evidence a
+   probe actually got. */
+.port-state {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  vertical-align: middle;
+  cursor: help;
+}
+.port-state.ps-open   { background: color-mix(in srgb, #2ecc71 22%, transparent); color: #2ecc71; }
+.port-state.ps-closed { background: color-mix(in srgb, #4f8cff 20%, transparent); color: #7aa9ff; }
+.port-state.ps-filtered { background: color-mix(in srgb, #e0a030 20%, transparent); color: #e0a030; }

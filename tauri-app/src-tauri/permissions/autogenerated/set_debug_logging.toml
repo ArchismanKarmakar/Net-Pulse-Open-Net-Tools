@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-debug-logging"
+description = "Enables the set_debug_logging command without any pre-configured scope."
+commands.allow = ["set_debug_logging"]
+
+[[permission]]
+identifier = "deny-set-debug-logging"
+description = "Denies the set_debug_logging command without any pre-configured scope."
+commands.deny = ["set_debug_logging"]

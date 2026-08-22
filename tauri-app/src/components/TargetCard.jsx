@@ -4,12 +4,30 @@ import Sparkline from './charts/Sparkline'
 import LatencyGraph from './charts/LatencyGraph'
 import { hopColor, niceCeil } from '../lib/format'
 
+// Motion's Reorder.Item listens for pointerdown anywhere on the card to
+// start a drag (see TargetPanel.jsx). That's what makes the whole card
+// draggable, not just the ⠿ handle — but it also means a mouse-down over
+// any text (to select and copy it) gets swallowed as a drag-start instead.
+// stopDrag() on a text element's own onPointerDown intercepts the event
+// before it bubbles to Motion's listener on the ancestor, so a
+// click-and-drag gesture over that text selects it normally instead —
+// everywhere else on the card is untouched, still draggable exactly as
+// before. A plain click still opens the target normally either way: this
+// only affects drag-start, not the separate click event that fires after.
+const stopDrag = (e) => e.stopPropagation()
+// Wraps a piece of copyable text: text cursor on hover (see .tc-select in
+// styles.css) and stopDrag so a select-and-copy gesture doesn't fight the
+// card's own drag-to-reorder.
+function Selectable({ as: Tag = 'span', className, children, ...rest }) {
+  return <Tag className={'tc-select' + (className ? ' ' + className : '')} onPointerDown={stopDrag} {...rest}>{children}</Tag>
+}
+
 function Metric({ label, value, unit, sub, danger, tone, hero }) {
   const cls = 'tc-metric-value' + (hero ? ' hero' : '') + (danger ? ' danger' : '') + (tone ? ' tone-' + tone : '')
   return (
     <div className={'tc-metric' + (hero ? ' tc-metric-hero' : '')}>
       <div className="tc-metric-label">{label}</div>
-      <div className={cls}>{value}{unit && <span className="tc-metric-unit">{unit}</span>}</div>
+      <Selectable as="div" className={cls}>{value}{unit && <span className="tc-metric-unit">{unit}</span>}</Selectable>
       {sub && <div className="tc-metric-sub muted">{sub}</div>}
     </div>
   )
@@ -18,6 +36,7 @@ function Metric({ label, value, unit, sub, danger, tone, hero }) {
 export default function TargetCard({
   t, compact, isSel,
   dragControls,
+  moveTarget,
   forceRecheckOne, pauseOne, removeTarget, openTarget,
   targetState, destLamp, pathLamp, destHopOf, familyLabel, fmt, STATE_LABEL,
   view, alertMs,
@@ -43,7 +62,7 @@ export default function TargetCard({
         <StatusLamps dest={destLamp(t)} path={pathLamp(t)} />
 
         <div className="tc-id">
-          <div className="tc-name">{t.name}{t.paused && <span className="muted"> · paused</span>}</div>
+          <div className="tc-name"><Selectable>{t.name}</Selectable>{t.paused && <span className="muted"> · paused</span>}</div>
         </div>
 
         {/* Mini path topology, then the metric readout — both collapse away
@@ -131,11 +150,16 @@ export default function TargetCard({
           not measurements of where something else landed. */}
       <div className="tc-subrow">
         <div className="tc-dest muted">
-          {t.dest_ip || '—'}<span>{familyLabel(t.family, t.config?.family)}</span>
+          <Selectable>{t.dest_ip || '—'}</Selectable><span>{familyLabel(t.family, t.config?.family)}</span>
+          {t.config?.protocol && t.config.protocol !== 'icmp' && (
+            <span className="tc-proto-badge" title={`Probing over ${t.config.protocol.toUpperCase()}, port ${t.config.destPort}`}>
+              {t.config.protocol.toUpperCase()}:{t.config.destPort}
+            </span>
+          )}
           <span className="tc-cadence"> · probing every {t.config?.probe}s</span>
         </div>
-        {t.error && <div className="tc-error">⚠ {t.error}</div>}
-        {!t.error && t.loopWarning && <div className="tc-error tc-warn-loop" title="Advisory — every hop is still measured normally">⚠ {t.loopWarning}</div>}
+        {t.error && <div className="tc-error"><Selectable as="span">⚠ {t.error}</Selectable></div>}
+        {!t.error && t.loopWarning && <div className="tc-error tc-warn-loop" title="Advisory — every hop is still measured normally"><Selectable as="span">⚠ {t.loopWarning}</Selectable></div>}
       </div>
 
       {/* min/avg/med/max/jit/pl readout — the compact sidebar's own tight
@@ -145,12 +169,12 @@ export default function TargetCard({
       {d && (
         <div className="tc-collapse-y">
           <div className="tc-compact-grid">
-            <span>min <b>{fmt(d.min)}</b></span>
-            <span>avg <b>{fmt(d.avg)}</b></span>
-            <span>med <b>{fmt(d.med)}</b></span>
-            <span>max <b>{fmt(d.max)}</b></span>
-            <span>jit <b>{fmt(d.jitter)}</b></span>
-            <span>pl <b className={d.loss > 0 ? 'danger' : ''}>{d.loss.toFixed(0)}%</b></span>
+            <Selectable>min <b>{fmt(d.min)}</b></Selectable>
+            <Selectable>avg <b>{fmt(d.avg)}</b></Selectable>
+            <Selectable>med <b>{fmt(d.med)}</b></Selectable>
+            <Selectable>max <b>{fmt(d.max)}</b></Selectable>
+            <Selectable>jit <b>{fmt(d.jitter)}</b></Selectable>
+            <Selectable>pl <b className={d.loss > 0 ? 'danger' : ''}>{d.loss.toFixed(0)}%</b></Selectable>
           </div>
         </div>
       )}

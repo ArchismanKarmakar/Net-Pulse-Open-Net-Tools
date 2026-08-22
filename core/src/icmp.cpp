@@ -122,7 +122,7 @@ std::optional<ParsedReply> parse_v4(const uint8_t* buf, size_t len) {
     size_t icmplen = len - ihl;
     uint8_t t = icmp[0];
     if (t == 0) { // echo reply
-        return ParsedReply{ReplyKind::EchoReply, be16(icmp + 4), be16(icmp + 6), {}};
+        return ParsedReply{ReplyKind::EchoReply, be16(icmp + 4), be16(icmp + 6), 1, {}};
     }
     if (t == 11 || t == 3) { // time exceeded / dest unreachable
         if (icmplen < 8) return std::nullopt;
@@ -131,9 +131,28 @@ std::optional<ParsedReply> parse_v4(const uint8_t* buf, size_t len) {
         if (innerlen < 20) return std::nullopt;
         size_t iihl = static_cast<size_t>(inner[0] & 0x0f) * 4;
         if (innerlen < iihl + 8) return std::nullopt;
+        uint8_t orig_proto = inner[9]; // IPv4 header byte 9 = protocol (1=ICMP, 6=TCP, 17=UDP)
         const uint8_t* orig = inner + iihl;
-        return ParsedReply{t == 11 ? ReplyKind::TimeExceeded : ReplyKind::Unreachable,
-                           be16(orig + 4), be16(orig + 6), parse_mpls_extensions(icmp, icmplen)};
+        ReplyKind kind = (t == 11) ? ReplyKind::TimeExceeded : ReplyKind::Unreachable;
+        auto mpls = parse_mpls_extensions(icmp, icmplen);
+        if (orig_proto == 6 || orig_proto == 17) {
+            // TCP/UDP embedded original — see ParsedReply::orig_proto's doc
+            // comment (icmp.hpp) for why this reads different bytes than
+            // the ICMP-embedded case below: bytes 0-1 are source port for
+            // both; bytes 2-3 are dest port (UDP) or unused-for-matching
+            // here (TCP); TCP additionally has a real sequence number at
+            // bytes 4-7 where UDP has length+checksum instead — matches
+            // probe_tcp.hpp's parse_tcp_in_icmp_v4 / probe_udp.hpp's
+            // parse_udp_in_icmp_v4, unified here into the single dispatch
+            // path every session's replies already flow through.
+            uint16_t src_port = be16(orig);
+            uint16_t second = (orig_proto == 6) ? be16(orig + 6) : be16(orig + 2);
+            return ParsedReply{kind, src_port, second, orig_proto, mpls};
+        }
+        // ICMP-embedded original (orig_proto == 1, or anything else
+        // unrecognized falls back to this — matches the pre-existing,
+        // long-proven behavior exactly).
+        return ParsedReply{kind, be16(orig + 4), be16(orig + 6), 1, mpls};
     }
     return std::nullopt;
 }
@@ -142,15 +161,22 @@ std::optional<ParsedReply> parse_v6(const uint8_t* buf, size_t len) {
     if (len < 8) return std::nullopt;
     uint8_t t = buf[0];
     if (t == 129) { // echo reply
-        return ParsedReply{ReplyKind::EchoReply, be16(buf + 4), be16(buf + 6), {}};
+        return ParsedReply{ReplyKind::EchoReply, be16(buf + 4), be16(buf + 6), 1, {}};
     }
     if (t == 3 || t == 1) { // time exceeded / dest unreachable
         const uint8_t* inner = buf + 8;
         size_t innerlen = len - 8;
-        if (innerlen < 48) return std::nullopt; // 40 (IPv6 hdr) + 8 (orig icmp)
+        if (innerlen < 48) return std::nullopt; // 40 (IPv6 hdr) + 8 (orig header's first 8 bytes)
+        uint8_t orig_proto = inner[6]; // IPv6 header byte 6 = Next Header (same numbering as v4's protocol field)
         const uint8_t* orig = inner + 40;
-        return ParsedReply{t == 3 ? ReplyKind::TimeExceeded : ReplyKind::Unreachable,
-                           be16(orig + 4), be16(orig + 6), parse_mpls_extensions(buf, len)};
+        ReplyKind kind = (t == 3) ? ReplyKind::TimeExceeded : ReplyKind::Unreachable;
+        auto mpls = parse_mpls_extensions(buf, len);
+        if (orig_proto == 6 || orig_proto == 17) {
+            uint16_t src_port = be16(orig);
+            uint16_t second = (orig_proto == 6) ? be16(orig + 6) : be16(orig + 2);
+            return ParsedReply{kind, src_port, second, orig_proto, mpls};
+        }
+        return ParsedReply{kind, be16(orig + 4), be16(orig + 6), 1, mpls};
     }
     return std::nullopt;
 }

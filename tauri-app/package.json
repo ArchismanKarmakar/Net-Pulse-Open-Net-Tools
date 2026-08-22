@@ -1,7 +1,7 @@
 {
   "name": "net-pulse-open-net-tools-tauri",
   "private": true,
-  "version": "0.9.5",
+  "version": "1.0.8",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -35,5 +35,8 @@
     "node": ">=20.19"
   },
   "license": "AGPL-3.0-or-later",
-  "author": "Archisman Karmakar"
+  "author": "Archisman Karmakar",
+  "overrides": {
+    "brace-expansion": "^5.0.9"
+  }
 }

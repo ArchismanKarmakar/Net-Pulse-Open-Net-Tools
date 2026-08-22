@@ -17,11 +17,22 @@
 
 #include "netpulse/icmp.hpp"
 #include "netpulse/transport.hpp"
+#include "netpulse/probe_icmp.hpp"
+#include "netpulse/probe_udp.hpp"
+#include "netpulse/probe_tcp.hpp"
+#include "netpulse/probe_http.hpp"
 #include "netpulse/stats.hpp"
 
 namespace netpulse {
 
 enum class FamilyPref { Auto, V4, V6 };
+// ICMP, TCP, UDP, and HTTP (plain, no TLS) are all fully implemented — see
+// run_udp()/run_tcp()/run_http()'s doc comments in session.cpp for each
+// one's specific mechanism. QUIC was considered and deliberately left out
+// (not exposed in the UI either) — it would need an actual QUIC library
+// integration (e.g. msquic/quiche/ngtcp2) and its own connection state
+// machine, a separate undertaking, not a variation on UDP mode.
+enum class Protocol { Icmp, Tcp, Udp, Http };
 
 struct Settings {
     double probe_interval = 1.0; // seconds
@@ -34,6 +45,8 @@ struct Settings {
     std::optional<double> focus_secs = 600.0;
     std::string source_addr; // optional local IP to bind (choose egress interface)
     std::set<uint8_t> paused_hops; // hops the user paused — skipped in send loop (cuts load)
+    Protocol protocol = Protocol::Icmp;
+    uint16_t dest_port = 33434; // TCP/UDP only — classic traceroute's historical UDP base port; also a reasonable TCP default probe target
     // Frankenstein-route guard tuning (see kLegacyMissThreshold/
     // kLegacyMissWindowSecs in session.cpp for the full mechanism). The
     // built-in defaults were tuned against a lossy consumer-ISP path; a
@@ -77,6 +90,43 @@ constexpr int kLoopAuditWindow = 1;
 uint8_t compute_max_hop(std::optional<uint8_t> dest_hop, std::optional<uint8_t> loop_at_hop,
                         uint8_t frontier, uint8_t max_hops);
 
+// UDP-mode's "give up waiting on this destination" threshold — see
+// run_udp()'s protocol_hint logic (session.cpp) and Snapshot::protocol_hint
+// above for the full rationale. Factored out as a pure function (same
+// reasoning as compute_max_hop above) so the threshold math is independently
+// unit-testable without a live socket. Always at least kUdpGiveUpMinSecs;
+// otherwise kUdpGiveUpSweeps full 1..max_hops passes at the configured probe
+// interval, whichever is larger — a target with a short interval or a small
+// max_hops shouldn't have to wait the bare minimum longer than that.
+constexpr double kUdpGiveUpMinSecs = 30.0;
+constexpr double kUdpGiveUpSweeps  = 3.0; // full 1..max_hops passes
+double udp_give_up_threshold(double probe_interval, uint8_t max_hops);
+
+// ICMP-mode silence-rebuild backoff — see the kSilenceRebuildMinSecs/
+// kDestSilenceRebuildMinSecs comment block in session.cpp for what triggers
+// a rebuild in the first place. That trigger is correctly gated (never
+// sooner than the base threshold) but was previously UNBOUNDED in how often
+// it could re-fire: a target whose destination is persistently unreachable
+// via this app's raw ICMP (see run()'s own silence-rebuild UI messaging)
+// re-triggers at the same flat cadence forever, however long that keeps
+// being true — which is exactly how a long-lived, otherwise-healthy session
+// accumulates an enormous, alarming-looking rebuild count over weeks of
+// uptime while adding socket-churn overhead that fixes nothing (rebuilding
+// doesn't change a REMOTE party's decision to stay silent, same reasoning
+// as UDP mode's protocol_hint above). This grows the retry interval with
+// each consecutive rebuild that didn't actually restore real replies,
+// capped at kSilenceBackoffCapSecs — same spirit as UDP's give-up
+// threshold, but backing off retry FREQUENCY rather than giving up
+// entirely, since ICMP mode (unlike UDP's Port-Unreachable dependency) can
+// and does recover on its own once whatever's blocking it clears. Factored
+// out as a pure function (same reasoning as compute_max_hop/
+// udp_give_up_threshold above) so the backoff math is independently
+// unit-testable without a live socket.
+constexpr double kSilenceBackoffCapSecs = 900.0; // 15 min — never wait longer than this between retries
+constexpr double kSilenceBackoffMult    = 1.5;   // growth factor per consecutive silence-triggered rebuild
+constexpr int    kSilenceBackoffCapAt   = 20;     // stop growing the exponent past this many — kSilenceBackoffCapSecs dominates well before this regardless
+double silence_backoff_threshold(double base_threshold, int consecutive_silence_rebuilds);
+
 // Public/private address classification — mirrors web/src/bgp.js's
 // isPublicIp() exactly. Exposed here (external linkage, defined in
 // session.cpp) so both the real probe loop and tests/test_core.cpp can call
@@ -100,6 +150,15 @@ struct SharedSample {
 struct SharedHopTable {
     std::shared_mutex mtx; // multiple concurrent adopters (readers) never block each other; publish (writer) is exclusive
     std::unordered_map<std::string, SharedSample> map; // key: source_addr "\x1f" predecessor "\x1f" responder_ip
+    // Secondary index over the same publishes, keyed by responder IP alone
+    // (last-seen timestamp only, no rtt/edge attribution) — see
+    // shared_last_seen_from()'s doc comment for what this is for. Kept as
+    // part of THIS table, updated by the same shared_publish_to() call that
+    // updates `map` above, rather than as a separate cache: it's the exact
+    // same underlying event (a real reply was published), just indexed a
+    // second way for a query `map` can't answer efficiently — "is this IP
+    // alive via *any* edge", not "alive via this specific edge".
+    std::unordered_map<std::string, double> ip_last_seen;
 };
 // Publish a real measurement. No-op for private/CGNAT or empty `ip` (see
 // is_public_ip) — those are never cross-target-cached.
@@ -110,6 +169,21 @@ void shared_publish_to(SharedHopTable& sh, const std::string& src, const std::st
 // for private/CGNAT/empty `ip`, no entry, same owner, or a stale entry.
 std::optional<double> shared_adopt_from(SharedHopTable& sh, const std::string& src, const std::string& predecessor,
                                         const std::string& ip, uint64_t self_session_id, double now, double max_age);
+// Last time ANY session (any source, any predecessor edge, including the
+// caller's own) published a real reply from `ip`, if within max_age —
+// std::nullopt for private/CGNAT/empty ip or nothing recent enough. This is
+// the read used to tell a stale hop apart from a genuinely-gone one: a hop
+// can legitimately go silent for ONE target's edge (asymmetric/ECMP per-flow
+// routing) while a different target's edge to the same public IP keeps
+// getting real replies — this answers "is anyone still hearing from it right
+// now", using the exact same publishes shared_adopt_from() already relies on
+// for send-suppression, not a second independently-maintained cache.
+std::optional<double> shared_last_seen_from(SharedHopTable& sh, const std::string& ip, double now, double max_age);
+// Process-global-singleton-backed wrapper around shared_last_seen_from(), for
+// callers outside session.cpp (e.g. stats.cpp's stale-hop display) that have
+// no SharedHopTable of their own and want the same table the real probe loop
+// publishes into.
+std::optional<double> shared_last_seen(const std::string& ip, double now, double max_age);
 
 // Anything that can own an ICMP id and receive replies addressed to it via
 // the shared registry/RX-dispatcher (see register_icmp_owner below and the
@@ -140,6 +214,37 @@ void register_icmp_owner(uint16_t icmp_id, IcmpOwner* owner);
 // it was already superseded) — safe to call unconditionally on teardown.
 void unregister_icmp_owner(uint16_t icmp_id, IcmpOwner* owner);
 
+// BUG FIX: allocate_flow_port_block() (probe.hpp) used to hand out one of
+// only 64 fixed port blocks via a blind round-robin counter, with zero
+// awareness of whether an earlier allocation was still actively in use.
+// After exactly 64 calls (trivially reached over a long-running session
+// with many targets — every MTR target and every Ping run each consume
+// one), the counter wraps and hands out a block that may still be fully
+// live, silently overwriting an unrelated, still-running session's
+// registry entries and misrouting its replies. This is the query that
+// makes it possible to actually check before committing to a block,
+// rather than trusting the counter alone. Cheap: one map lookup range,
+// same mutex the registry already uses for every register/unregister call.
+bool icmp_owner_port_in_use(uint16_t base_port, int span);
+
+// BUG FIX: every Session::run() variant (ICMP/UDP/TCP/HTTP, session.cpp)
+// explicitly starts the shared RX dispatcher thread before it can expect
+// register_icmp_owner() above to ever actually deliver anything — nothing
+// reads a pooled socket until this has been called at least once,
+// PROCESS-WIDE, by anyone. That call (`g_rx().ensure_started()`) lives in
+// an anonymous namespace in session.cpp and was never reachable from
+// outside it, which meant PingRun (ping_run.cpp, a separate translation
+// unit) never actually started the dispatcher itself — it only appeared to
+// work at all because, in the real app, some OTHER already-running
+// Session almost always already started it first. A genuinely standalone
+// PingRun — nothing else active in the process — would silently receive
+// nothing, forever, exactly the failure mode a live UDP-ping test
+// surfaced. Idempotent and cheap to call unconditionally (mirrors
+// RxDispatcher::ensure_started()'s own compare_exchange guard) — safe for
+// every caller to call every time rather than trying to reason about
+// whether "someone else already did."
+void ensure_rx_dispatcher_started();
+
 struct Snapshot {
     std::string target;
     std::optional<std::string> dest_ip;
@@ -167,6 +272,29 @@ struct Snapshot {
     std::vector<HopStat> hops;
     std::optional<uint8_t> dest_hop;
     std::vector<NewPoint> new_points;
+    // How many times the total-silence self-heal (see kSilenceRebuildMinSecs
+    // in session.cpp) has torn down and re-acquired this session's socket
+    // because too long had passed since ANY hop (including direct-echo to
+    // the destination) produced a real reply, plus when that last happened.
+    // Exists purely for visibility: a target that's been down a long time
+    // with no `error` set is ambiguous from the UI's side alone — is the
+    // engine actively retrying and simply not getting anything back (points
+    // at something outside this process: firewall/AV/ISP dropping THIS
+    // process's raw ICMP specifically, a real routing outage, etc.), or did
+    // something wedge and it's not trying at all? A nonzero, climbing count
+    // answers that question without needing engine logs.
+    int silence_rebuild_count = 0;
+    std::optional<double> last_any_reply_at;
+    // Advisory, non-fatal hint for a protocol-level condition the engine
+    // can't resolve by retrying — currently only set by run_udp() once a
+    // UDP-mode trace has had a fair, repeated chance across its whole TTL
+    // range to get a Port-Unreachable back from the destination and still
+    // hasn't. Unlike `error`, the hop table is still valid and stays
+    // visible (same rationale as loop_warning above) — this only explains
+    // *why* the destination may never resolve, since (unlike the ICMP
+    // silence watchdog) no amount of socket rebuilding fixes a destination
+    // that is silently dropping UDP instead of rejecting it.
+    std::optional<std::string> protocol_hint;
 };
 
 class Session : public IcmpOwner {
@@ -230,6 +358,39 @@ public:
 private:
     uint16_t next_seq();
     Snapshot snapshot(bool running, std::vector<NewPoint> new_points) const;
+    // Separate, deliberately simpler control loop for UDP mode — see its
+    // own doc comment in session.cpp for exactly why this isn't just
+    // another branch inside the main ICMP loop: UDP has no equivalent of
+    // ICMP's direct-echo optimization (a router isn't running a
+    // predictable service on a guessable port), so it stays in
+    // TTL-limited discovery-style probing for its entire lifetime rather
+    // than switching steady states the way ICMP mode does — different
+    // enough control flow that sharing one function would mean threading
+    // UDP-specific branches through logic (echo_silent, due_recheck,
+    // loop-audit-triggered legacy fallback) that's about a mechanism UDP
+    // mode never uses in the first place.
+    void run_udp(std::atomic<bool>* stop, std::atomic<bool>* paused,
+                 const std::function<void(const Snapshot&)>& on_update);
+    // TCP's own control loop — structurally closer to run_udp() than to
+    // the main ICMP loop (same reasoning: no direct-echo equivalent), but
+    // with one real difference run_udp() doesn't have: TCP hop-discovery
+    // replies still route through the shared ICMP registry (same as
+    // UDP), but TCP's OWN destination replies (SYN-ACK/RST) never touch
+    // that path at all — they're detected by polling ProbeTcp's own
+    // per-probe sockets directly (see ProbeTcp::poll_completions). Two
+    // genuinely different completion-detection mechanisms running side
+    // by side in the same loop, not one.
+    void run_tcp(std::atomic<bool>* stop, std::atomic<bool>* paused,
+                 const std::function<void(const Snapshot&)>& on_update);
+    // HTTP's own control loop — structurally almost identical to
+    // run_tcp() (same two-mechanism shape: ICMP-routed hop-discovery,
+    // socket-polled direct-probe completion), just using ProbeHttp
+    // instead of ProbeTcp for the direct probe, since ProbeHttp continues
+    // past a completed handshake to a real request/response cycle — see
+    // probe_http.hpp's top comment for why that's a genuinely different,
+    // stronger claim than TCP mode's "the port is open".
+    void run_http(std::atomic<bool>* stop, std::atomic<bool>* paused,
+                  const std::function<void(const Snapshot&)>& on_update);
 
     struct InFlight {
         uint8_t hop;
@@ -274,7 +435,18 @@ private:
     std::optional<uint8_t> loop_hop_;
     std::optional<uint8_t> loop_dup_at_;
     std::optional<uint8_t> dest_hop_; // hop index of the destination, once reached
+    // See Snapshot::silence_rebuild_count/last_any_reply_at's doc comment —
+    // members (not run()-local) for the same reason error_/loop_warning_
+    // aren't local: snapshot() reads them directly, and run()'s own
+    // last_any_reply_at local (the thing the silence watchdog actually
+    // compares against) needs a member twin to publish out to the UI.
+    int silence_rebuild_count_ = 0;
+    std::optional<double> last_any_reply_at_;
     uint8_t max_hop_seen_ = 0;        // furthest hop that has ever responded
+    // See Snapshot::protocol_hint's doc comment — member (not run_udp()-local)
+    // for the same reason error_/loop_warning_ aren't local: snapshot() reads
+    // it directly.
+    std::optional<std::string> protocol_hint_;
 
     // Every reply this session ever sees arrives here, pushed by the shared RX
     // dispatcher thread (Session::dispatch_incoming, session.cpp) after a

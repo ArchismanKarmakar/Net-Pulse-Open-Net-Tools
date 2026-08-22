@@ -38,5 +38,5 @@ tauri-app/src-tauri/Cargo.lock
 .mypy_cache/
 
 
-Unnecessary files
+# Unnecessary files
 step0_classifier.py

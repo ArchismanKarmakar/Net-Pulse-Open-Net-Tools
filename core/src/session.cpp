@@ -711,7 +711,6 @@ constexpr double kLoopAuditSecs = 8.0; // s — backoff cadence for hops at/beyo
 // discovery but does NOT answer a direct ping is detected after kEchoTestTries
 // misses and falls back to TTL-limited probing (its rate-limit loss is then
 // unavoidable — the same thing traceroute/mtr show for such a hop).
-constexpr uint8_t kDirectEchoTtl = 255; // max TTL for a direct hop ping — maximum survivability, always valid regardless of real path length
 constexpr int     kEchoTestTries = 4;  // direct misses (with no direct reply yet) before a hop is deemed echo-silent
 
 // Once a hop switches to direct-echo, its own TTL-elicited Time-Exceeded is no
@@ -1576,7 +1575,6 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
         // kDiscoveryDropCount settling replies clear quickly instead of taking
         // kDiscoveryDropCount·interval. Actual sends stay paced by the bucket.
         bool settling = have_dest && (now - dest_found_at) < kDestSettleSecs;
-        bool discovering = !have_dest || settling;
 
         // A hop is "answered" once any reply (echo or TTL-exceeded) has given it
         // an address; those don't need fast re-probing to be found.
@@ -1665,7 +1663,11 @@ void Session::run(std::atomic<bool>* stop, std::atomic<bool>* paused,
                 if (adopted) { soonest = (std::min)(soonest, nx); return; }
 
                 // Direct-echo measurement (the fix for shared-hop rate-limit
-                // loss, see kDirectEchoTtl above): once a hop's IP is known and
+                // loss — each ProbeStrategy's own send_direct_probe()
+                // independently hardcodes TTL 255 for exactly this reason,
+                // "always valid regardless of real path length"; see e.g.
+                // ProbeTcp::send_direct_probe, probe_tcp.cpp): once a hop's
+                // IP is known and
                 // it hasn't proven echo-silent, ping that IP directly full-TTL
                 // instead of eliciting a Time-Exceeded via *dest_. A due
                 // recheck, or an active loop audit, temporarily forces the

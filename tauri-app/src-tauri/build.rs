@@ -102,9 +102,27 @@ fn main() {
     // internally) fell back to a very old default (10.13) that can't
     // support it. Setting this BEFORE constructing the build below is what
     // actually matters — cc-rs reads MACOSX_DEPLOYMENT_TARGET from the
-    // environment to decide which -mmacosx-version-min flag to emit, so
-    // this is the single source of truth rather than an extra flag that
-    // could conflict with whatever cc-rs would otherwise add on its own.
+    // environment to decide which -mmacosx-version-min flag to emit.
+    //
+    // BUG FIX: this comment used to call the env var set here "the single
+    // source of truth" for the build's deployment target — that was wrong,
+    // confirmed by a real build showing the FINAL linked binary using
+    // -mmacosx-version-min=11.0.0, not this 10.15. The var set here only
+    // ever affects THIS process (build.rs) and whatever it spawns itself
+    // (cc-rs's own clang invocations, compiling the C++ engine) — it
+    // cannot reach backward to affect Cargo's own, separate rustc
+    // invocation for the actual link step, since that's a sibling process
+    // Cargo spawns directly, not a child of build.rs. The real source of
+    // truth is now each CI workflow's own job-level `env:` block (see
+    // e.g. tauri-release.yml's build job) — set at the top of the whole
+    // process tree, it's inherited by BOTH Cargo's link step and this
+    // script. This `.is_none()` fallback still matters for a LOCAL build
+    // invoked without that env block already set (e.g. a developer running
+    // `cargo tauri build` directly) — it's just no longer the only place
+    // this needs to be correct, and a local build that only relies on this
+    // fallback will still get the same 11.0-not-10.15 mismatch on its
+    // final linked binary unless the developer also sets the env var
+    // themselves before invoking cargo.
     if cfg!(target_os = "macos") && std::env::var_os("MACOSX_DEPLOYMENT_TARGET").is_none() {
         // SAFETY: this runs single-threaded, at the very start of the build
         // script, before any other code (including cc-rs's own build steps)
@@ -176,6 +194,25 @@ fn main() {
         println!("cargo:rustc-link-lib=ws2_32");
         println!("cargo:rustc-link-lib=iphlpapi");
         println!("cargo:rustc-link-lib=winmm");
+    } else if cfg!(target_os = "macos") {
+        println!("cargo:rustc-link-lib=pthread");
+        // BUG FIX: this was missing entirely, discovered only by an actual
+        // macOS CI build failure — `AudioServicesPlaySystemSound` (used by
+        // play_alert_sound(), netpulse_ffi.cpp, for the native OS alert
+        // sound on critical dialogs) is declared correctly via
+        // <AudioToolbox/AudioServices.h> and compiles fine, but linking
+        // failed: "Undefined symbols for architecture arm64:
+        // _AudioServicesPlaySystemSound". Tauri's own build links AppKit,
+        // WebKit, Security, and several other frameworks it needs for its
+        // own windowing/webview — none of which happen to pull in
+        // AudioToolbox as a side effect, since nothing else in this binary
+        // uses it. This project's own build.rs has to link the frameworks
+        // ITS OWN code needs explicitly; it never did for this one, because
+        // this code path had never actually been compiled for macOS before
+        // (no macOS cross-compiler was available while writing it — see
+        // this project's own `docs/` notes on what could and couldn't be
+        // verified without real hardware for each platform).
+        println!("cargo:rustc-link-lib=framework=AudioToolbox");
     } else {
         println!("cargo:rustc-link-lib=pthread");
     }

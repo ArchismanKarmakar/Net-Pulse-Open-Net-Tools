@@ -2,6 +2,62 @@
 
 ## 1.0.8
 
+### macOS build: missing AudioToolbox framework link
+
+The very first real macOS CI build of this codebase (obfuscated-build.yml)
+failed at the link stage: `Undefined symbols for architecture arm64:
+_AudioServicesPlaySystemSound`. The core engine itself linked fine on macOS
+(its own CI job passed) — this was isolated to `netpulse_ffi.cpp`'s
+`play_alert_sound()`, whose macOS branch calls `AudioServicesPlaySystemSound`
+(declared correctly via `<AudioToolbox/AudioServices.h>`, compiling without
+complaint) without `build.rs` ever telling the linker about the
+`AudioToolbox` framework it lives in. Tauri's own build links AppKit,
+WebKit, Security, and several other frameworks it needs for its own
+windowing/webview — none of which happen to pull in AudioToolbox as a side
+effect, since nothing else in the binary uses it. This project's own
+build.rs has to link the frameworks its own code needs explicitly, and
+never did for this one — this exact code path had no macOS cross-compiler
+available while it was being written, so this was the first time it was
+ever actually compiled for the platform. Fixed by adding the missing
+`cargo:rustc-link-lib=framework=AudioToolbox` directive specifically for
+`cfg!(target_os = "macos")`, distinct from the generic Unix branch Linux
+also falls into (which correctly needs no such framework at all, since its
+own `play_alert_sound()` branch is a deliberate no-op).
+
+Two more warnings visible in that same build log — unused `discovering`
+(session.cpp) and an orphaned `kDirectEchoTtl` constant, both flagged by
+clang's warning set but not GCC's, which is what `verify.sh`'s own
+warning-budget check runs against — were confirmed genuinely dead (not a
+functional gap: each `ProbeStrategy`'s own `send_direct_probe()` already
+independently hardcodes TTL 255 with the identical reasoning comment) and
+removed.
+
+### macOS build: deployment target never actually reached the final linked binary
+
+The same build log also showed the final link command using
+`-mmacosx-version-min=11.0.0`, not the `10.15` `build.rs` sets via
+`MACOSX_DEPLOYMENT_TARGET` — a real, separate bug from the AudioToolbox one
+above. Root cause: `build.rs`'s `std::env::set_var(...)` only ever affects
+`build.rs`'s own process and whatever it spawns itself (`cc`-rs's clang
+invocations, compiling the C++ engine) — it cannot reach backward to affect
+Cargo's own, separate `rustc` invocation for the actual link step, since
+that's a sibling process Cargo spawns directly, not a child of `build.rs`.
+Every macOS build had silently been linking against whichever deployment-
+target default the Rust target triple happens to have (11.0 for
+`aarch64-apple-darwin`, since ARM64 Mac hardware never existed before that
+version) rather than the `10.15` `tauri.conf.json`'s own
+`macOS.minimumSystemVersion` claims the app supports — and, for the release
+workflow's universal binary specifically, meant the x86_64 and aarch64
+slices within the same binary could disagree on their own deployment
+targets, not just disagree with the app's stated one. Fixed by setting
+`MACOSX_DEPLOYMENT_TARGET` in each CI workflow's own job-level `env:` block
+(`obfuscated-build.yml`, `tauri-ci.yml`, `tauri-release.yml`,
+`tauri-canary-build.yml`) — the actual top of the process tree, correctly
+inherited by both Cargo's link step and `build.rs`. `build.rs`'s own
+fallback still matters for a local build invoked without that env block
+already set; its comment now says so explicitly rather than calling itself
+"the single source of truth", which this real build proved it wasn't.
+
 ### Single source of truth for the version number
 
 `/VERSION` at the repo root is now the one canonical version string, with

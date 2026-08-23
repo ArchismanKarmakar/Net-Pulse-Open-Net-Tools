@@ -40,3 +40,15 @@ tauri-app/src-tauri/Cargo.lock
 
 # Unnecessary files
 step0_classifier.py
+
+
+# Key Files
+netpulse_signing_private_key.pem
+netpulse_signing_private_key_password.txt
+netpulse_signing_public_key.pem
+netpulse_signing_public_key.pub
+netpulse_signing_public_key.pub.asc
+netpulse_signing_public_key.pub.asc.sig
+
+netpulse_updater.key
+netpulse_updater.key.pub

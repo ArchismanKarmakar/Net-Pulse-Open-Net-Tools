@@ -66,7 +66,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRCOEZEMDdBQTQxQTU2ODIKUldTQ1ZocWtldENQUzVFVHFXNWp5citiVGs2WjVJNXIwZElISzJZUlR0d1c1SURVcXh6NFVHaFEK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY4N0YwMzg0NTFERkZBMzYKUldRMit0OVJoQU4vYUtnSTVza1ZadGlCd1BlU2VMbTR6QWNWQTVHVDAxZGtTdGtteThzWmszOFgK",
       "endpoints": [
         "https://github.com/ArchismanKarmakar/Net-Pulse-Open-Net-Tools/releases/latest/download/latest.json"
       ],

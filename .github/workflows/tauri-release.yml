@@ -16,7 +16,10 @@ name: Tauri Release
 #      can confirm their download is byte-identical to what CI produced.
 #   4. If the Tauri-equivalent signing secrets are ever added later (once a
 #      certificate is obtained), tauri-action picks them up automatically —
-#      see the `env:` block below, which is a no-op today (unset secrets).
+#      see the build job's "Set signing env" step below. If they're not
+#      configured, the build still succeeds unsigned, and the "Diagnose
+#      per-OS updater artifact presence" step says so explicitly rather
+#      than leaving that as a silent gap.
 
 on:
   push:
@@ -44,10 +47,37 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
+    # See obfuscated-build.yml's identical env block for the full reasoning
+    # — this is the actual release build, so this fix matters here most of
+    # all: without it, every macOS release binary links against whatever
+    # deployment-target default the aarch64-apple-darwin/x86_64-apple-
+    # darwin rustc target happens to have, not the 10.15 tauri.conf.json's
+    # own `macOS.minimumSystemVersion` claims the app supports.
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '10.15'
+      # Same pattern as the publish job's own HAS_GPG_KEY/HAS_SIGNING_KEY —
+      # needed here too now, for the new per-OS signing diagnostic below.
+      HAS_SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+      HAS_SIGNING_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD != '' }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # BUG FIX: this used to have no `ref:` at all, meaning the
+          # checkout always used whatever the triggering ref happened to
+          # be -- for a plain tag push that IS the tag, correctly, but for
+          # the workflow_dispatch path this file's own header comment
+          # documents ("Existing tag to (re)build a release for"), the
+          # dispatch is issued against `main` (see tauri-version-
+          # release.yml's own dispatch call: `--ref main`), so this
+          # silently built whatever main's CURRENT head looked like on
+          # every workflow_dispatch run, not the actual historical tagged
+          # commit -- a real correctness bug for the one scenario this
+          # input exists to support at all. Explicit now: the tag when
+          # one was given, falling back to whatever ref actually triggered
+          # this run otherwise (a plain tag push).
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -62,6 +92,21 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          # BUG FIX: this used to install only the runner's own native
+          # target. macos-latest runners are Apple Silicon (aarch64) as of
+          # GitHub's own runner image updates — with no explicit target,
+          # tauri-action builds ONLY an arm64 binary, which does not run on
+          # an Intel Mac at all (not "runs slower via Rosetta" — Tauri does
+          # not produce a fat/universal binary unless explicitly told to,
+          # so an Intel machine simply cannot execute an arm64-only
+          # executable). That directly contradicts "identical across every
+          # OS" — an Intel Mac user would get no working build at all from
+          # this release. Installing both targets here is what makes the
+          # universal-binary build below possible; a plain `stable`
+          # install only ever has the host's own target regardless of
+          # what tauri-action is later asked to build.
+          targets: ${{ matrix.os == 'macos-latest' && 'x86_64-apple-darwin,aarch64-apple-darwin' || '' }}
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -72,24 +117,6 @@ jobs:
         working-directory: tauri-app
         run: npm ci
 
-      # ---- Package + sign-if-possible ------------------------------------
-      # Build-only mode: omit tagName/releaseId/releaseName so tauri-action
-      # just builds and packages — it does NOT try to create or upload to a
-      # GitHub Release itself (that would need its own GITHUB_TOKEN, which
-      # isn't set here, and would collide with the separate publish job
-      # below that already owns release creation via softprops/action-gh-release).
-      # Signing env vars are unset today (no certificate/keys yet — see
-      # CODE_SIGNING.md) so this produces unsigned artifacts with no error;
-      # set the secrets once a cert exists and this becomes a genuinely
-      # signed build automatically.
-      # IMPORTANT: these vars must be genuinely ABSENT when no cert secret is
-      # configured, not present-but-empty. `env: APPLE_CERTIFICATE: ${{ secrets.X }}`
-      # sets APPLE_CERTIFICATE="" when the secret doesn't exist — tauri-action
-      # then still attempts `security import` with that empty blob, which
-      # fails as `SecKeychainItemImport: One or more parameters passed to a
-      # function were not valid` instead of cleanly skipping signing. Same
-      # root cause as the earlier electron-builder CSC_LINK bug — exporting
-      # conditionally via GITHUB_ENV avoids ever setting an empty secret var.
       - name: Set signing env (only if secrets are configured)
         shell: bash
         run: |
@@ -124,27 +151,150 @@ jobs:
           set_multiline_env WINDOWS_CERTIFICATE "${{ secrets.WINDOWS_CERTIFICATE }}"
           set_multiline_env WINDOWS_CERTIFICATE_PASSWORD "${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}"
 
+      # FEATURE: diagnoses, on THIS step rather than several minutes and
+      # three OS jobs later at the merge step, whether TAURI_SIGNING_
+      # PRIVATE_KEY actually reached this job at all — never prints the
+      # key itself, only whether it's present/non-empty and how long it is
+      # (a real minisign private key is a predictable, multi-hundred-
+      # character block; a suspiciously short "present" value usually
+      # means something got truncated or pasted wrong, not that it's
+      # missing entirely). The single most common reason a secret that is
+      # genuinely configured in the repo still shows up empty HERE: GitHub
+      # has two different secret scopes — plain repository-level secrets
+      # (Settings → Secrets and variables → Actions) and per-Environment
+      # secrets (Settings → Environments → <name> → Secrets) — and an
+      # Environment secret is ONLY visible to a job that explicitly opts
+      # into that environment via `environment: <name>` at the job level.
+      # This workflow's jobs don't declare one (deliberately not guessed
+      # here — getting an environment name wrong can be worse than not
+      # setting one at all, since some environments have required-reviewer
+      # protection rules that would pause the whole run waiting for
+      # approval) — so if the key was configured under Environments rather
+      # than plain Actions secrets, this step is what will make that
+      # visible immediately, rather than the confusing "it's configured
+      # but nothing worked" symptom a live report described.
+      - name: Diagnose signing key visibility (no secret values ever printed)
+        shell: bash
+        run: |
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY is NOT visible to this job. If it's genuinely configured in the repo, the most common cause is that it's set as an ENVIRONMENT secret (Settings -> Environments -> <name> -> Secrets) rather than a plain repository Actions secret (Settings -> Secrets and variables -> Actions) — Environment secrets are only visible to a job that declares 'environment: <name>', which this workflow's jobs currently don't. Updater artifacts will not be produced this run."
+          else
+            echo "TAURI_SIGNING_PRIVATE_KEY is visible to this job (length: ${#TAURI_SIGNING_PRIVATE_KEY} characters)."
+          fi
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]; then
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD is not set — fine if the key was generated without a password; Tauri treats an empty password as 'no password', not an error."
+          fi
+
+      # ---- Package + sign-if-possible ------------------------------------
+      # BUG FIX: this used to omit tagName/releaseId entirely ("build-only
+      # mode"), on the theory that latest.json was something `tauri build`
+      # itself produces locally on disk (createUpdaterArtifacts: true),
+      # which this step's own "Collect installer files" step further down
+      # could just find and copy — same as any other bundle output. That
+      # theory was wrong, confirmed directly against tauri-action's own
+      # source (upload-version-json.ts): latest.json is constructed BY
+      # tauri-action ITSELF, entirely in memory, only as part of its own
+      # upload-to-release logic — `tauri build` never writes it to disk at
+      # all, regardless of whether signing succeeded. A real build log
+      # proved this precisely: signing genuinely succeeded ("Finished 1
+      # updater signature at ...exe.sig"), yet tauri-action's own very next
+      # line was "No releaseId or tagName provided, skipping all
+      # uploads..." — the exact, documented message tauri-action's README
+      # says appears when tagName/releaseId are both omitted, which is
+      # deliberately what "build-only mode" does. No version of the signing
+      # key, its password, or the merge script downstream could ever have
+      # produced a latest.json under the old setup, because tauri-action's
+      # own manifest-generation code path was never being reached at all.
+      #
+      # Fixed by giving tauri-action what its own documented pattern for a
+      # multi-OS matrix release requires: GITHUB_TOKEN plus tagName, with
+      # releaseDraft: true so the three concurrent OS jobs safely share one
+      # not-yet-public release rather than each trying to publish
+      # separately. tauri-action finds-or-creates that draft release itself
+      # and merges each platform's entry into one real, multi-platform
+      # latest.json natively — the exact job this workflow's own custom
+      # merge-latest-json.mjs script was trying to reimplement, and could
+      # never succeed at no matter how correct its own logic was, since it
+      # depended on a local latest.json file that was never going to exist.
       - name: tauri-action build
         id: tauri-build
         uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: tauri-app
+          tagName: ${{ inputs.tag || github.ref_name }}
+          releaseName: Net Pulse — Open Net Tools ${{ inputs.tag || github.ref_name }}
+          releaseDraft: true
+          prerelease: false
+          # Set once here (all three concurrent OS jobs pass the same,
+          # identical text, so whichever one's request actually "wins" the
+          # release-creation race produces the same result either way) —
+          # keeps the publish job below from needing its own separate
+          # step just to set the body on a release that already exists.
+          releaseBody: |
+            **Unsigned build notice:** this project does not yet have a paid
+            code-signing certificate (Windows Authenticode / Apple Developer
+            ID) — see [`CODE_SIGNING.md`](https://github.com/${{ github.repository }}/blob/main/CODE_SIGNING.md)
+            for why, and for the plan to add one. Windows SmartScreen and
+            macOS Gatekeeper will show a warning on first run; this is
+            expected for an unsigned free/open-source app and is not a
+            statement about the app's safety.
+
+            To verify what you downloaded:
+            - **Checksums:** compare against `SHA256SUMS.txt` in this release.
+            - **Build provenance:** every file here carries a GitHub
+              attestation proving it was built by this exact public workflow
+              run from this exact commit — verify with:
+              `gh attestation verify <downloaded-file> --owner ${{ github.repository_owner }}`
+            - **Source:** this entire build is reproducible from the public
+              workflow at `.github/workflows/tauri-release.yml` in this repository.
+          # BUG FIX: see the Rust-toolchain step's own comment above for
+          # the full reasoning — without this, macOS produces an arm64-only
+          # binary that an Intel Mac cannot run at all. `universal-apple-
+          # darwin` is Tauri's own supported target string for this exact
+          # case: it builds the Rust/C++ core twice (once per architecture,
+          # via the two rustup targets installed above) and combines them
+          # with `lipo` into one fat binary automatically. Windows and
+          # Linux are unaffected by this arg (Tauri only special-cases it
+          # on macOS); left unset there so those two jobs build exactly as
+          # they did before.
+          args: ${{ matrix.os == 'macos-latest' && '--target universal-apple-darwin' || '' }}
+
+      # BUG FIX: this used to search the LOCAL bundle directory
+      # (tauri-app/src-tauri/target/release/bundle) for latest.json — which
+      # can never find it, with or without a signing key, since (see the
+      # "tauri-action build" step's own doc comment above) latest.json is
+      # never written to disk at all; tauri-action constructs and uploads
+      # it entirely in memory, directly to the release. This would have
+      # reported "missing" on every single run regardless of whether
+      # signing actually worked. Checking the release itself now, via the
+      # same GITHUB_TOKEN the build step already has, which is what
+      # actually reflects whether tauri-action's own upload succeeded.
+      - name: Diagnose per-OS updater artifact presence
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${{ inputs.tag || github.ref_name }}" --repo "${{ github.repository }}" --json assets \
+              --jq '.assets[].name' 2>/dev/null | grep -qx 'latest.json'; then
+            echo "latest.json IS present on the draft release — tauri-action's own upload for ${{ matrix.os }} succeeded (or an earlier matrix job's did; this file is shared across the whole release, not per-OS)."
+          elif [ "${{ env.HAS_SIGNING_KEY }}" != "true" ]; then
+            echo "::notice::No latest.json on the release yet — expected, no TAURI_SIGNING_PRIVATE_KEY is configured (see CODE_SIGNING.md)."
+          else
+            echo "::warning::No latest.json on the release even though TAURI_SIGNING_PRIVATE_KEY IS configured. Likely causes: (1) the key requires a password and TAURI_SIGNING_PRIVATE_KEY_PASSWORD is wrong or missing (currently set: ${{ env.HAS_SIGNING_PASSWORD }}) — Tauri only treats a genuinely EMPTY password as valid for a key that was generated WITHOUT one. (2) the private key doesn't match tauri.conf.json's updater.pubkey. (3) the secret's encoding got mangled in transit — regenerate and re-paste via 'gh secret set TAURI_SIGNING_PRIVATE_KEY < path/to/key'. Search the 'tauri-action build' step's own log above for 'sign' for the actual error if one occurred."
+          fi
 
       - name: List produced bundle artifacts (diagnostic)
         shell: bash
         run: find tauri-app/src-tauri/target/release/bundle -maxdepth 2 -type f | sort
 
-      # Ship installers/archives AND the updater artifacts (createUpdaterArtifacts:
-      # true in tauri.conf.json makes `tauri build` also emit a per-platform
-      # `latest.json` + `.sig` file per bundle, alongside the installer) — NOT
-      # intermediate unpacked-app directories or debug metadata. Previously this
-      # glob only grabbed the installers, so every OS job's latest.json/.sig was
-      # silently thrown away here and never reached the release at all — the
-      # direct reason the updater endpoint 404s. Each OS's own latest.json only
-      # describes ITS OWN platform (e.g. windows-latest's only has
-      # "windows-x86_64"); renamed with an OS prefix here so all three survive
-      # side by side once downloaded into the same publish job below, where
-      # merge-latest-json.mjs combines them into one real multi-platform manifest.
+      # Ship installers/archives and their .sig signature files (not
+      # latest.json — see the "tauri-action build" step's own doc comment
+      # for why that's never a local file at all: tauri-action uploads it
+      # directly to the draft release in memory, and it's pulled from
+      # there in the publish job below instead) and not intermediate
+      # unpacked-app directories or debug metadata.
       - name: Collect installer files
         shell: bash
         run: |
@@ -156,8 +306,6 @@ jobs:
             -type f -exec cp -v {} collected/ \;
           find tauri-app/src-tauri/target/release/bundle -name '*.sig' -type f \
             -exec cp -v {} collected/ \;
-          find tauri-app/src-tauri/target/release/bundle -name 'latest.json' -type f \
-            -exec cp -v {} "collected/latest-${{ matrix.os }}.json" \;
           ls -la collected
 
       - name: Upload artifact
@@ -177,9 +325,25 @@ jobs:
       # the one bit we need ("is a key configured") into a plain job env var
       # instead, decided once at job level where `secrets.*` IS accessible.
       HAS_GPG_KEY: ${{ secrets.RELEASE_GPG_PRIVATE_KEY != '' }}
+      # CODE_SIGNING.md is explicit that this project doesn't have a real
+      # signing key configured yet ("future implementation"), which used to
+      # mean createUpdaterArtifacts genuinely couldn't produce a latest.json
+      # on any of the three OS jobs — not a bug, the documented, current
+      # state of the project at the time. Kept for the "download latest.json"
+      # step below, which needs to tell apart "genuinely no key configured,
+      # so no manifest exists on the release at all" (expected, continue
+      # without one) from "a key IS configured but the release still has no
+      # manifest" (a real, unexpected problem worth failing loudly over).
+      HAS_SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # Same fix as the build job's checkout above -- this job also
+          # needs the tag's own commit (e.g. its CODE_SIGNING.md content
+          # referenced in the release body below), not whatever ref
+          # happened to trigger the run.
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - name: Download all installer artifacts
         uses: actions/download-artifact@v4
@@ -191,16 +355,34 @@ jobs:
       - name: List downloaded artifacts (diagnostic)
         run: ls -la release/
 
-      # Combine each OS's own single-platform latest.json into the one
-      # multi-platform manifest the updater's endpoint actually needs — see
-      # merge-latest-json.mjs's own doc comment for why this can't just be
-      # "upload whichever one tauri-cli produced". Runs before checksums so
-      # latest.json itself is covered by SHA256SUMS.txt too.
-      - name: Merge per-OS updater manifests into one latest.json
+      # BUG FIX: this step used to run a custom script (merge-latest-
+      # json.mjs) that combined each OS's own single-platform latest.json —
+      # collected as a workflow artifact by the build job — into one real,
+      # multi-platform manifest. That script's own logic was correct, but
+      # it was solving a problem that no longer exists the way it assumed:
+      # latest.json was never a file `tauri build` writes to disk at all
+      # (confirmed against tauri-action's own source — see the "tauri-
+      # action build" step's doc comment above), so there was never
+      # anything for the build job to collect as a workflow artifact in
+      # the first place, regardless of whether signing succeeded. Now that
+      # the build job gives tauri-action a real tagName + GITHUB_TOKEN,
+      # tauri-action itself creates the draft release and merges every
+      # platform's entry into ONE real latest.json there, natively, as
+      # each of the three matrix jobs finishes — this step just downloads
+      # that already-correct file, rather than trying to reconstruct it
+      # from parts that were never actually collected.
+      - name: Download latest.json from the draft release (if signing produced one)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          node .github/scripts/merge-latest-json.mjs release release/latest.json \
-            "${{ github.repository }}" "${{ inputs.tag || github.ref_name }}"
-          rm -f release/latest-*.json
+          if gh release download "${{ inputs.tag || github.ref_name }}" \
+              --repo "${{ github.repository }}" --pattern 'latest.json' --dir release --clobber 2>/dev/null; then
+            echo "Downloaded latest.json from the draft release."
+          elif [ "${{ env.HAS_SIGNING_KEY }}" != "true" ]; then
+            echo "No latest.json on the release — expected, no TAURI_SIGNING_PRIVATE_KEY is configured (see CODE_SIGNING.md). Installers will still publish; auto-update is unavailable until signing is set up."
+          else
+            echo "::warning::No latest.json on the release even though TAURI_SIGNING_PRIVATE_KEY IS configured — see the build jobs' own 'Diagnose per-OS updater artifact presence' step for the likely cause (password mismatch, key/pubkey mismatch, or secret corruption)."
+          fi
 
       - name: Generate SHA256SUMS.txt
         run: node .github/scripts/checksums.mjs release release/SHA256SUMS.txt
@@ -224,30 +406,30 @@ jobs:
         with:
           subject-path: 'release/*'
 
-      - name: Create / update GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
-          name: Net Pulse — Open Net Tools ${{ inputs.tag || github.ref_name }}
-          draft: false
-          prerelease: false
-          generate_release_notes: true
-          files: |
-            release/*
-          body: |
-            **Unsigned build notice:** this project does not yet have a paid
-            code-signing certificate (Windows Authenticode / Apple Developer
-            ID) — see [`CODE_SIGNING.md`](https://github.com/${{ github.repository }}/blob/main/CODE_SIGNING.md)
-            for why, and for the plan to add one. Windows SmartScreen and
-            macOS Gatekeeper will show a warning on first run; this is
-            expected for an unsigned free/open-source app and is not a
-            statement about the app's safety.
-
-            To verify what you downloaded:
-            - **Checksums:** compare against `SHA256SUMS.txt` in this release.
-            - **Build provenance:** every file here carries a GitHub
-              attestation proving it was built by this exact public workflow
-              run from this exact commit — verify with:
-              `gh attestation verify <downloaded-file> --owner ${{ github.repository_owner }}`
-            - **Source:** this entire build is reproducible from the public
-              workflow at `.github/workflows/tauri-release.yml` in this repository.
+      # BUG FIX: this used to be softprops/action-gh-release@v2, whose job
+      # was to CREATE the release — but the build job now already created
+      # it (as a draft, via tauri-action) before this job ever runs. Asking
+      # a second, different tool to "create or update" the same tag's
+      # release has real, documented failure modes for exactly this
+      # scenario (softprops/action-gh-release issues #445 and #403, both
+      # "Validation Failed: already_exists" against a release created by
+      # something else) — and the fix for reusing an existing draft
+      # release correctly only landed in v3.0.2; this file was pinned to
+      # v2, which predates it. Rather than carry that risk into a step
+      # that's the last thing standing between a build and a public
+      # release, using the official `gh` CLI directly instead: `gh release
+      # upload` unambiguously operates on an release that must already
+      # exist (no create-vs-update ambiguity at all), and `gh release
+      # edit --draft=false` is the well-established, reliable way to
+      # publish a draft. Both are pre-installed on every GitHub-hosted
+      # runner. The release body was already set once, on creation, by the
+      # build job's own tauri-action call (see its releaseBody input) —
+      # no need to set it a second time here.
+      - name: Upload checksums/attestation files and publish the release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ inputs.tag || github.ref_name }}" release/SHA256SUMS.txt* \
+            --repo "${{ github.repository }}" --clobber
+          gh release edit "${{ inputs.tag || github.ref_name }}" \
+            --repo "${{ github.repository }}" --draft=false --prerelease=false

@@ -32,7 +32,38 @@ functional gap: each `ProbeStrategy`'s own `send_direct_probe()` already
 independently hardcodes TTL 255 with the identical reasoning comment) and
 removed.
 
-### macOS build: deployment target never actually reached the final linked binary
+### Release pipeline: entire release blocked on an updater signing key that doesn't exist yet
+
+With the macOS build fixes above landing, the first real release run (all
+three OS installers built successfully) still failed — this time in the
+publish job, at "Merge per-OS updater manifests into one latest.json": zero
+`latest-*.json` manifests were found among the downloaded artifacts. Root
+cause, and confirmed by `CODE_SIGNING.md`'s own heading ("future
+implementation") and text ("nothing here is wired up yet"): this project
+genuinely does not have a `TAURI_SIGNING_PRIVATE_KEY` configured yet —
+`createUpdaterArtifacts` correctly refuses to produce a `latest.json`/`.sig`
+on any platform without one, since an unsigned update manifest can't be
+trusted. That's expected, not a bug — but the merge script unconditionally
+hard-failed the whole job whenever it found nothing to merge, which meant
+this correct, documented "not set up yet" state was blocking **every
+release from ever publishing**, installers included, even though the
+installers themselves build and work completely fine without a signing key
+at all. Confirmed none of the downstream steps (checksums, GPG signing,
+build-provenance attestation, the GitHub Release itself) actually require
+`latest.json` to exist — they all operate generically on `release/*`.
+Fixed by mirroring the job's existing `HAS_GPG_KEY` pattern (secrets can't
+be read in a step-level `if:`, so the one bit needed — "is a key
+configured" — is decided once at job level instead) into a new
+`HAS_SIGNING_KEY`, and having the merge script tell apart two genuinely
+different situations: no key configured at all (expected — warn and exit
+0, installers still publish, just without auto-update) vs. a key IS
+configured and still produced nothing (a real, unexpected problem — e.g. a
+malformed key — still exits 1 exactly as before). Verified all three paths
+execute correctly (no-key-skip, key-configured-failure, and the normal
+merge-succeeds case) before trusting it — and caught a real typo of my own
+along the way, a malformed escape sequence that would have made the script
+a syntax error on every future invocation of the failure path.
+
 
 The same build log also showed the final link command using
 `-mmacosx-version-min=11.0.0`, not the `10.15` `build.rs` sets via

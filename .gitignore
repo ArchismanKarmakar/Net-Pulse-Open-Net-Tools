@@ -50,5 +50,5 @@ netpulse_signing_public_key.pub
 netpulse_signing_public_key.pub.asc
 netpulse_signing_public_key.pub.asc.sig
 
-netpulse_updater.key
-netpulse_updater.key.pub
+netpulse-updater.key
+netpulse-updater.key.pub

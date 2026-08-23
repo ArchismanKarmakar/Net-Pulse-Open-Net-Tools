@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.9
+## 1.1.2
 
 ### macOS build: missing AudioToolbox framework link
 
@@ -482,7 +482,7 @@ had been directly audited before — several real, concrete gaps found:
 
 ## 0.9.5 revised
 
-The work below shipped as part of the 1.0.9 release above rather than
+The work below shipped as part of the 1.1.2 release above rather than
 getting its own dedicated version bump.
 
 ### Ping tool: rebuilt on the native engine, not an OS subprocess

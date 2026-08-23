@@ -32,37 +32,71 @@ functional gap: each `ProbeStrategy`'s own `send_direct_probe()` already
 independently hardcodes TTL 255 with the identical reasoning comment) and
 removed.
 
-### Release pipeline: entire release blocked on an updater signing key that doesn't exist yet
+### Release pipeline: `latest.json` never existed at all, regardless of signing
 
 With the macOS build fixes above landing, the first real release run (all
-three OS installers built successfully) still failed — this time in the
-publish job, at "Merge per-OS updater manifests into one latest.json": zero
-`latest-*.json` manifests were found among the downloaded artifacts. Root
-cause, and confirmed by `CODE_SIGNING.md`'s own heading ("future
-implementation") and text ("nothing here is wired up yet"): this project
-genuinely does not have a `TAURI_SIGNING_PRIVATE_KEY` configured yet —
-`createUpdaterArtifacts` correctly refuses to produce a `latest.json`/`.sig`
-on any platform without one, since an unsigned update manifest can't be
-trusted. That's expected, not a bug — but the merge script unconditionally
-hard-failed the whole job whenever it found nothing to merge, which meant
-this correct, documented "not set up yet" state was blocking **every
-release from ever publishing**, installers included, even though the
-installers themselves build and work completely fine without a signing key
-at all. Confirmed none of the downstream steps (checksums, GPG signing,
-build-provenance attestation, the GitHub Release itself) actually require
-`latest.json` to exist — they all operate generically on `release/*`.
-Fixed by mirroring the job's existing `HAS_GPG_KEY` pattern (secrets can't
-be read in a step-level `if:`, so the one bit needed — "is a key
-configured" — is decided once at job level instead) into a new
-`HAS_SIGNING_KEY`, and having the merge script tell apart two genuinely
-different situations: no key configured at all (expected — warn and exit
-0, installers still publish, just without auto-update) vs. a key IS
-configured and still produced nothing (a real, unexpected problem — e.g. a
-malformed key — still exits 1 exactly as before). Verified all three paths
-execute correctly (no-key-skip, key-configured-failure, and the normal
-merge-succeeds case) before trusting it — and caught a real typo of my own
-along the way, a malformed escape sequence that would have made the script
-a syntax error on every future invocation of the failure path.
+three OS installers built successfully) still failed in the publish job, at
+"Merge per-OS updater manifests into one latest.json": zero manifests found.
+
+The first diagnosis here was wrong, and worth recording honestly rather
+than quietly editing out: `CODE_SIGNING.md`'s own heading ("future
+implementation") made it look like a missing signing key was the cause, and
+a first fix made the merge step tell apart "no key configured" (expected)
+from "key configured but still failed" (a real problem) — reasonable
+handling for a genuinely different bug, but not this one. A real build log,
+requested specifically to settle it, proved that theory wrong directly:
+signing had genuinely succeeded (`Finished 1 updater signature at
+...exe.sig`), yet the very next line from `tauri-action` itself was `No
+releaseId or tagName provided, skipping all uploads...`.
+
+Tracing that message into `tauri-action`'s own source confirmed the actual
+root cause: `latest.json` is never a file `tauri build` writes to disk at
+all — `createUpdaterArtifacts: true` only makes it emit the `.sig`
+signature files. `latest.json` is constructed by `tauri-action` itself,
+entirely in memory, exclusively as part of its own upload-to-release logic,
+which requires `tagName`/`releaseId`. This project's build job never
+passed either (deliberately, on the theory that `latest.json` was some
+other local build output the "Collect installer files" step further down
+could just find and copy — it never could, since it never existed on disk
+to begin with). No version of the signing key, its password, or the merge
+script downstream could ever have produced a `latest.json`, regardless of
+how correct any of their own logic was, because `tauri-action`'s manifest-
+generation code path was never being reached at all — with or without a
+signing key.
+
+Fixed by switching to `tauri-action`'s own documented pattern for a multi-
+OS matrix release: `GITHUB_TOKEN` + `tagName` + `releaseDraft: true`,
+letting each of the three concurrent OS jobs safely share one draft release
+that `tauri-action` finds-or-creates and merges every platform's entry into
+one real `latest.json` natively — the exact job the project's own custom
+`merge-latest-json.mjs` script was trying to reimplement, and could never
+succeed at no matter how correct its own logic was, since it depended on a
+local file that was never going to exist. That script is now genuinely
+unused and was removed rather than left as dead code.
+
+This changed the shape of the whole release pipeline, not just one step —
+`softprops/action-gh-release` (the tool that used to create the release)
+was removed too: with the build job now creating the release itself via
+`tauri-action`, asking a second, different tool to "create or update" the
+same tag has real, documented failure modes for exactly this scenario
+(`softprops/action-gh-release` issues #445 and #403, both `already_exists`
+against a release created by something else — and the fix for reusing an
+existing draft correctly only landed in v3.0.2, while this file was pinned
+to v2). Replaced with the official `gh` CLI directly for the publish job's
+final step: `gh release upload` unambiguously requires an already-existing
+release (no create-vs-update ambiguity at all), and `gh release edit
+--draft=false` reliably publishes it.
+
+Two real mistakes were caught and fixed while making this change, both
+before it shipped: a `str_replace` edit that inserted the new, correctly-
+configured `tauri-action build` step without removing the old one, briefly
+leaving two copies of the same step in the file (caught by re-grepping for
+step names immediately after the edit, not assumed correct); and a job-
+level `permissions: contents: write` block that would have silently
+*removed* the `id-token`/`attestations` permissions the same job's build-
+provenance-attestation step depends on, since GitHub Actions job-level
+permissions override the workflow-level ones rather than adding to them,
+not something either would have been flagged by YAML validation alone.
 
 
 The same build log also showed the final link command using

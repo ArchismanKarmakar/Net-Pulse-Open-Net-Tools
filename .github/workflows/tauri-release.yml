@@ -41,12 +41,45 @@ concurrency:
 
 jobs:
   build:
-    name: build installer (${{ matrix.os }})
+    name: build installer (${{ matrix.artifact_name }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # BUG FIX: macOS used to be a single 'macos-latest' entry building
+      # `--target universal-apple-darwin` — but real CI runs proved that
+      # combination genuinely doesn't produce updater artifacts (repeatedly
+      # confirmed: signing succeeds, the raw .app and the .dmg both build
+      # fine, but the bundler's own "Bundling .../.app.tar.gz (updater)"
+      # step never runs at all, regardless of the tauri.conf.json `targets`
+      # array's contents or order — two different config changes here were
+      # each tested against real macOS CI runs and neither changed this
+      # bundler behavior even slightly, which is what ruled out a config
+      # problem and pointed at the universal-build path itself). Switched
+      # to tauri-action's own official example workflow pattern instead
+      # (see its README) — two separate architecture-specific macOS jobs,
+      # not one universal one. Trade-off: this ships an aarch64 .dmg and an
+      # x86_64 .dmg as two separate downloads rather than one universal
+      # file that runs on both — a real trade-off, but one an official,
+      # documented, working pattern makes, rather than a workaround for an
+      # unconfirmed bundler bug.
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
+        include:
+          - os: windows-latest
+            artifact_name: windows-latest
+            target_args: ''
+            rust_target: ''
+          - os: macos-latest
+            artifact_name: macos-aarch64
+            target_args: '--target aarch64-apple-darwin'
+            rust_target: 'aarch64-apple-darwin'
+          - os: macos-latest
+            artifact_name: macos-x86_64
+            target_args: '--target x86_64-apple-darwin'
+            rust_target: 'x86_64-apple-darwin'
+          - os: ubuntu-latest
+            artifact_name: ubuntu-latest
+            target_args: ''
+            rust_target: ''
     # See obfuscated-build.yml's identical env block for the full reasoning
     # — this is the actual release build, so this fix matters here most of
     # all: without it, every macOS release binary links against whatever
@@ -93,20 +126,15 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          # BUG FIX: this used to install only the runner's own native
-          # target. macos-latest runners are Apple Silicon (aarch64) as of
-          # GitHub's own runner image updates — with no explicit target,
-          # tauri-action builds ONLY an arm64 binary, which does not run on
-          # an Intel Mac at all (not "runs slower via Rosetta" — Tauri does
-          # not produce a fat/universal binary unless explicitly told to,
-          # so an Intel machine simply cannot execute an arm64-only
-          # executable). That directly contradicts "identical across every
-          # OS" — an Intel Mac user would get no working build at all from
-          # this release. Installing both targets here is what makes the
-          # universal-binary build below possible; a plain `stable`
-          # install only ever has the host's own target regardless of
-          # what tauri-action is later asked to build.
-          targets: ${{ matrix.os == 'macos-latest' && 'x86_64-apple-darwin,aarch64-apple-darwin' || '' }}
+          # BUG FIX: this used to unconditionally install BOTH aarch64 and
+          # x86_64 targets whenever matrix.os == 'macos-latest', because a
+          # single job built both via --target universal-apple-darwin. Now
+          # that macOS is two separate, architecture-specific jobs (see the
+          # matrix's own doc comment above for why), each job only needs
+          # its own single target — matrix.rust_target is empty for
+          # Windows/Linux (rustup's default host target is already correct
+          # there) and set to exactly one Darwin target per macOS job.
+          targets: ${{ matrix.rust_target }}
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -249,17 +277,14 @@ jobs:
               `gh attestation verify <downloaded-file> --owner ${{ github.repository_owner }}`
             - **Source:** this entire build is reproducible from the public
               workflow at `.github/workflows/tauri-release.yml` in this repository.
-          # BUG FIX: see the Rust-toolchain step's own comment above for
-          # the full reasoning — without this, macOS produces an arm64-only
-          # binary that an Intel Mac cannot run at all. `universal-apple-
-          # darwin` is Tauri's own supported target string for this exact
-          # case: it builds the Rust/C++ core twice (once per architecture,
-          # via the two rustup targets installed above) and combines them
-          # with `lipo` into one fat binary automatically. Windows and
-          # Linux are unaffected by this arg (Tauri only special-cases it
-          # on macOS); left unset there so those two jobs build exactly as
-          # they did before.
-          args: ${{ matrix.os == 'macos-latest' && '--target universal-apple-darwin' || '' }}
+          # BUG FIX: this used to build a single universal-apple-darwin
+          # binary for macOS, which real CI runs proved doesn't reliably
+          # produce updater artifacts (see the matrix strategy's own doc
+          # comment above for the full evidence). matrix.target_args now
+          # directly carries each job's own single-architecture flag —
+          # '--target aarch64-apple-darwin' or '--target x86_64-apple-
+          # darwin' for the two macOS jobs, empty for Windows/Linux.
+          args: ${{ matrix.target_args }}
 
       # BUG FIX: this used to search the LOCAL bundle directory
       # (tauri-app/src-tauri/target/release/bundle) for latest.json — which
@@ -278,7 +303,7 @@ jobs:
         run: |
           if gh release view "${{ inputs.tag || github.ref_name }}" --repo "${{ github.repository }}" --json assets \
               --jq '.assets[].name' 2>/dev/null | grep -qx 'latest.json'; then
-            echo "latest.json IS present on the draft release — tauri-action's own upload for ${{ matrix.os }} succeeded (or an earlier matrix job's did; this file is shared across the whole release, not per-OS)."
+            echo "latest.json IS present on the draft release — tauri-action's own upload for ${{ matrix.artifact_name }} succeeded (or an earlier matrix job's did; this file is shared across the whole release, not per-job)."
           elif [ "${{ env.HAS_SIGNING_KEY }}" != "true" ]; then
             echo "::notice::No latest.json on the release yet — expected, no TAURI_SIGNING_PRIVATE_KEY is configured (see CODE_SIGNING.md)."
           else
@@ -311,7 +336,14 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.os }}-installer
+          # BUG FIX: this used to be matrix.os-based ('macos-latest-
+          # installer') — harmless with one job per OS, but with macOS now
+          # split into two architecture-specific jobs sharing the same
+          # matrix.os value, both would upload to the identical artifact
+          # name and collide (actions/upload-artifact rejects a duplicate
+          # name outright rather than silently merging or overwriting).
+          # matrix.artifact_name is unique per job across the whole matrix.
+          name: ${{ matrix.artifact_name }}-installer
           path: collected/*
           if-no-files-found: error
 

@@ -70,11 +70,20 @@ jobs:
             rust_target: ''
           - os: macos-latest
             artifact_name: macos-aarch64
-            target_args: '--target aarch64-apple-darwin'
+            # BUG FIX: explicit --bundles, alongside --target, not just
+            # relying on tauri.conf.json's own `targets` array — a recent
+            # (Nov 2025), confirmed-working real CI config for this exact
+            # scenario (separate arch-specific macOS jobs, updater
+            # artifacts required) passes bundles this way explicitly.
+            # `targets` array changes alone (adding "app", reordering it
+            # before "dmg") were both tried against real CI runs first and
+            # neither changed this warning at all — this is a genuinely
+            # different mechanism, not another variation of the same one.
+            target_args: '--target aarch64-apple-darwin --bundles dmg,app'
             rust_target: 'aarch64-apple-darwin'
           - os: macos-latest
             artifact_name: macos-x86_64
-            target_args: '--target x86_64-apple-darwin'
+            target_args: '--target x86_64-apple-darwin --bundles dmg,app'
             rust_target: 'x86_64-apple-darwin'
           - os: ubuntu-latest
             artifact_name: ubuntu-latest
@@ -281,9 +290,11 @@ jobs:
           # binary for macOS, which real CI runs proved doesn't reliably
           # produce updater artifacts (see the matrix strategy's own doc
           # comment above for the full evidence). matrix.target_args now
-          # directly carries each job's own single-architecture flag —
-          # '--target aarch64-apple-darwin' or '--target x86_64-apple-
-          # darwin' for the two macOS jobs, empty for Windows/Linux.
+          # directly carries each job's own architecture flag plus, for
+          # the two macOS jobs specifically, an explicit '--bundles
+          # dmg,app' (see the matrix's own doc comment on those two
+          # entries for why that's there, not just tauri.conf.json's
+          # `targets` array) — empty for Windows/Linux.
           args: ${{ matrix.target_args }}
 
       # BUG FIX: this used to search the LOCAL bundle directory

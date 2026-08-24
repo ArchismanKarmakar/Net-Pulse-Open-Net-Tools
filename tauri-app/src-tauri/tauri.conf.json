@@ -42,7 +42,8 @@
       "nsis",
       "appimage",
       "deb",
-      "dmg"
+      "dmg",
+      "app"
     ],
     "createUpdaterArtifacts": true,
     "icon": [

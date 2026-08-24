@@ -321,9 +321,24 @@ jobs:
             echo "::warning::No latest.json on the release even though TAURI_SIGNING_PRIVATE_KEY IS configured. Likely causes: (1) the key requires a password and TAURI_SIGNING_PRIVATE_KEY_PASSWORD is wrong or missing (currently set: ${{ env.HAS_SIGNING_PASSWORD }}) — Tauri only treats a genuinely EMPTY password as valid for a key that was generated WITHOUT one. (2) the private key doesn't match tauri.conf.json's updater.pubkey. (3) the secret's encoding got mangled in transit — regenerate and re-paste via 'gh secret set TAURI_SIGNING_PRIVATE_KEY < path/to/key'. Search the 'tauri-action build' step's own log above for 'sign' for the actual error if one occurred."
           fi
 
+      # BUG FIX: this hardcoded target/release/bundle — correct for
+      # Windows/Linux (no explicit --target, so Cargo uses the plain
+      # target/release/ path), but wrong for the two macOS jobs, which now
+      # pass an explicit --target (see the matrix strategy's own doc
+      # comment on why: universal-apple-darwin doesn't reliably produce
+      # updater artifacts, architecture-specific builds do). An explicit
+      # --target always makes Cargo nest output under target/<triple>/
+      # release/ instead of target/release/ directly — this diagnostic
+      # step's own `find` on the old path failed outright ("No such file
+      # or directory"), which — since nothing here tolerates that failure
+      # — took the whole job down even though the actual build, signing,
+      # and upload to the release had already succeeded completely by this
+      # point. Searching from target/ itself and filtering by path pattern
+      # finds the bundle dir correctly either way, without needing to
+      # know or construct the exact intermediate path per job.
       - name: List produced bundle artifacts (diagnostic)
         shell: bash
-        run: find tauri-app/src-tauri/target/release/bundle -maxdepth 2 -type f | sort
+        run: find tauri-app/src-tauri/target -path '*/release/bundle/*' -type f | sort
 
       # Ship installers/archives and their .sig signature files (not
       # latest.json — see the "tauri-action build" step's own doc comment
@@ -336,11 +351,16 @@ jobs:
         run: |
           mkdir -p collected
           shopt -s nullglob
-          find tauri-app/src-tauri/target/release/bundle \
+          # BUG FIX: same target/<triple>/release/ nesting issue as the
+          # diagnostic step immediately above — see its own comment for
+          # the full reasoning. Same fix here: search from target/ and
+          # filter by path pattern instead of assuming the bundle dir
+          # sits directly under target/release/.
+          find tauri-app/src-tauri/target -path '*/release/bundle/*' \
             \( -name '*.exe' -o -name '*.msi' -o -name '*.dmg' -o -name '*.app.tar.gz' \
                -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) \
             -type f -exec cp -v {} collected/ \;
-          find tauri-app/src-tauri/target/release/bundle -name '*.sig' -type f \
+          find tauri-app/src-tauri/target -path '*/release/bundle/*' -name '*.sig' -type f \
             -exec cp -v {} collected/ \;
           ls -la collected
 

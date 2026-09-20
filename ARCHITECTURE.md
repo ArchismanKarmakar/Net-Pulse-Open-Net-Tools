@@ -146,7 +146,7 @@ mutex-protected `deque<Incoming>` — then notifies `inbox_cv_`.
 
 `IcmpOwner` is a small abstract interface (`session.hpp`) with one method,
 `push_incoming(const Incoming&)`; `Session` implements it, and so does
-`PingRun` (`ping_run.hpp` — the standalone Ping tool's engine, §11's file
+`PingRun` (`ping_run.hpp` — the standalone Ping tool's engine, §12's file
 map). The registry itself only ever deals in `IcmpOwner*`, not `Session*` —
 that's what lets the Ping tool share this exact socket pool and dispatcher
 rather than needing its own thread or its own registry.
@@ -210,15 +210,18 @@ unavoidable, exactly what `mtr`/`tracert` would show for it. This is a
 one-way fallback per hop-identity; a route flap (different device answers)
 clears it (see §6).
 
-**Periodic re-confirmation (`kHopRecheckSecs = 45s`).** Once a hop is on
-direct-echo, its TTL-elicited identity is no longer probed every round — so a
-silent mid-session reroute (a different device now answers at this position)
-would go unnoticed forever, since we'd just keep pinging the *old* device's
-IP. Every 45s, one legacy TTL-limited probe is sent instead, re-confirming (or
-updating) the hop's real address — deliberately rare (well under 3 probes/sec
-even summed across 100 targets sharing a hop) and, unlike the interval
-measurement, **never satisfied by shared-hop adoption** (§4) since its whole
-point is independent re-verification.
+**Periodic re-confirmation (`hop_recheck_secs()`, 30s by default).** Once a
+hop is on direct-echo, its TTL-elicited identity is no longer probed every
+round — so a silent mid-session reroute (a different device now answers at
+this position) would go unnoticed forever, since we'd just keep pinging the
+*old* device's IP. Every `hop_recheck_secs()` (a process-wide runtime
+default — 30s out of the box, changeable from the GUI's Settings window
+without a rebuild; see `set_default_recheck_tuning`, session.hpp, and §6's
+own note below), one legacy TTL-limited probe is sent instead, re-confirming
+(or updating) the hop's real address — deliberately rare (well under 3
+probes/sec even summed across 100 targets sharing a hop) and, unlike the
+interval measurement, **never satisfied by shared-hop adoption** (§4) since
+its whole point is independent re-verification.
 
 ---
 
@@ -257,7 +260,7 @@ struct SharedHopTable {
 takes a `shared_lock` (read) — a read-mostly table under many concurrent
 adopters never serializes them against each other.
 
-### Gate 1 — public IPs only
+### Gate 1 — public IPs always; private IPs when a real source disambiguates them
 
 A **private/CGNAT** address (`192.168.x`, `10.x`, `100.64/10`, link-local,
 ULA, …) is only unambiguous **within one routing domain**. The exact same
@@ -269,16 +272,54 @@ blindly sharing one's RTT for the other would silently attribute a
 measurement to the wrong hardware. A **public** IP has no such ambiguity — it
 is globally unique by the internet's own addressing invariant — so
 cross-target sharing of a public hop's measurement is always safe in
-principle.
+principle, regardless of `source`.
 
 `is_public_ip()` (`session.cpp`, external linkage, mirrors
 `web/src/bgp.js`'s `isPublicIp()` exactly — same exclusion ranges: `10/8`,
 `127/8`, `169.254/16`, `172.16–31/12`, `192.168/16`, CGNAT `100.64/10`, IPv6
-`fe80::/10`, `fc00::/7`) gates **both** `shared_publish_to` and
-`shared_adopt_from`. Private hops (including the user's own router) are
-still measured — direct-echo still applies, no rate-limit risk there since it
-never elicits a control-plane error — they're just never cross-target-cached,
-so a private-IP collision can never cross-contaminate.
+`fe80::/10`, `fc00::/7`) still classifies public vs. private exactly as
+before. What changed is what happens to the private case.
+
+**BUG FIX — private hops used to be excluded from the cache outright,
+regardless of `source`.** That was overly conservative: the cache key
+already includes a `source` component (`(source_addr, predecessor,
+responder_ip)`), and `source_addr` genuinely does disambiguate two different
+routing domains *when it's set* — the ambiguity only exists because most
+targets never explicitly bind an egress interface, leaving `source_addr`
+empty for the common case, which collapses every session onto the same key
+component regardless of which interface the OS actually routes them
+through.
+
+The fix keeps public IPs cacheable unconditionally, and makes private/CGNAT
+IPs cacheable **too, but only alongside a non-empty `source`** — see
+`is_cacheable_ip()` (rejects only genuinely meaningless values: empty/`"*"`,
+loopback, unspecified, link-local — link-local specifically can't be
+disambiguated by `source` at all, since it's identical on every interface by
+definition) and `cache_gate(ip, source)` (the actual combined rule) in
+`session.cpp`. The `source` fed into `shared_publish`/`shared_adopt` is now
+`Session::effective_cache_source(configured_source)`: the session's
+explicit `source_addr` when set, else `local_egress_` if `resolve()` managed
+to determine one, else empty (falls back to the original public-only
+behavior for that session — safe by construction, never wrong, just
+conservative).
+
+`local_egress_` (`local_egress_ip()`, `transport.cpp`) is the standard "UDP
+`connect()` trick": open a throwaway `SOCK_DGRAM` socket, `connect()` it to
+the real resolved destination (this **never sends a packet** — UDP
+`connect()` only consults the routing table and records which local address
+it would use), read that decision back via `getsockname()`, close the
+socket. That's the OS's own routing table answering "which interface would
+traffic to this destination actually leave from" — the same decision the
+real probes get — so two sessions whose destinations route out different
+interfaces (physical NIC vs. VPN adapter, two default gateways, …) get
+different, correctly-disambiguating keys with zero user configuration,
+while sessions that genuinely share an egress (the common, valuable case)
+correctly collapse onto one cache entry — including for their private hops
+now, not just their public ones. Private hops (including the user's own
+router) were always *measured* either way; the only thing that changed is
+whether other targets on the same real egress can now share that
+measurement instead of each probing the same router redundantly, exactly
+like public hops already could.
 
 ### Gate 2 — key on the *edge*, not just the node
 
@@ -311,32 +352,46 @@ now get **separate** entries, so a genuine fast/slow difference between the
 two paths is preserved as real data instead of one path's number silently
 overwriting the other's.
 
-**Finding the predecessor robustly.** The naive approach —
-`hops_[hop-1].address()` — breaks the moment hop-1 doesn't answer a
-TTL-limited probe (many real routers silently forward without ever
-generating Time-Exceeded, while still forwarding fine). If hop-1 is
-unresolved, that does **not** mean the whole predecessor chain is unknown —
-hop-2 (or further back) may well be resolved and is the correct, stable
-predecessor. `predecessor_of()` therefore walks backward from `hop-1` down to
-hop 1 and uses the **nearest resolved** hop's address, falling back to the
-sentinel `"SRC"` only if *no* lower hop has ever resolved:
+**Finding the predecessor.** The naive approach — `hops_[hop-1].address()` —
+looks fragile the moment hop-1 doesn't answer a TTL-limited probe (many real
+routers silently forward without ever generating Time-Exceeded, while still
+forwarding fine), which might suggest falling back to the nearest *already-
+resolved* hop further back as a stand-in. **That fallback is deliberately
+NOT used**, for the same reason the edge-keying fix above exists in the
+first place: using the nearest resolved hop as a stand-in collapses every
+target whose immediate predecessor happens to be unresolved onto whichever
+earlier hop DID resolve, even though two targets can genuinely diverge at
+that unresolved hop and reach different next hops — they'd wrongly share one
+cache entry and stomp each other's real measurements. Instead,
+`predecessor_of()` looks at hop-1 only, and if it hasn't resolved, returns a
+sentinel keyed to that specific missing depth (`"UNKN-<h>"`), not the shared
+`"SRC"` sentinel reserved for hop 1 itself:
 
 ```cpp
 auto predecessor_of = [&](uint8_t hop) -> std::string {
-    for (uint8_t h = hop; h-- > 1;) {           // h = hop-1, hop-2, ..., 1
-        auto it = hops_.find(h);
-        if (it != hops_.end() && it->second.address()) return *it->second.address();
-    }
-    return kSharedHopSrcSentinel;                // "SRC" — nothing below this hop has ever resolved
+    if (hop <= 1) return shared_hop_src_sentinel();   // "SRC" — this IS hop 1
+    uint8_t h = hop - 1;
+    auto it = hops_.find(h);
+    if (it != hops_.end() && it->second.address()) return *it->second.address();
+    return "UNKN-" + std::to_string(h);               // distinct per unresolved depth
 };
 ```
 
-Without this walk-back, a route whose hop-1 happens to be silent would get a
-*different* (sentinel-based) key than the exact same route once hop-1 starts
-answering — splitting one stable cache entry into two — and could
-coincidentally collide with another target whose *own* hop-1 is silent for an
-unrelated reason, since both would fall back to the same `"SRC"` sentinel at
-the same responder.
+Per-depth sentinels mean two targets that both have an unresolved hop-1 (for
+unrelated reasons, or because they've genuinely diverged before hop 1
+resolves) don't collide either — they get `"UNKN-1"` each, as part of a key
+that also includes their own `responder_ip`, which differs if they've truly
+diverged.
+
+**BUG FIX (protocol parity):** this exact logic lives in **four** places —
+one `predecessor_of` per probe loop (ICMP, UDP, TCP, HTTP; see
+`Session::run()`/`run_udp()`/`run_tcp()`/`run_http()`, `session.cpp`) — since
+`SharedHopTable` is keyed identically regardless of which protocol
+discovered the hop. The ICMP copy had this fix; the other three had NOT been
+updated to match and still used the walk-back-to-nearest-resolved-hop
+version this section argues against, meaning UDP/TCP/HTTP-mode targets were
+exposed to exactly the cross-contamination hazard ICMP-mode targets were
+already protected from. All four are now identical.
 
 ### Attribution and ownership safety
 
@@ -360,6 +415,39 @@ it simply stops publishing fresh samples — the entry goes stale within about
 one interval, every adopter falls back to real probing on its own, and the
 *true* loss becomes visible again. There is no separate "ownership handoff"
 logic needed; staleness alone makes this self-healing.
+
+### BUG FIX: "stale, live via another target" firing with only one target running
+
+The stale-hop display (`stats.cpp`'s `HopStats::compute()`) uses a second,
+lighter-weight query, `shared_last_seen_from()`, to answer "is *anyone*
+still hearing real replies from this exact responder IP right now" —
+independent of the edge-keyed `map` above, since a hop can legitimately go
+silent on ONE target's specific edge (asymmetric/ECMP per-flow routing)
+while a *different* target's edge to the same public IP keeps getting real
+replies. This backs the GUI's "(stale, live via another target)" badge.
+
+That query used to be answered from a flat `ip_last_seen: unordered_map<ip,
+timestamp>` index with no publisher attribution at all — "has anyone,
+including me, published from this IP in the last 30s". A hop's own last real
+reply is recorded as `stale_since` at the exact moment it goes stale, so it
+is *always* inside that 30s window by construction — meaning this check
+would routinely report "seen elsewhere" using nothing but the hop's own
+immediately-prior reply, even with a single target running and no other
+session ever having touched that IP. Reported live and confirmed exactly
+this way.
+
+Fixed by giving the index owner attribution too
+(`IpLastSeen{ts, owner_session_id}`) and having `shared_last_seen_from()`
+take the querying session's own id, excluding an entry whose owner is the
+caller itself — the same owner-exclusion `shared_adopt_from()` already
+applies to RTT adoption above, now applied consistently to the "seen
+elsewhere" read as well. `stats.cpp` passes `HopStats::target_id_` (the same
+id `Session::id_` publishes under) as the caller's own id. The legitimate
+case — a genuinely different session's edge to the same IP still getting
+real replies — is unaffected: verified with dedicated `tests/test_core.cpp`
+cases (self-publish-then-self-query sees nothing; a different session's
+publish is still surfaced; `max_age` expiry still applies regardless of
+owner).
 
 ---
 
@@ -510,8 +598,11 @@ real loop will, every time.
 
 **Scoping the self-heal correctly.** A clean reply only clears the loop state
 when it's *at or beyond* the current `loop_at_hop` — an unrelated earlier
-hop's routine 45s recheck (§3) coming back clean proves nothing about the
-actual loop boundary and must not clear it prematurely. The loop state is
+hop's routine periodic recheck (§3) coming back clean proves nothing about the
+actual loop boundary and must not clear it prematurely (the recheck cadence
+this refers to is now runtime-configurable — see §6's note below — but the
+scoping rule itself doesn't depend on what that cadence currently is). The
+loop state is
 also unconditionally cleared the moment the real destination is genuinely
 reached (`dest_hop_` set) — once the destination is known, discovery no
 longer consults `loop_at_hop` at all (`compute_max_hop`'s early return), so a
@@ -537,6 +628,90 @@ if (hs.address() && *hs.address() != inc.from) {
 This is untouched by any of the pillars above — none of them change the
 *trigger* condition, only what runs alongside it (the loop re-scan and the
 edge-keyed cache re-publish, both driven off the same reply).
+
+### The OTHER route-change case: a silent new device, not a replying one
+
+The flap-detection above only fires when a legacy probe gets a reply from a
+*different* address. There's a second, harder case: a route changes and the
+new device at that position simply **drops** the legacy TTL-elicited probe
+instead of replying with any address at all. Nothing in the flap path above
+ever runs, so the *old* address — still a real, globally-routable IP — keeps
+sitting in `hops_` and keeps answering direct-echo probes aimed at it,
+producing a hop that blends two different physical routes (nicknamed the
+"Frankenstein hop" in the code). Once a hop is echo-confirmed, its own
+TTL-elicited Time-Exceeded is normally probed only rarely (`hop_recheck_secs()`
+— 30s by default, see §3's note above and the GUI's Settings window)
+precisely so this case is still checked for, just cheaply.
+
+**Guarded wipe.** A hop's legacy-probe misses are counted (`legacy_miss`),
+and once `legacy_miss_threshold_default()` (2 by default) of them happen at
+least `hop_recheck_secs()` (30s by default — the two are always kept equal)
+apart, the hop's address is wiped and rediscovered from scratch — gated on
+the hop's own recent loss staying below
+`kGuardedWipeMaxRecentLossPct` (a hop that's already looking unhealthy isn't
+"falsely healthy," so it's left alone rather than flapped) and capped at
+`kMaxGuardedWipesPerHop` per physical device (`wipe_count`, which
+deliberately survives the wipe it's counting, to stop a chronically bad hop
+from being wiped forever). The wall-clock spread is what tells this apart
+from ordinary jitter — a single legacy probe's timing can't do that on its
+own.
+
+### Force Recheck: a decisive verification burst, not a single nudged probe
+
+**BUG FIX.** `force_recheck()` (user-triggered, "re-verify this target's
+route now") used to only zero `hop_recheck_at`, which fires **exactly one**
+legacy probe — `hop_recheck_at` is reset to `now` the instant it's sent — so
+a single click could contribute at most one miss toward the
+threshold/window pair above. That's a passive nudge, not a decisive check:
+it could never resolve a stuck Frankenstein hop on its own, only shave time
+off however long the automatic background cadence would have taken anyway,
+contradicting the feature's own promise.
+
+The fix seeds a short **burst** of `kForceVerifyProbes` (3) back-to-back
+legacy probes per already-addressed hop, sent at the target's normal probe
+cadence (a couple of seconds total, not a full recheck-interval wait) via
+three new per-hop counters: `force_verify_remaining` (probes not yet sent),
+`force_verify_outstanding` (sent but not yet resolved), `force_verify_misses`
+(resolved as a miss). The `due_recheck` gate in the send loop stays true for
+the whole burst instead of reverting after one probe. If every probe in the
+burst comes back silent, that's treated as real-time evidence at least as
+strong as the wall-clock-separated organic trigger — several independent,
+clustered misses rule out ordinary jitter just as well as two misses a full
+recheck-interval apart do — and the same
+guarded wipe fires immediately, through the same loss/wipe-count safety
+gates (an explicit request bypasses the *wait*, never the safety check). Any
+reply anywhere in the burst clears all three counters and confirms the hop
+as-is. All three maps are also cleared on a full route-context reset
+(alongside `legacy_miss`/`hop_recheck_at`) so no stale burst state can
+attach to an unrelated future measurement for the same hop.
+
+### Why "auto refresh" can look like it does nothing, right after Force Recheck visibly works
+
+Reported live: Force Recheck resumed a stale target, but the passive
+background mechanism (there is no separate feature literally named "auto
+refresh" — this refers to the guarded-wipe path just above, which is the
+thing that is supposed to do this on its own) appeared not to. This is not a
+missing feature; both paths converge on the exact same guarded-wipe code and
+the exact same safety gates. The difference is purely how fast each one can
+reach a verdict:
+
+- **Force Recheck**: 3 probes at the session's normal cadence (default 1s)
+  → verdict in a few seconds.
+- **Passive path**: 1 legacy probe per `hop_recheck_secs()` (30s by
+  default), needs `legacy_miss_threshold_default()` (2 by default) of those
+  to miss, spanning at least the same interval again → **at least ~60
+  seconds** by default, often more depending on where in that cycle the
+  route actually changed.
+
+So watching a stale hop for anything under roughly a minute before
+concluding "auto refresh didn't do it" will reliably look broken even when
+it is working exactly as designed — it just hasn't reached its threshold
+yet. This was originally 45s/45s (a ~90s minimum) when this section was
+first written; both numbers are now 30s by default and, since a later
+round, genuinely configurable from the GUI's Settings window — see
+`set_default_recheck_tuning`'s doc comment (session.hpp) — so the exact
+minimum wait is whatever's currently configured there (visible in the
+Settings window itself), not a fixed number baked into this document.
 
 ---
 
@@ -659,6 +834,37 @@ of which the pillars above needed to touch except at the margins:
   away if no other session still uses that exact combo — same lifecycle the
   pre-pool exclusive-ownership model had, just shared instead of exclusive.
 
+### Family availability: don't probe blindly into a family with no real egress
+
+Before starting to probe, `Session::run()` checks whether the local machine
+actually has a usable egress for the target's family — `has_local_v4`/
+`has_local_v6`, derived from `list_interfaces()`. For an explicit `Family:
+IPv6` (or `V4`) choice with no usable egress, it shows a clear "No local
+IPv6 egress available — waiting for IPv6 or change family" message and
+polls for up to 30s for one to appear (an interface coming up, or the user
+changing the setting) rather than opening a socket and emitting a burst of
+probes that can only ever time out. `Auto` uses the same two booleans to
+prefer whichever family has both a DNS answer and a real local egress,
+falling back to IPv4 first as before if both exist.
+
+**BUG FIX.** "Usable egress" used to mean "any interface has an address of
+this family, at all" — which includes **link-local** (`169.254.0.0/16`
+IPv4 APIPA, `fe80::/10` IPv6). Link-local addresses are auto-assigned to
+every active interface by SLAAC/APIPA on every major OS **regardless of
+real internet connectivity** — IPv6 SLAAC in particular does this
+unconditionally — so this check passed on virtually every machine whether
+or not it actually had a route anywhere. An explicit `Family: IPv6`
+selection on an otherwise IPv4-only machine (link-local v6 present, no real
+v6 route) would skip straight past the friendly wait message and open a
+real socket against a destination it could never reach, producing confusing
+0%-progress/100%-loss behavior instead of a clear explanation. Fixed by
+filtering through `is_cacheable_ip()` (§4's private-IP cache gate reuses
+the same function) before counting an interface address toward
+`has_local_v4`/`has_local_v6` — it already excludes link-local, loopback,
+and the unspecified address while still correctly accepting private/CGNAT
+addresses (a home LAN behind NAT is a perfectly real, usable egress, same
+reasoning as §4's private-IP cache fix).
+
 ---
 
 ## 10. Testability without a live socket
@@ -671,6 +877,9 @@ socket or Administrator/root privileges:
 - `compute_max_hop()` — the loop-narrowing/discovery-window decision, as a
   pure function of `(dest_hop, loop_at_hop, frontier, max_hops)`.
 - `is_public_ip()` — the public/private classification gate.
+- `is_cacheable_ip()` — the looser "meaningful, routing-domain-scoped
+  address" gate used both by §4's private-IP cache fix and by the family-
+  availability check above.
 - `SharedSample` / `SharedHopTable` / `shared_publish_to()` /
   `shared_adopt_from()` — table-taking variants that operate on a
   test-local `SharedHopTable` instance, never the process-global singleton,
@@ -688,12 +897,306 @@ that unit tests deliberately don't exercise.
 
 ---
 
-## 11. File map
+## 11. The CLI (`cli/`, target `npulse`): a second front-end over the same engine
+
+`cli/main.cpp` is a terminal front-end over the exact same engine calls the
+Tauri desktop app uses — `Session` for `tracert`/`traceroute`/`tracert-mtr`/
+`mtr`, `PingRun` for `ping`, `list_interfaces()` for `ifconfig`/`ipconfig` —
+not a reimplementation of any probing logic. See `cli/CLI.md` for the full
+command reference; this section covers the architectural decisions
+specific to it.
+
+**Separate executable, same build.** `cli/CMakeLists.txt` adds an `npulse`
+target linked against `netpulse_core`, included via `add_subdirectory(cli)`
+in the top-level `CMakeLists.txt`, gated by `NETPULSE_BUILD_CLI` (default
+ON). This means `netpulse_tests` and `npulse` are both produced by the exact
+same `cmake --build .` a contributor already runs for engine work — no
+separate CLI-specific build step to remember, and no risk of the CLI
+silently going stale against engine API changes the way a totally separate
+repository/build would risk.
+
+**`argv[0]`-based command dispatch.** Rather than a single `npulse
+[OPTIONS] HOST` flag set, the binary inspects its own invoked name first
+(stripping a path and a Windows `.exe` suffix) and dispatches to a
+subcommand directly if it recognizes it (`ping`, `tracert`/`traceroute`,
+`mtr`, `ifconfig`/`ipconfig`, `nslookup`) — falling back to `npulse
+SUBCOMMAND ...` otherwise. This is what lets a copy or symlink of the
+binary named `mtr` behave like `mtr` with no arguments needed beyond the
+host, while the canonical `npulse` name still works identically via its
+subcommand form — confirmed by literally copying the built binary under
+each alias name and running it (see `CHANGES.md`'s verification section).
+
+**`tracert` and `tracert-mtr` are two separate commands, not one with a
+mode flag.** They're genuinely different output models over the same
+`Session` engine: `tracert` (also `traceroute`) prints each hop exactly
+once, in ascending order, once it "settles" (resolved, or 5 silent probes
+with no reply — treated the same as real traceroute's own `* * *` row),
+stopping at the destination or `--max-hops` — a one-shot process that
+exits. `tracert-mtr` (also `mtr`) is the live, continuously-refreshing
+table the GUI's Path/MTR view shows, and never exits on its own (barring
+`-c`/`--report`). Splitting them avoids the far more common one-shot case
+needing to remember a flag every time, and matches two real, differently-
+named tools people already reach for instead of inventing a third
+convention.
+
+**Auto-refresh for `Family: Auto`, in place of Force Recheck.** The GUI's
+Force Recheck is an interactive keypress against an already-running trace
+— this CLI's live view has no keyboard-input reader loop to hang a key
+binding on (see `CLI.md`'s "Not yet implemented" section). What
+`tracert-mtr` has instead, specifically for `Family: Auto` (never for a
+pinned `-4`/`-6`, which has no ambiguity worth silently overriding):
+`Session::resolve()` — the family-availability check — runs exactly once,
+at the very top of `Session::run()`, never re-evaluated mid-loop (see §9's
+"Family availability" subsection). A trace started before a real route
+came up would otherwise sit on a stale "no local egress" message forever.
+`cmd_tracert_mtr()` instead wraps `Session` construction in an outer retry
+loop: if a session under `Auto` reports an error continuously for more
+than 15 seconds, the `Session` is destroyed and a fresh one constructed
+(re-running `resolve()` from scratch), repeating every few seconds until
+it succeeds or the user interrupts.
+
+Combining "a real Ctrl-C" and "this internal restart decision" into the
+one `std::atomic<bool>* stop` pointer `Session::run()` accepts needed a
+small dedicated helper (`run_session_until()`, `cli/main.cpp`) — a
+lightweight poller thread that sets a shared `combined` flag true the
+moment either the global SIGINT flag or a local `want_restart` flag fires,
+and that's what actually gets passed to `run()`. The caller can still tell
+the two apart afterward by checking the global SIGINT flag specifically:
+true means a real interrupt (stop for good), false means the internal
+restart fired (loop again). Verified directly: `Auto` against a target
+this project's own build sandbox genuinely can't reach retries every ~3s
+as designed; the identical target with a family pinned explicitly shows
+its error once and never retries; a live SIGINT sent mid-retry stops it
+immediately — all three clean under AddressSanitizer/UBSan, including the
+new poller thread.
+
+**`ifconfig -w`/`--watch`** is the same idea applied to the adapter list
+itself rather than a single in-progress trace — a plain redraw loop (no
+threading needed, since there's no long-running `Session`/engine call to
+combine a stop signal with) for noticing an adapter change over time (a
+cable unplugged/replugged, a VPN connecting) that a one-shot CLI process
+would otherwise have no way to observe.
+
+**Why `-c`/`--count` on `tracert-mtr` is an approximation, not exact.**
+`PingRun::run()` delivers one `PingLine` per sequence number — an exact,
+well-defined unit to count. `Session::run()`'s `on_update` callback has no
+equivalent: different hops resolve, get re-measured, and get evicted
+(guarded wipe) on their own independent schedules, so there's no single
+clean "one complete round" boundary the way a ping's sequence number is.
+`cmd_tracert_mtr()` uses "a non-empty snapshot delivery" as its counting unit
+instead — good enough for "stop once the trace has actually produced
+something," not precise enough to promise "exactly N probe rounds per hop."
+Documented as an approximation in `CLI.md` rather than oversold as exact.
+
+**Packaging: a Tauri `externalBin` sidecar, not a separate download.**
+`tauri.conf.json`'s `bundle.externalBin: ["binaries/npulse"]` bundles a
+per-target-triple-named build of this binary into every installer Tauri
+produces (NSIS/AppImage/deb/dmg), placed by a "Build CLI sidecar" step
+added to each of `tauri-ci.yml`/`tauri-release.yml`/`tauri-canary-
+build.yml`'s build jobs (see `tauri-app/src-tauri/binaries/README.md` for
+the exact sequence, which was run and confirmed working on a real machine
+before being written into any workflow file). Getting the bundled binary
+onto PATH is handled per-OS, with genuinely different levels of confidence
+per platform — see `CLI.md`'s "Packaging" section for the full breakdown
+of Windows (NSIS/EnVar, written to match documented plugin behavior but
+not verified against a real install), Linux .deb (`bundle.linux.deb.files`,
+confirmed by Tauri's own documentation), Linux AppImage (no install step
+exists to hook, by design of the format), and macOS (not yet solved —
+`.dmg` has no script-execution point the way NSIS/dpkg do; the right fix is
+an in-app "install to PATH" action, not an installer-time script).
+
+**The `npulse` console, "VS Developer Command Prompt" style, on every OS.**
+Asked for explicitly, across two rounds of clarification: not a custom
+REPL, but literally the user's own shell — the same relationship VS
+Developer Command Prompt has to `cmd.exe` (a shortcut that runs it with an
+environment script applied first, not a bespoke shell language of its
+own) — and, per the second clarification, triggered uniformly whether
+`npulse`/`netpulse` is typed bare into an already-open terminal OR the
+file is run directly (double-click, a shortcut, `./npulse`), on every OS,
+not gated on any Windows-specific "was this console freshly allocated"
+distinction the way an earlier iteration of this feature was. `main()`
+checks, before any argument parsing, whether the canonical `npulse`/
+`netpulse` invocation (not an alias — see below) received zero arguments;
+if so, `launch_shell_console()` prepends this executable's own directory
+to `PATH` (`own_executable_dir()` — `GetModuleFileNameA` on Windows,
+`readlink("/proc/self/exe")` on Linux, `_NSGetExecutablePath` on macOS,
+falling back to resolving `argv[0]` directly if none of those apply),
+prints a short banner, and spawns the user's real shell inside the same
+session — `%COMSPEC%` (`cmd.exe`) via `CreateProcessA`/`WaitForSingleObject`
+on Windows, `$SHELL` (falling back to `/bin/sh`) via `fork()`/`execl()`/
+`waitpid()` on POSIX — waiting for it and propagating its exit code as
+`npulse`'s own. Running under an ALIAS name (`ping`, `tracert`, `mtr`,
+`ifconfig`, ...) with no further arguments is unaffected by any of this —
+that alias's own usage/behavior applies, matching the same reasoning
+`cmd_ping()`/`cmd_tracert()` already had for a missing HOST argument;
+`npulse help` or any other argument is likewise unaffected, since only
+literally zero arguments to the canonical name enters this path at all.
+
+Verified more rigorously than prior Windows-specific work in this project,
+and — for the POSIX side — verified completely, not just cross-compiled:
+a MinGW-w64 cross-compiler and Wine were installed specifically to move
+past compile-only/manual review for this file's `_WIN32` branches, and the
+Linux build was run directly in the environment this was built in.
+Confirmed on Linux: a bare invocation spawns the real `$SHELL` (tested
+explicitly with both `/bin/sh` and `/bin/bash`), the spawned shell's `PATH`
+genuinely has `npulse`'s directory prepended (`which npulse` resolves it
+from inside that shell), `npulse help` runs correctly from inside that
+session, the spawned shell's exit code propagates back correctly, and
+every alias with no arguments correctly shows its OWN behavior rather than
+entering console mode. Confirmed on the cross-compiled `.exe` under Wine,
+repeated multiple times for stability: the same bare-invocation console-
+hosting works, `COMSPEC`/`PATH` resolve and propagate correctly, the
+with-arguments path still bypasses console-hosting entirely — plus,
+independent of this feature, real `ping` replies, real adapter enumeration
+via actual `GetAdaptersAddresses` (not a stub), and real DNS resolution,
+all against genuine network traffic. One isolated false alarm during this
+process is worth recording: a single Wine run of the console-hosting path
+appeared to hang, which turned out to be transient (five subsequent runs
+were all clean) rather than a real bug — confirmed by writing and testing
+an isolated minimal reproduction of the exact `CreateProcessA` pattern
+first, which is what made it possible to tell a real bug apart from Wine
+flakiness with confidence rather than guessing. This is real execution
+evidence on both platforms, not a compile-only check — though the Windows
+side is still not a substitute for testing on an actual Windows machine.
+
+**BUG FIX, reported live: the console's own promise wasn't backed by
+anything.** The banner told the person to "use `ping`/`tracert`/`mtr`/
+`ifconfig` directly," but nothing anywhere ever created a FILE by any of
+those names — `argv[0]`-based dispatch (main()'s alias handling) only ever
+activates for a name that actually exists somewhere on `PATH`, and the
+first version of this feature only ever prepended `npulse`'s OWN
+directory, which contains a file named `npulse` and nothing else. Typing
+`tracert-mtr host` inside the console correctly failed with "not
+recognized" — the shell was right, the feature was incomplete.
+`setup_alias_dir()` fixes this for real: a session-scoped temporary
+directory containing a hard link to the `npulse` executable under each
+standard-command name (`kAliasNames`: `ping`, `tracert`, `traceroute`,
+`mtr`, `tracert-mtr`, `ifconfig`, `ipconfig`, `nslookup`), prepended to
+`PATH` ahead of everything else, and removed by `cleanup_alias_dir()` the
+moment the spawned shell exits. A hard link (`CreateHardLinkA` on Windows,
+`link()` on POSIX, falling back to a plain file copy only if that fails —
+most likely a different filesystem/volume than the executable) costs zero
+extra disk space and, unlike a symlink, needs no elevated privilege on
+Windows. Shadowing the system's own `ping`/`tracert`/etc. only for the
+lifetime of one console the person explicitly opened for this purpose is a
+fundamentally different, much safer case than the PERMANENT PATH install
+this project already decided against elsewhere (§ above, and `CLI.md`'s
+Packaging section) — the same reasoning `conda activate`/`nvm use`/a
+Python virtualenv already rely on.
+
+Verified precisely against the reported failure: on Linux, confirmed
+`which tracert-mtr`/`ping`/`tracert`/`mtr`/`ifconfig` inside a spawned
+session all resolve into the new alias directory, confirmed running
+`tracert-mtr HOST` by name inside that session produces correct output,
+and confirmed the alias directory is fully removed after the session ends
+— all clean under ASan/UBSan. On the cross-compiled Windows `.exe` under
+Wine: confirmed `CreateHardLinkA` itself works correctly in isolation, and
+confirmed a renamed/hardlinked copy of the executable invoked DIRECTLY
+under an alias name dispatches and runs correctly end to end. What could
+NOT be confirmed under Wine: the full nested chain (`npulse.exe` → spawns
+`cmd.exe` → which spawns the hardlinked alias binary) hung reliably,
+despite every individual link in that chain checking out correctly on its
+own — most consistent with a Wine-specific limitation in its console/
+process emulation for a process spawning a shell that itself spawns
+further raw-socket-using processes, but this is not certain, and could not
+be verified against real Windows. Documented plainly as an open question
+in `CLI.md` rather than presented as resolved.
+
+**BUG FIX, reported live: a long hostname could hide its own destination
+marker.** `render_hop_table()`'s `[DEST]` suffix used to be appended to
+the hop's display string BEFORE truncating it to the Host column's width
+— so a fully-resolved IPv6 reverse-DNS hostname (routinely long enough on
+its own to need truncating) could cut the marker off partially or
+entirely, on exactly the row where knowing "this is the destination"
+matters most. Fixed by truncating the hostname/address text first, to a
+budget that reserves room for the suffix, then appending the suffix after
+— it can no longer be truncated away regardless of hostname length. The
+Host column was also widened (38 → 46 characters, `kHostColumnWidth`) since
+the same live report showed how routinely a real hostname+address
+combination exceeds a narrow budget on its own, making truncation the
+common case rather than a rare edge case.
+
+**BUG FIX, reported live: `tracert-mtr`/`ifconfig -w` could corrupt the
+parent shell's prompt, PowerShell specifically.** Running either directly
+from an already-open PowerShell session (not through the `npulse` console
+above, which hosts `cmd.exe` and was reported unaffected) could leave
+fragments of unrelated text appearing to type themselves at the next
+prompt, spurious continuation prompts, arrow keys inserting garbage. Root
+cause is a well-documented class of Windows-console pitfall: a live-redraw
+view repositioning the cursor inside the SAME screen buffer a line editor
+(PSReadLine, or any shell's own line editing) is also tracking desyncs
+that editor's bookkeeping from where the cursor actually is, and once
+desynced, ordinary typed input can render or get interpreted incorrectly.
+`cmd.exe` has no equivalent line-editing layer to desync, which is exactly
+why it was unaffected.
+
+Fixed with the standard technique for exactly this: `enter_live_view()`/
+`leave_live_view()` (`cli/main.cpp`) switch to the **alternate screen
+buffer** (`\033[?1049h`/`\033[?1049l`) once around the whole live session,
+rather than doing per-frame cursor repositioning in the same buffer the
+shell's own prompt lives in — the same guarantee `vim`/`less`/`htop`
+already give on quit, on every exit path including Ctrl-C, not just a
+clean one (enforced by always calling `leave_live_view()` before
+`cmd_tracert_mtr()`/`cmd_ifconfig()`'s watch loop returns, regardless of
+which branch got there). Two further defensive layers, added because this
+class of bug is worth being thorough about rather than fixing only the
+one reported symptom: `term_restore()` (registered once via `atexit()`,
+so it runs on every exit path without a matching call needed at each
+`return` in the file) saves the Windows console's `ENABLE_VIRTUAL_
+TERMINAL_PROCESSING` mode before `term_init()` changes it and restores
+the original afterward — a child process leaving shared console state
+changed is a separate, real way to confuse a parent shell, since the
+console mode is a property of the console object both processes share,
+not a private copy — and discards any input the terminal sent but this
+process never read (`FlushConsoleInputBuffer` on Windows, `tcflush` on
+POSIX), since response bytes a terminal can send for certain queries can
+otherwise resurface as garbage in whatever reads input next.
+
+**A visible sign of being "inside" npulse, asked for explicitly**: two
+layers, `set_terminal_title()` (window/tab title — `SetConsoleTitleA` on
+Windows, the OSC 0 escape sequence on POSIX; found written but never
+actually called anywhere, the same "defined but dead" pattern `term_init()`
+itself had earlier in this project's history, now wired into both the
+console-hosting path and every direct live-view invocation) and
+`prepare_prompt_plan()`/`set_console_prompt_indicator()` (prefixes the
+`npulse` console's own spawned shell prompt with `[npulse] ` — a plain
+`PROMPT` environment variable suffices for `cmd.exe`, but bash/zsh
+required actually testing the naive approach to find that it doesn't
+work: an interactive shell always re-runs its own startup file on launch,
+which unconditionally overwrites any inherited `PS1` before ever showing
+a prompt, confirmed by testing a genuinely interactive shell — a real pty
+on both stdin and stdout, since piped input alone makes bash detect
+itself as non-interactive and skip this path entirely, which made an
+earlier, more naive test look like it worked when it wasn't really being
+exercised. The real fix layers the prefix in AFTER the user's own startup
+file runs, using each shell's own supported mechanism: bash's `--rcfile
+FILE -i`, zsh's `ZDOTDIR` pointed at a temp directory).
+
+Verified with a real pseudo-terminal on Linux — captured the actual
+escape bytes emitted (not just visual inspection) and confirmed the
+alternate-screen sequence and title are correct and appear/disappear at
+the right moments, confirmed the `[npulse]`-prefixed bash prompt renders
+correctly live, confirmed a real `SIGTERM` mid-session completes promptly
+(~3 seconds, matching the signal timeout, not a hang) with the alternate
+screen properly exited first — and on the cross-compiled Windows `.exe`
+under Wine across multiple repeated runs. Two testing-environment
+artifacts surfaced and were resolved by reproducing in isolation rather
+than assumed to be real bugs: a graceful-shutdown test hung specifically
+when wrapped in the `script` pty-recording utility (traced to `script`'s
+own known signal-forwarding/pty-monitoring quirks — the identical command
+completed correctly and promptly with `script` removed from the test),
+and one single Wine run of an already-passing command appeared to hang
+once, which did not reproduce across three immediate repeat runs.
+
+---
+
+## 12. File map
 
 | File | Responsibility |
 |---|---|
 | `core/include/netpulse/icmp.hpp` / `core/src/icmp.cpp` | ICMP/ICMPv6 packet codec, RFC 1071 checksum, Paris-style checksum pinning. |
 | `core/include/netpulse/transport.hpp` / `core/src/transport.cpp` | `Prober` (one raw/datagram socket), the socket pool, `list_interfaces()`. |
+| `cli/main.cpp` / `cli/CMakeLists.txt` | The `npulse` CLI (§11) — argument parsing and terminal rendering over `Session`/`PingRun`/`list_interfaces`. |
 | `core/include/netpulse/session.hpp` / `core/src/session.cpp` | Everything in this document: `Session::run()`, the RX dispatcher, the global pacer, the shared-hop cache, the rDNS pool, the loop auditor. |
 | `core/include/netpulse/ping_run.hpp` / `core/src/ping_run.cpp` | `PingRun` — the standalone single-host Ping tool's engine. A second `IcmpOwner` implementation (see §2's registry) alongside `Session`, sharing the same pooled sockets and RX dispatcher rather than opening its own — no separate thread, no OS `ping` subprocess. |
 | `core/include/netpulse/stats.hpp` | `HopStats`/`HopStat` — rolling per-hop RTT/loss stats over the focus window. |

@@ -114,10 +114,15 @@ HopStat HopStats::compute(std::optional<double> focus_secs) const {
         if (last_confirmed_at_ > 0.0) s.stale_since = last_confirmed_at_;
         // Same table shared_adopt_from() reads from in session.cpp's send
         // loop. 30s is generous relative to typical probe intervals
-        // (default 1s), so this stays "is anyone hearing from it right
+        // (default 1s), so this stays "is anyone ELSE hearing from it right
         // now", not a long-tail memory of an address that's genuinely
-        // gone quiet everywhere.
-        s.stale_seen_elsewhere_at = shared_last_seen(*stale_address_, now_secs(), 30.0);
+        // gone quiet everywhere. target_id_ is passed as the "self" session
+        // id (it's the same id Session::id_ publishes under — see
+        // shared_publish's callers in session.cpp) so this excludes our own
+        // last (pre-staleness) reply — see shared_last_seen_from's BUG FIX
+        // note for the false "live via another target" this used to show
+        // even with a single target running.
+        s.stale_seen_elsewhere_at = shared_last_seen(*stale_address_, target_id_, now_secs(), 30.0);
     }
 
     double hot_sum = 0, hot_sumsq = 0, hot_min = 0, hot_max = 0;

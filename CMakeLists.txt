@@ -67,3 +67,21 @@ enable_testing()
 add_executable(netpulse_tests tests/test_core.cpp)
 target_link_libraries(netpulse_tests PRIVATE netpulse_core)
 add_test(NAME core COMMAND netpulse_tests)
+
+# ---------------------------------------------------------------------------
+# netpulse-cli (npulse) — the terminal front-end. Separate executable target,
+# same static library, same source tree — see cli/CMakeLists.txt and
+# ARCHITECTURE.md's CLI section for why this is a distinct binary rather than
+# a mode flag on the Tauri app: the Tauri desktop build has its own separate
+# build system (tauri-app/src-tauri, via cargo/tauri-action) and never
+# invokes this top-level CMakeLists.txt at all, so building this target is
+# fully independent of whether the desktop app is being built in the same CI
+# run. Default ON so a plain `cmake --build .` from a source checkout
+# produces both netpulse_tests and npulse without extra flags; the release
+# workflow can still build ONLY this target on its own when producing the
+# sidecar binary bundled into each OS installer (see .github/workflows/
+# tauri-release.yml's "Build CLI sidecar" step).
+option(NETPULSE_BUILD_CLI "Build the netpulse-cli (npulse) command-line tool" ON)
+if(NETPULSE_BUILD_CLI)
+  add_subdirectory(cli)
+endif()

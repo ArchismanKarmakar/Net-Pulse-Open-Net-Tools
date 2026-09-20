@@ -11,6 +11,14 @@ tauri-app/node_modules
 tauri-app/dist
 tauri-app/src-tauri/target
 tauri-app/src-tauri/gen
+# CLI sidecar binaries (Tauri externalBin — tauri.conf.json's bundle.
+# externalBin) are built fresh by CI immediately before each `tauri build`
+# (see .github/workflows/tauri-release.yml's "Build CLI sidecar" step) and
+# are OS/arch-specific — never something to commit. The directory itself
+# (with its README) stays tracked so `bundle.externalBin`'s referenced path
+# exists in a fresh checkout even before that step has ever run.
+tauri-app/src-tauri/binaries/*
+!tauri-app/src-tauri/binaries/README.md
 
 
 # Env files

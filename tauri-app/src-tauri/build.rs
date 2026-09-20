@@ -39,6 +39,27 @@ const COMMANDS: &[&str] = &[
     // permissions exist at all — was never updated, so the permission simply
     // didn't exist yet for default.json to grant.
     "capabilities", "relaunch_elevated", "set_debug_logging", "play_alert_sound",
+    // BUG FIX: this command (the Interfaces diagnostics page's data source —
+    // list_interfaces_json's fuller sibling, App.jsx's InterfacesPage.jsx)
+    // was registered in lib.rs's invoke_handler and granted in
+    // capabilities/default.json when that feature was added, but never added
+    // HERE — the exact failure mode this comment block already warns about.
+    // Caught only now, while re-touching this file for the Settings window
+    // below, by actually re-running a real `cargo build`/`cargo check`
+    // (previously not possible in earlier rounds — no Rust/Tauri toolchain
+    // was available in that sandbox) rather than by inspection; without a
+    // real build this silently would have made the whole Interfaces page's
+    // API call fail with a permission-denied error at runtime, in any real
+    // install.
+    "list_interfaces_detailed",
+    // FEATURE (user-requested): the app-wide Settings tab — see
+    // commands.rs's own doc comment on AppSettings/load_app_settings/
+    // save_app_settings for what each does. (This used to also include
+    // open_settings_window for a separate Settings OS window; that window
+    // came up blank and outlived the main window when closed, so it's a
+    // tab in the main window now instead — see SettingsPage.jsx — and
+    // there's no longer a window-opening command to grant.)
+    "load_app_settings", "save_app_settings", "get_recheck_tuning",
 ];
 
 // Raw ICMP (SOCK_RAW — the only ICMP mode this app uses on any platform, see
@@ -78,7 +99,109 @@ const WINDOWS_MANIFEST: &str = r#"<assembly xmlns="urn:schemas-microsoft-com:asm
   </trustInfo>
 </assembly>"#;
 
+// See its call site in main() for the full rationale (fixes a real,
+// reported "tauri dev fails: resource path ... doesn't exist" break).
+// Builds the CLI (cli/, CMake target `npulse`) via the SAME top-level
+// CMakeLists.txt "Engine development" already uses, into
+// tauri-app/src-tauri/binaries/npulse-<TARGET>[.exe] — exactly where
+// tauri.conf.json's bundle.externalBin expects it. `TARGET` is set by
+// Cargo for every build script automatically (the actual Rust target
+// triple being compiled for — the same value used for
+// TAURI_ENV_TARGET_TRIPLE, and what NETPULSE_CLI_SIDECAR_TRIPLE needs to
+// match exactly for the filename externalBin resolves to line up).
+fn ensure_cli_sidecar(repo_root: &std::path::Path, binaries_dir: &std::path::Path) {
+    let target = std::env::var("TARGET").expect("Cargo always sets TARGET for build scripts");
+    let ext = if target.contains("windows") { ".exe" } else { "" };
+    let dest = binaries_dir.join(format!("npulse-{target}{ext}"));
+    if dest.exists() {
+        return; // already built (this run or a previous one) — skip the slow cmake invocation
+    }
+    std::fs::create_dir_all(binaries_dir).expect("create tauri-app/src-tauri/binaries/");
+
+    let build_dir = repo_root.join("build-cli-sidecar");
+    let cmake_ok = std::process::Command::new("cmake")
+        .args(["-S", ".", "-B"])
+        .arg(&build_dir)
+        .args(["-DCMAKE_BUILD_TYPE=Release"])
+        .arg(format!("-DNETPULSE_CLI_SIDECAR_TRIPLE={target}"))
+        .current_dir(repo_root)
+        .status();
+    let build_ok = cmake_ok.as_ref().map(|s| s.success()).unwrap_or(false)
+        && std::process::Command::new("cmake")
+            .args(["--build"])
+            .arg(&build_dir)
+            .args(["--config", "Release", "--target", "npulse"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    if !build_ok {
+        panic!(
+            "Could not automatically build the CLI sidecar (needs `cmake` and a C++20 \
+             compiler on PATH). Either install those, or build it yourself and place it \
+             manually:\n  cmake -S {root} -B build-cli -DNETPULSE_CLI_SIDECAR_TRIPLE={t}\n  \
+             cmake --build build-cli --target npulse\n  (then copy the output into {dest})",
+            root = repo_root.display(), t = target, dest = dest.display()
+        );
+    }
+    // The sidecar dir property (cli/CMakeLists.txt's NETPULSE_CLI_SIDECAR_TRIPLE
+    // branch) always names the output npulse-<target>[.exe] but its exact
+    // parent directory differs between a single-config generator
+    // (Makefiles/Ninja: build-cli-sidecar/sidecar/) and a multi-config one
+    // (Visual Studio, CMake's Windows default: build-cli-sidecar/sidecar/Release/)
+    // — searching by filename instead of assuming one exact path handles
+    // both without needing to know which generator is in play.
+    let found = find_file_named(&build_dir, &format!("npulse-{target}{ext}"))
+        .unwrap_or_else(|| panic!("CLI sidecar build reported success but the output file wasn't found under {}", build_dir.display()));
+    std::fs::copy(&found, &dest).expect("copy CLI sidecar into tauri-app/src-tauri/binaries/");
+}
+
+fn find_file_named(dir: &std::path::Path, name: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_file_named(&path, name) {
+                return Some(found);
+            }
+        } else if path.file_name().and_then(|n| n.to_str()) == Some(name) {
+            return Some(path);
+        }
+    }
+    None
+}
+
 fn main() {
+    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    // .../tauri-app/src-tauri -> .../tauri-app -> repo root
+    let repo_root = manifest_dir.parent().unwrap().parent().unwrap().to_path_buf();
+
+    // BUG FIX: tauri.conf.json's bundle.externalBin ("binaries/npulse", see
+    // cli/CLI.md's Packaging section and ARCHITECTURE.md §11) makes
+    // tauri_build::try_build() below HARD-FAIL — before compiling a single
+    // line of the app itself, on `cargo build`/`tauri dev` as much as a
+    // release `tauri build` — if the per-target-triple sidecar file it
+    // names doesn't already exist on disk: "resource path
+    // binaries\npulse-x86_64-pc-windows-msvc.exe doesn't exist". The CI
+    // workflows (tauri-ci.yml/tauri-release.yml/tauri-canary-build.yml)
+    // each have their own "Build CLI sidecar" step that runs BEFORE `tauri
+    // build`, so releases are unaffected — but a plain local `npx tauri
+    // dev`/`cargo build`, the single most common way anyone actually runs
+    // this project, has no such step and hit this immediately: reported
+    // against a real Windows dev run, confirming this was a real gap, not
+    // a hypothetical one. Fixed the same way the rest of this file already
+    // handles "the C++ engine needs building as part of `cargo build`" —
+    // automatically, here, rather than requiring a separate manual step
+    // every contributor has to remember and every fresh clone would
+    // otherwise break on. Skips the actual (slow) cmake invocation
+    // whenever the target file already exists, so this costs nothing on
+    // the many builds after the first one; a stale sidecar left over from
+    // editing cli/ sources isn't detected here (this only checks
+    // existence, not staleness) — delete
+    // tauri-app/src-tauri/binaries/npulse-* by hand to force a rebuild
+    // after changing CLI source, or use the separate CLI-only dev command
+    // (README.md's "Development" section) which always builds fresh.
+    ensure_cli_sidecar(&repo_root, &manifest_dir.join("binaries"));
+
     tauri_build::try_build(
         Attributes::new()
             .app_manifest(AppManifest::new().commands(COMMANDS))
@@ -86,9 +209,6 @@ fn main() {
     )
     .expect("failed to run tauri-build (app manifest / command permissions)");
 
-    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    // .../tauri-app/src-tauri -> .../ (repo root) -> core, native
-    let repo_root = manifest_dir.parent().unwrap().parent().unwrap().to_path_buf();
     let core_include = repo_root.join("core/include");
     let core_src = repo_root.join("core/src");
     let native_dir = manifest_dir.join("native");

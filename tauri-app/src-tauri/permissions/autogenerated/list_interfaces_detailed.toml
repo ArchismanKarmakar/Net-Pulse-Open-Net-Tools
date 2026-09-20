@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-interfaces-detailed"
+description = "Enables the list_interfaces_detailed command without any pre-configured scope."
+commands.allow = ["list_interfaces_detailed"]
+
+[[permission]]
+identifier = "deny-list-interfaces-detailed"
+description = "Denies the list_interfaces_detailed command without any pre-configured scope."
+commands.deny = ["list_interfaces_detailed"]

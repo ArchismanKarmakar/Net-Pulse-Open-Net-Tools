@@ -9,6 +9,14 @@ import ReactDOM from 'react-dom/client'
 import App from './App.jsx'
 import './styles.css'
 
+// NOTE: Settings used to be a second OS window rendered from this same
+// bundle via a `?window=settings` query param — removed (see
+// SettingsPage.jsx and App.jsx's "Settings" tab/menu item) after that
+// window came up blank in real-world testing and outlived the main window
+// when closed, since Tauri doesn't tie a secondary window's lifetime to
+// the main one. There is now only ever one window, so this file always
+// renders the normal App.
+
 // Safety net for the blank-black-screen-after-sleep bug: if a resume-triggered
 // render exception ever unmounts the tree, this catches it and renders a
 // visibly recoverable message instead of leaving a bare root against the

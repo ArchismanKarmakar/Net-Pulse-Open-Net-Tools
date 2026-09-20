@@ -1,0 +1,8 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/Users/Archisman/Downloads/NetPulse-cpp-web/33/NetPulse-cpp-web/build-cli-sidecar/cmake_install.cmake",
+		"C:/Users/Archisman/Downloads/NetPulse-cpp-web/33/NetPulse-cpp-web/build-cli-sidecar/cli/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

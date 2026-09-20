@@ -25,6 +25,8 @@ import PingPage from './components/tools/PingPage'
 import { IconImage, IconCsv, IconRoute, IconBackupTable, IconTableChart, IconSave, IconUpload, IconDataObject } from './components/icons/MaterialIcons'
 import DnsPage from './components/tools/DnsPage'
 import PortScanPage from './components/tools/PortScanPage'
+import InterfacesPage from './components/tools/InterfacesPage'
+import SettingsPage from './components/tools/SettingsPage'
 import TargetPanel from './components/TargetPanel'
 
 // ── Top menu bar ────────────────────────────────────────────────────────────
@@ -128,7 +130,7 @@ export default function App() {
   const [updateProgress, setUpdateProgress] = useState(null)
   const [updateDismissed, setUpdateDismissed] = useState(false)
   const [tool, setTool] = useState(null)
-  const [tab, setTab] = useState('path') // 'path' (traceroute/MTR home) | 'ping' | 'dns' | 'ports'
+  const [tab, setTab] = useState('path') // 'path' (traceroute/MTR home) | 'ping' | 'dns' | 'ports' | 'interfaces'
   const [theme, setTheme] = useState(() => { try { return localStorage.getItem('np-theme') || 'dark' } catch { return 'dark' } })
   const chartRef = useRef(null)
   const [modal, setModal] = useState(null)
@@ -367,7 +369,152 @@ export default function App() {
     return () => cancelAnimationFrame(id)
   }, [theme])
 
-  useEffect(() => { api('/api/interfaces').then((j) => setInterfaces(Array.isArray(j) ? j : [])).catch(() => {}) }, [])
+  // FEATURE (user-requested): hydrate the "Add target" form's defaults from
+  // the saved app-wide Settings (see commands.rs's AppSettings and the new
+  // SettingsWindow.jsx) instead of the hardcoded literals `form`'s
+  // useState above started life with. Also picks up a saved theme that
+  // differs from whatever localStorage's own np-theme key already had —
+  // e.g. after Settings was changed from a different machine's copy of the
+  // same settings file, or on a genuinely fresh install where the settings
+  // file predates any localStorage entry at all. Only touches the numeric
+  // config fields, never `target` itself, and only once at mount — this
+  // races harmlessly against whatever the user might type into the host
+  // field in the same instant, which is the one field it never overwrites.
+  useEffect(() => {
+    let cancelled = false
+    window.netpulse.loadAppSettings().then((s) => {
+      if (cancelled || !s) return
+      setForm((f) => ({
+        ...f,
+        family: s.defaultFamily ?? f.family,
+        probe: s.defaultProbe ?? f.probe,
+        trace: s.defaultTrace ?? f.trace,
+        timeout: s.defaultTimeout ?? f.timeout,
+        payload: s.defaultPayload ?? f.payload,
+        maxhops: s.defaultMaxhops ?? f.maxhops,
+        raw: s.defaultRaw ?? f.raw,
+        protocol: s.defaultProtocol ?? f.protocol,
+        destPort: s.defaultDestPort ?? f.destPort,
+      }))
+      if (s.theme) setTheme(s.theme)
+    }).catch(() => {}) // no saved settings yet (fresh install) — keep the built-in literals
+    // Live update when the Settings window (a separate OS window) saves —
+    // see tauri-bridge.js's emitSettingsChanged/onSettingsChanged and
+    // SettingsWindow.jsx's save(). Applies immediately, no restart needed.
+    const off = window.netpulse.onSettingsChanged?.((s) => {
+      if (!s) return
+      setForm((f) => ({
+        ...f,
+        family: s.defaultFamily ?? f.family,
+        probe: s.defaultProbe ?? f.probe,
+        trace: s.defaultTrace ?? f.trace,
+        timeout: s.defaultTimeout ?? f.timeout,
+        payload: s.defaultPayload ?? f.payload,
+        maxhops: s.defaultMaxhops ?? f.maxhops,
+        raw: s.defaultRaw ?? f.raw,
+        protocol: s.defaultProtocol ?? f.protocol,
+        destPort: s.defaultDestPort ?? f.destPort,
+      }))
+      if (s.theme) setTheme(s.theme)
+    })
+    return () => { cancelled = true; if (typeof off === 'function') off() }
+  }, [])
+
+  // BUG FIX (reported): the "Add target" source-Interface dropdown only
+  // ever showed whatever adapters were up at the exact moment the app
+  // started — it fetched `/api/interfaces` ONCE on mount with no polling
+  // and no way to refresh, so an adapter that connects or reconnects
+  // afterwards (Wi-Fi joining a network a few seconds after launch, a
+  // laptop waking from sleep, a VPN coming up) never appeared in the
+  // dropdown until the app was restarted, even though the separate
+  // Interfaces *tab* — which does poll — showed it as up correctly the
+  // whole time. Fixed by folding this into the SAME 20-second poll the
+  // connectivity-alert check below already runs (against
+  // `/api/interfaces/detailed`, a superset of what `/api/interfaces`
+  // itself returns), instead of adding a second, redundant timer/IPC
+  // round-trip — see that effect's own `check()` for where `interfaces`
+  // is now also derived from each poll.
+
+  // Critical no-IPv4 / no-IPv6 connectivity alert. Uses the SAME `usable`
+  // classification (is_cacheable_ip() server-side) the probing engine
+  // itself checks before starting a trace — see InterfacesPage.jsx and
+  // ARCHITECTURE.md's "Family availability" subsection — so this can never
+  // disagree with why a target is actually stuck waiting. Checked once on
+  // mount and then polled (an adapter can come up or go down at any time,
+  // e.g. unplugging an Ethernet cable or a VPN disconnecting), with each
+  // condition independently "armed" so it alerts again if it clears and
+  // later recurs, but doesn't re-alert on every single poll while it's
+  // continuously true — a persistent problem should say so once, loudly,
+  // not nag every 20 seconds.
+  const noV4AlertShown = useRef(false)
+  const noV6AlertShown = useRef(false)
+  // Lets the "Add target" Interface dropdown's refresh button (below) call
+  // straight into this effect's own check() rather than waiting out the
+  // 20s poll — a manual "I just connected Wi-Fi, why isn't it here yet"
+  // action shouldn't have to wait on a timer.
+  const refreshInterfacesRef = useRef(() => {})
+  const [ifaceRefreshing, setIfaceRefreshing] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    const check = async () => {
+      let j
+      try { j = await api('/api/interfaces/detailed') } catch { return }
+      if (cancelled || !Array.isArray(j)) return
+      // Same up+non-loopback filter `/api/interfaces` (list_interfaces_json,
+      // include_all=false) applies server-side — kept in sync here so the
+      // "Add target" dropdown always matches what a fresh non-detailed call
+      // would return, without needing a second native call every 20s.
+      setInterfaces(j.filter((i) => i.up && !i.loopback).map((i) => ({ name: i.name, address: i.address, v6: i.v6, kind: i.kind })))
+      const hasUsableV4 = j.some((i) => !i.v6 && i.up && i.usable)
+      const hasUsableV6 = j.some((i) => i.v6 && i.up && i.usable)
+      const t = toolsApi()
+      const alert = async (title, message, details) => {
+        if (typeof t?.playAlertSound === 'function') t.playAlertSound('error').catch(() => {})
+        await showModal({ title, message, details, blocking: true })
+      }
+      if (!hasUsableV4 && !hasUsableV6) {
+        // Combined case: fire ONE alert, not two back-to-back blocking
+        // modals — the person needs one clear explanation, not a queue.
+        if (!noV4AlertShown.current || !noV6AlertShown.current) {
+          noV4AlertShown.current = true; noV6AlertShown.current = true
+          await alert(
+            'No network connectivity detected',
+            'This machine has no usable IPv4 or IPv6 egress on any active interface.',
+            <div>Every address found is down, loopback, or link-local-only — no target, of any address family, will be able to probe until a real connection is available. Open the Interfaces page for the full adapter list.</div>,
+          )
+        }
+        return
+      }
+      if (!hasUsableV4) {
+        if (!noV4AlertShown.current) {
+          noV4AlertShown.current = true
+          await alert(
+            'No IPv4 connectivity detected',
+            'This machine has no usable IPv4 egress on any active interface.',
+            <div>Every IPv4 address found is down, loopback, or link-local (APIPA) only. Targets set to <code>Family: IPv4</code> will wait rather than probe — expected on an IPv6-only network.</div>,
+          )
+        }
+      } else {
+        noV4AlertShown.current = false // condition cleared — re-arm for a future recurrence
+      }
+      if (!hasUsableV6) {
+        if (!noV6AlertShown.current) {
+          noV6AlertShown.current = true
+          await alert(
+            'No IPv6 connectivity detected',
+            'This machine has no usable IPv6 egress on any active interface.',
+            <div>Every IPv6 address found is down, loopback, or link-local-only. Targets set to <code>Family: IPv6</code> will wait rather than probe — normal on an IPv4-only network, since every OS auto-assigns a link-local IPv6 address to every interface whether or not real IPv6 connectivity exists.</div>,
+          )
+        }
+      } else {
+        noV6AlertShown.current = false
+      }
+    }
+    check()
+    refreshInterfacesRef.current = check
+    const iv = setInterval(check, 20000)
+    return () => { cancelled = true; clearInterval(iv) }
+  }, [])
 
   useEffect(() => {
     const t = setTimeout(async () => {
@@ -570,11 +717,31 @@ export default function App() {
   // Per-hop status dot (breakpoint-style). Intermediate hops that never answer
   // (100% loss) are GREY, not red — routers commonly deprioritise ICMP, so that
   // is informational, not a fault. Only real signals get warm colours.
+  //
+  // BUG FIX (TCP/UDP hop dots showing green with SENT=0/RECV=0): `noReply`
+  // below only fires once a probe was actually SENT (`sent > 0`) and got no
+  // reply — that's the right definition for "silent", but it left a gap for
+  // a hop that was never probed AT ALL yet (sent === 0, recv === 0), which
+  // TCP/UDP hit far more often than ICMP: TCP's hop-discovery loop only
+  // sends a probe for a TTL once discovery reaches it (see session.cpp's
+  // outstanding-probe bookkeeping around the "Timeout sweep for hops still
+  // waiting on an ICMP reply that never came" comment), so a hop whose TTL
+  // discovery hasn't reached yet — or that sits beyond where the
+  // destination was already confirmed at a lower TTL — sits at sent=0/
+  // recv=0 for a while, sometimes indefinitely. That fell through every
+  // check here (`noReply` requires sent > 0) straight to the `return 'ok'`
+  // default, i.e. a genuinely never-probed hop rendered identically to a
+  // real healthy reply — indistinguishable green dots for "great hop" and
+  // "haven't even asked yet". ICMP mode rarely showed this because its
+  // discovery sends every TTL up front. Now handled explicitly as its own
+  // 'pending' state (hollow/dim dot in styles.css) distinct from both 'ok'
+  // (green, real reply) and 'silent' (grey, asked and got nothing back).
   const hopStatus = (h) => {
-    const noReply = h.sent > 0 && h.recv === 0
+    if (h.sent === 0) return 'pending'           // never probed yet — not ok, not silent
+    const noReply = h.recv === 0
     const lat = h.med ?? h.avg
     const latHigh = lat != null && lat > alerts.ms
-    const lossHigh = h.sent > 0 && h.loss > alerts.loss
+    const lossHigh = h.loss > alerts.loss
     if (h.is_dest) {
       if (noReply) return 'down'                 // red — destination unreachable
       if (lossHigh && latHigh) return 'bad'      // orange — loss + high latency
@@ -616,7 +783,16 @@ export default function App() {
   // DNS resolves and the first probes come back.
   const isDiscovering = (t) => {
     const d = destHopOf(t)
-    if (d) return false
+    // BUG FIX: a destination-hop record can exist (allocated by the engine)
+    // before it has actually been probed (sent === 0) — TCP/UDP hit this far
+    // more often than ICMP (see hopStatus()'s comment above for why). That
+    // used to make isDiscovering() bail out to "not discovering" the moment
+    // the record appeared, even with zero real data yet, which then let
+    // targetState()/destLamp() fall through their own thresholds with
+    // sent=0/recv=0/loss=0/lat=0 and land on a false "ok" — same shape of
+    // bug as the per-hop dot. Only a hop that's actually been probed counts
+    // as "have real destination data".
+    if (d && d.sent > 0) return false
     const f = frontierHop(t)
     if (f && f.sent > 0 && f.recv === 0) {
       // The last-hop frontier hasn't replied — treat as unreachable rather
@@ -1018,12 +1194,29 @@ export default function App() {
   }, [ipKey]) // eslint-disable-line
 
   // Quick-add a host directly (menu shortcuts) using default config, without
-  // touching the add form. Skips exact-duplicate hosts already being traced.
-  const addTargetHost = async (host) => {
+  // touching the add form. Skips exact-duplicate hosts already being traced
+  // — identity is (host, family), matching addTarget()'s own (host, protocol,
+  // port, family) rule for the icmp/default-port case these shortcuts always
+  // use.
+  // BUG FIX: this used to key the "already being traced" check on `host`
+  // ALONE, ignoring family entirely — so re-running a quick trace for a host
+  // that already had an IPv4 (or IPv6) entry just re-selected that entry
+  // instead of ever adding the other family, and there was no way to pass a
+  // specific family in at all (every call silently hardcoded "auto"). Family
+  // is now a real parameter, defaulting to "auto", and participates in the
+  // duplicate check the same way addTarget()'s does.
+  const addTargetHost = async (host, family = 'auto') => {
     host = String(host || '').trim()
     if (!host) return
-    if (targets.some((t) => t.name === host)) { const ex = targets.find((t) => t.name === host); if (ex) selectTarget(ex.id); return }
-    const q = new URLSearchParams({ target: host, family: 'auto', probe: 1, trace: 30, timeout: 0, payload: 56, maxhops: 30, raw: '1' })
+    const famOf = (t) => (
+      t.family === 'IPv4' ? 'v4' :
+      t.family === 'IPv6' ? 'v6' :
+      (t.config?.family || 'auto')
+    )
+    const isIcmp = (t) => (t.config?.protocol || 'icmp') === 'icmp'
+    const ex = targets.find((t) => t.name === host && isIcmp(t) && famOf(t) === family)
+    if (ex) { selectTarget(ex.id); return }
+    const q = new URLSearchParams({ target: host, family, probe: 1, trace: 30, timeout: 0, payload: 56, maxhops: 30, raw: '1' })
     const r = await api(`/api/add?${q}`, { method: 'POST' })
     if (r && r.id) { await refreshState(); selectTarget(r.id) }
   }
@@ -1255,17 +1448,62 @@ export default function App() {
     // Port is only part of the identity where it actually varies the probe;
     // ICMP has no port, so every ICMP trace to a host is the same trace.
     const portOf = (c) => (protoOf(c) === 'icmp' ? '' : String(c?.destPort ?? ''))
+    // BUG FIX: identity used to be (host, protocol, port) ONLY — dropped
+    // from the tuple despite this very comment block still saying "IPv4 vs
+    // IPv6" is one of the "meaningfully different measurement sets" that
+    // should be allowed to coexist. That regression is exactly what made
+    // adding the SAME hostname under a different IP family ("any IP type")
+    // get rejected as "already in the list" — an IPv4 trace and an IPv6
+    // trace to the same host are genuinely different measurements and must
+    // not collide. Family is back in the identity tuple below, compared by
+    // the RESOLVED family once a target has one (t.family, "IPv4"/"IPv6")
+    // — not the raw config label — so an existing "auto" entry that has
+    // already resolved to v4 correctly collides with a new explicit "v4"
+    // request for the same host, not just with another literal "auto".
+    const famOf = (t) => (
+      t.family === 'IPv4' ? 'v4' :
+      t.family === 'IPv6' ? 'v6' :
+      (t.config?.family || 'auto')
+    )
     const formCfg = { protocol: form.protocol, destPort: form.destPort }
+
+    // Auto-complement: if the user left Family on "Auto" and this exact
+    // host+protocol+port already has ONE address family being traced,
+    // resolving "Auto" again would almost always land on that SAME family
+    // (DNS answers don't change moment to moment) and just duplicate the
+    // measurement already running — silently wasting the paced probe
+    // budget on a second copy of the same data instead of the dual-stack
+    // comparison a person reaching for "Auto" a second time most likely
+    // wants. Steer it at the missing family instead. Only kicks in when
+    // exactly one family is already present — if both v4 and v6 already
+    // exist (or neither does), there's nothing sensible to steer toward,
+    // so Auto is left alone (and, in the "both exist" case, correctly
+    // falls through to the duplicate-trace modal below once it resolves).
+    let effectiveFamily = form.family || 'auto'
+    if (effectiveFamily === 'auto') {
+      const sameHostProto = targets.filter((t) =>
+        t.name === form.target.trim() &&
+        protoOf(t.config) === protoOf(formCfg) &&
+        portOf(t.config) === portOf(formCfg)
+      )
+      const haveV4 = sameHostProto.some((t) => famOf(t) === 'v4')
+      const haveV6 = sameHostProto.some((t) => famOf(t) === 'v6')
+      if (haveV4 && !haveV6) effectiveFamily = 'v6'
+      else if (haveV6 && !haveV4) effectiveFamily = 'v4'
+    }
+    if (effectiveFamily !== form.family) { form.family = effectiveFamily; setForm({ ...form, family: effectiveFamily }) }
+
     const dupe = targets.find((t) => (
       t.name === form.target.trim() &&
       protoOf(t.config) === protoOf(formCfg) &&
-      portOf(t.config) === portOf(formCfg)
+      portOf(t.config) === portOf(formCfg) &&
+      famOf(t) === effectiveFamily
     ))
     if (dupe) {
       await showModal({
         title: 'Already in the list',
-        message: `"${form.target.trim()}" is already being traced with ${(form.protocol || 'icmp').toUpperCase()}${form.protocol && form.protocol !== 'icmp' ? ':' + form.destPort : ''}.`,
-        details: <div>Each host is listed once per protocol and port. Pick a different protocol or port (for example TCP:80 alongside TCP:443), or select the existing entry in the list.</div>,
+        message: `"${form.target.trim()}" is already being traced with ${(form.protocol || 'icmp').toUpperCase()}${form.protocol && form.protocol !== 'icmp' ? ':' + form.destPort : ''}${effectiveFamily !== 'auto' ? ' over ' + (effectiveFamily === 'v4' ? 'IPv4' : 'IPv6') : ''}.`,
+        details: <div>Each host is listed once per protocol, port, and IP family. Pick a different protocol, port, or family (for example IPv4 alongside IPv6), or select the existing entry in the list.</div>,
       })
       return
     }
@@ -2147,6 +2385,7 @@ export default function App() {
             { label: 'Ping', checked: tab === 'ping', onClick: () => setTab('ping') },
             { label: 'DNS Lookup (forward/reverse)', checked: tab === 'dns', onClick: () => setTab('dns') },
             { label: 'Port Scanner', checked: tab === 'ports', onClick: () => setTab('ports') },
+            { label: 'Network Interfaces', checked: tab === 'interfaces', onClick: () => setTab('interfaces') },
             { sep: true },
             { label: 'Quick trace 1.1.1.1 (Cloudflare)', onClick: () => { setTab('path'); addTargetHost('1.1.1.1') } },
             { sep: true },
@@ -2202,6 +2441,22 @@ export default function App() {
             { label: 'Quick trace 9.9.9.9 (Quad9)', onClick: () => { setTab('path'); addTargetHost('9.9.9.9') } },
             { sep: true },
             { label: 'Edit config (selected)…', onClick: () => { if (sel) { setEditForm({ probe: sel.config.probe, timeout: sel.config.timeout, payload: sel.config.payload, maxhops: sel.config.maxhops, family: sel.config.family, src: sel.config.src, protocol: sel.config.protocol || 'icmp', destPort: sel.config.destPort || 33434 }); setEditErrs({}); setEditing(true) } }, disabled: !sel },
+          ],
+        },
+        {
+          label: 'Settings', items: [
+            // BUG FIX: this used to open a separate OS window
+            // (window.netpulse.openSettingsWindow()); that window loaded
+            // blank in real-world testing and — because closing the main
+            // window doesn't wait for or close any other open windows —
+            // kept the whole app's process alive in the background after
+            // the main window was closed, with no visible window left to
+            // close it from. A tab in the same window can't go blank
+            // independently of the rest of the app, and closing the main
+            // window always ends the process, so both problems are gone
+            // by construction rather than patched around. See the
+            // 'settings' entry in the tab bar / SettingsPage.jsx.
+            { label: 'Open Settings…', onClick: () => setTab('settings') },
           ],
         },
         {
@@ -2263,13 +2518,15 @@ export default function App() {
         </div>
       )}
       <nav className="tabbar">
-        {[['path', '🌐 Path / MTR'], ['ping', '📡 Ping'], ['dns', '🔎 DNS Lookup'], ['ports', '🔌 Port Scanner']].map(([id, label]) => (
+        {[['path', '🌐 Path / MTR'], ['ping', '📡 Ping'], ['dns', '🔎 DNS Lookup'], ['ports', '🔌 Port Scanner'], ['interfaces', '🖧 Interfaces'], ['settings', '⚙️ Settings']].map(([id, label]) => (
           <button key={id} className={'tab' + (tab === id ? ' active' : '')} onClick={() => setTab(id)}>{label}</button>
         ))}
       </nav>
       {tab === 'ping' && <PingPage />}
       {tab === 'dns' && <DnsPage />}
       {tab === 'ports' && <PortScanPage />}
+      {tab === 'interfaces' && <InterfacesPage />}
+      {tab === 'settings' && <SettingsPage />}
       {tab === 'path' && (<>
       <header>
         <h1 style={{ display: 'flex', alignItems: 'center', gap: '9px' }}>
@@ -2358,12 +2615,30 @@ export default function App() {
           <label title="ICMP payload bytes (0–65500; &gt;~1472 is fragmented)">Payload<input type="number" min="0" max="65500" step="1" value={form.payload} onChange={(e) => setForm({ ...form, payload: e.target.value })} /></label>
           <label title="Maximum hops / TTL (1–255)">Hops<input type="number" min="1" max="255" step="1" value={form.maxhops} onChange={(e) => setForm({ ...form, maxhops: e.target.value })} /></label>
           <label>Interface
-            <select value={iface} onChange={(e) => setIface(e.target.value)}>
-              <option value="">Auto (default route)</option>
-              {interfaces
-                .filter((i) => form.family === 'auto' || (form.family === 'v6') === i.v6)
-                .map((i, k) => <option key={k} value={i.address}>{i.name} — {i.address}</option>)}
-            </select>
+            {/* FEATURE ("add more details" to this dropdown): each option now
+                shows its kind (Wi-Fi/Ethernet/Virtual) alongside the name —
+                a generic driver-assigned adapter name gave no way to tell
+                which entry WAS the Wi-Fi adapter without checking OS network
+                settings separately. See NetInterface::kind (transport.hpp)
+                for how each platform derives this. */}
+            <span style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+              <select value={iface} onChange={(e) => setIface(e.target.value)} style={{ flex: 1 }}>
+                <option value="">Auto (default route)</option>
+                {interfaces
+                  .filter((i) => form.family === 'auto' || (form.family === 'v6') === i.v6)
+                  .map((i, k) => <option key={k} value={i.address}>{i.kind && i.kind !== 'Other' ? `[${i.kind}] ` : ''}{i.name} — {i.address}</option>)}
+              </select>
+              <button type="button" title="Refresh the interface list now (also happens automatically every 20s)"
+                disabled={ifaceRefreshing}
+                onClick={async () => { setIfaceRefreshing(true); try { await refreshInterfacesRef.current() } finally { setIfaceRefreshing(false) } }}>
+                {ifaceRefreshing ? '…' : '⟳'}
+              </button>
+            </span>
+            {interfaces.length === 0 && (
+              <span className="muted" style={{ fontSize: 11 }}>
+                No up, non-loopback adapter found yet — check the Interfaces tab, or press ⟳ after connecting.
+              </span>
+            )}
           </label>
         </div>
         <div className="controls second">
@@ -2583,7 +2858,7 @@ export default function App() {
                       {(() => {
                         const effectiveFamily = editForm.family === 'auto' && sel ? sel.family : editForm.family
                         return interfaces.filter((i) => effectiveFamily === 'auto' || (effectiveFamily === 'v6') === i.v6)
-                          .map((i, k) => <option key={k} value={i.address}>{i.name} — {i.address}</option>)
+                          .map((i, k) => <option key={k} value={i.address}>{i.kind && i.kind !== 'Other' ? `[${i.kind}] ` : ''}{i.name} — {i.address}</option>)
                       })()}
                     </select>
                   </label>
@@ -2664,7 +2939,7 @@ export default function App() {
                                 <button className="hop-pause" disabled={targetPaused}
                                   title={targetPaused ? 'Target is paused — resume the target to control individual hops' : (hopPaused ? 'Resume probing this hop' : 'Pause probing this hop (reduce load)')}
                                   onClick={(e) => { e.stopPropagation(); if (!targetPaused) toggleHopPause(h.hop) }}>{effPaused ? '▶' : '⏸'}</button>
-                                <span className={'hopdot st-' + hopStatus(h)} title={hopStatus(h)} />{h.hop}{h.is_dest ? ' ◀' : ''}
+                                <span className={'hopdot st-' + hopStatus(h)} title={hopStatus(h) === 'pending' ? 'not probed yet' : hopStatus(h)} />{h.hop}{h.is_dest ? ' ◀' : ''}
                                 {form.protocol === 'tcp' && tcpPortState(h) && (
                                   <span
                                     className={'port-state ps-' + tcpPortState(h)}

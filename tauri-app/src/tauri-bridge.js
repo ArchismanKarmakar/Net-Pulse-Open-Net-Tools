@@ -16,7 +16,7 @@
 //    serde), which Tauri serializes to JSON automatically — invoke() already
 //    hands back a plain object, no parsing needed.
 import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { listen, emit } from '@tauri-apps/api/event'
 import { save as saveDialog, open as openDialog, message as messageDialog, ask as askDialog } from '@tauri-apps/plugin-dialog'
 import { check as checkUpdate } from '@tauri-apps/plugin-updater'
 import { relaunch } from '@tauri-apps/plugin-process'
@@ -59,6 +59,7 @@ function install() {
       return JSON.parse(json)
     },
     listInterfaces: async () => JSON.parse(await invoke('list_interfaces')),
+    listInterfacesDetailed: async () => JSON.parse(await invoke('list_interfaces_detailed')),
     // Full-fidelity CSV — every raw sample ColdStore has for a target (or
     // every target), NOT the chart's downsampled series get_state already
     // returns. Plain text back (not JSON — there's nothing to parse, it's
@@ -97,6 +98,39 @@ function install() {
     },
     writeFile: (path, bytes) => invoke('write_file', { path, data: Array.from(bytes) }),
     readFile: async (path) => new Uint8Array(await invoke('read_file', { path })),
+
+    // App-wide Settings (see commands.rs's AppSettings doc comment and
+    // SettingsPage.jsx): loadAppSettings/saveAppSettings round-trip the
+    // same JSON shape (a plain object with the fields AppSettings'
+    // serde(rename_all = "camelCase") already produces, so no shape
+    // translation is needed here, unlike getState/listInterfaces above).
+    // getRecheckTuning reads back what the ENGINE currently has applied
+    // right now (a live sanity check, independent of the settings file —
+    // see its own doc comment, commands.rs).
+    //
+    // Settings used to be a separate OS window (hence openSettingsWindow
+    // and this event-broadcast pair below); it's a tab in the main window
+    // now (see App.jsx/SettingsPage.jsx) after that window came up blank
+    // and outlived the main window when closed. openSettingsWindow is
+    // gone — there's nothing left to open. emitSettingsChanged/
+    // onSettingsChanged are kept: SettingsPage.jsx still uses this event
+    // (rather than prop-drilling into App.jsx) to push a saved theme/
+    // "Add target" defaults into App.jsx's own state live, and Tauri's
+    // event system delivers within a single window exactly the same way
+    // it did across windows, so nothing else needed to change here.
+    loadAppSettings: () => invoke('load_app_settings'),
+    saveAppSettings: (settings) => invoke('save_app_settings', { settings }),
+    getRecheckTuning: () => invoke('get_recheck_tuning'),
+    emitSettingsChanged: (settings) => emit('np-settings-changed', settings),
+    onSettingsChanged: (cb) => {
+      let unlisten = null
+      let cancelled = false
+      listen('np-settings-changed', (event) => cb(event.payload)).then((fn) => {
+        if (cancelled) fn()
+        else unlisten = fn
+      }).catch((e) => { console.error('Net Pulse: failed to listen for settings changes —', e) })
+      return () => { cancelled = true; if (unlisten) unlisten() }
+    },
 
     tools: {
       dns: (name) => invoke('dns_lookup', { name }),

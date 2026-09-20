@@ -254,7 +254,35 @@ int main() {
         CHECK(!is_public_ip("::1"));
     }
 
-    std::printf("[SharedHopTable: edge-attributed key + public gate]\n");
+    std::printf("[cacheable IP classification (is_cacheable_ip)]\n");
+    {
+        // Everything is_public_ip() accepts, is_cacheable_ip() accepts too.
+        CHECK(is_cacheable_ip("1.1.1.1"));
+        CHECK(is_cacheable_ip("2606:4700:4700::1111"));
+        // Private/CGNAT — the whole point of this function: accepted here,
+        // unlike is_public_ip().
+        CHECK(is_cacheable_ip("192.168.1.1"));
+        CHECK(is_cacheable_ip("10.1.5.12"));
+        CHECK(is_cacheable_ip("172.16.0.1"));
+        CHECK(is_cacheable_ip("100.64.0.1")); // CGNAT
+        CHECK(is_cacheable_ip("fd00::1"));    // ULA
+        // BUG FIX regression coverage: link-local must stay rejected even
+        // here — it's present on every interface regardless of real
+        // connectivity (SLAAC in particular), so treating it as "cacheable"
+        // (or, at the call site this exists for, as "proof of a usable
+        // egress") would be a false positive on virtually every machine.
+        CHECK(!is_cacheable_ip("169.254.1.1")); // IPv4 APIPA link-local
+        CHECK(!is_cacheable_ip("fe80::1"));     // IPv6 link-local
+        // Loopback/unspecified/meaningless — never cacheable regardless.
+        CHECK(!is_cacheable_ip("127.0.0.1"));
+        CHECK(!is_cacheable_ip("::1"));
+        CHECK(!is_cacheable_ip("0.0.0.0"));
+        CHECK(!is_cacheable_ip("::"));
+        CHECK(!is_cacheable_ip(""));
+        CHECK(!is_cacheable_ip("*"));
+    }
+
+    std::printf("[SharedHopTable: edge-attributed key + public/private cache gate]\n");
     {
         // Same (source, predecessor, responder) edge: a DIFFERENT owner adopts a fresh sample.
         SharedHopTable sh;
@@ -281,12 +309,9 @@ int main() {
         // Same responder IP, DIFFERENT predecessor: this is the user's exact
         // "10.1.5.12 at two different hop depths, two different real devices"
         // scenario — must NOT cross-adopt, or their real numbers would overwrite
-        // each other.
-        SharedHopTable sh;
-        shared_publish_to(sh, "10.0.0.5", "203.0.113.9", "10.1.5.12", 1000.0, 5.0, 1, 5);   // target A's edge
-        shared_publish_to(sh, "10.0.0.5", "198.51.100.4", "10.1.5.12", 1000.0, 80.0, 2, 8); // target B's DIFFERENT edge, same responder
-        // But wait — 10.1.5.12 is private, so neither publish should even land (gate below).
-        // Re-run with a PUBLIC responder to isolate the predecessor-differentiation behavior:
+        // each other. Runs against a PUBLIC responder to isolate the
+        // predecessor-differentiation behavior from the private-IP gate
+        // (covered separately below).
         SharedHopTable sh2;
         shared_publish_to(sh2, "10.0.0.5", "203.0.113.9", "117.216.207.208", 1000.0, 5.0, 1, 5);
         shared_publish_to(sh2, "10.0.0.5", "198.51.100.4", "117.216.207.208", 1000.0, 80.0, 2, 8);
@@ -294,8 +319,6 @@ int main() {
         auto via_b = shared_adopt_from(sh2, "10.0.0.5", "198.51.100.4", "117.216.207.208", 99, 1000.1, 1.0);
         CHECK(via_a.has_value() && *via_a == 5.0);
         CHECK(via_b.has_value() && *via_b == 80.0); // independent entry, NOT overwritten by the other edge's sample
-        // And the private-IP publishes from the first block truly never landed:
-        CHECK(sh.map.empty());
     }
     {
         // Same edge, SAME predecessor (including both "SRC"): this is the
@@ -306,13 +329,117 @@ int main() {
         CHECK(v.has_value() && *v == 12.0);
     }
     {
-        // Public-IP gate: a private responder is never published, so no other
-        // session can ever adopt a sample for it, regardless of predecessor.
+        // BUG FIX (private-IP shared cache): a private/CGNAT responder is
+        // now cacheable too, PROVIDED `src` is non-empty — a non-empty
+        // source is what disambiguates which routing domain it was seen on
+        // (see cache_gate's doc comment, session.cpp / local_egress_ip's,
+        // transport.cpp). Two DIFFERENT non-empty sources for the same
+        // private IP must still land in independent entries, same as the
+        // public-IP predecessor-differentiation case above — a shared
+        // private hop is the single most common, most valuable case this
+        // fix exists for (e.g. everyone's home router).
         SharedHopTable sh;
         shared_publish_to(sh, "10.0.0.5", "SRC", "192.168.1.1", 1000.0, 1.0, 1, 1);
-        CHECK(sh.map.empty());
+        CHECK(!sh.map.empty());
         auto v = shared_adopt_from(sh, "10.0.0.5", "SRC", "192.168.1.1", 2, 1000.1, 1.0);
+        CHECK(v.has_value() && *v == 1.0);
+        // A different source for the exact same private IP does NOT adopt
+        // the first source's sample — different routing domains, must stay
+        // independent even though `predecessor` and `ip` are identical.
+        auto cross = shared_adopt_from(sh, "10.0.0.9", "SRC", "192.168.1.1", 2, 1000.1, 1.0);
+        CHECK(!cross.has_value());
+    }
+    {
+        // Safety fallback: with NO source to disambiguate it (empty `src` —
+        // e.g. local_egress_ip() couldn't determine one), a private/CGNAT
+        // responder is never published, so no other session can ever adopt
+        // a sample for it — exactly the original, fully conservative
+        // behavior, preserved for exactly the case it was protecting.
+        SharedHopTable sh;
+        shared_publish_to(sh, "", "SRC", "192.168.1.1", 1000.0, 1.0, 1, 1);
+        CHECK(sh.map.empty());
+        auto v = shared_adopt_from(sh, "", "SRC", "192.168.1.1", 2, 1000.1, 1.0);
         CHECK(!v.has_value());
+    }
+
+    std::printf("[shared_last_seen_from: 'stale, live via another target' attribution]\n");
+    {
+        // BUG FIX (real, user-reported): with only ONE target/session ever
+        // having published to an IP, shared_last_seen_from() used to still
+        // report it as recently seen — because the old ip_last_seen index
+        // had no owner attribution, so a hop's own last real reply (right
+        // before it goes stale) always counted as "recently seen by
+        // someone". That made the GUI's "stale ... live via another target"
+        // label fire even with a single target running. Publishing and then
+        // immediately querying with the SAME session id as "self" must now
+        // report nothing — there is no "elsewhere" here, only the caller's
+        // own recent past.
+        SharedHopTable sh;
+        shared_publish_to(sh, "10.0.0.5", "203.0.113.9", "162.158.52.4", 1000.0, 38.0, /*owner*/ 1, 11);
+        auto self_view = shared_last_seen_from(sh, "162.158.52.4", /*self*/ 1, 1000.5, 30.0);
+        CHECK(!self_view.has_value());
+    }
+    {
+        // A genuinely DIFFERENT session publishing to the same IP IS real
+        // "elsewhere" evidence and must still be reported — this is the
+        // legitimate asymmetric/ECMP-routing case the feature exists for.
+        SharedHopTable sh;
+        shared_publish_to(sh, "10.0.0.5", "203.0.113.9", "162.158.52.4", 1000.0, 38.0, /*owner*/ 1, 11);
+        shared_publish_to(sh, "10.0.0.9", "198.51.100.4", "162.158.52.4", 1005.0, 40.0, /*owner*/ 2, 12);
+        auto other_view = shared_last_seen_from(sh, "162.158.52.4", /*self*/ 1, 1005.2, 30.0);
+        CHECK(other_view.has_value() && *other_view == 1005.0);
+        // And session 2 querying its own last publish sees nothing either.
+        auto self_view2 = shared_last_seen_from(sh, "162.158.52.4", /*self*/ 2, 1005.2, 30.0);
+        CHECK(!self_view2.has_value());
+    }
+    {
+        // Still respects max_age regardless of owner.
+        SharedHopTable sh;
+        shared_publish_to(sh, "10.0.0.5", "203.0.113.9", "162.158.52.4", 1000.0, 38.0, /*owner*/ 1, 11);
+        shared_publish_to(sh, "10.0.0.9", "198.51.100.4", "162.158.52.4", 1000.0, 40.0, /*owner*/ 2, 12);
+        auto too_old = shared_last_seen_from(sh, "162.158.52.4", /*self*/ 1, 1000.0 + 30.1, 30.0);
+        CHECK(!too_old.has_value());
+    }
+
+    std::printf("[default auto-refresh (recheck) tuning: default value + set_default_recheck_tuning clamping]\n");
+    {
+        // Out-of-the-box default: 30s / 2 misses (lowered from the old
+        // hardcoded 45s per explicit request, and now runtime-configurable —
+        // see set_default_recheck_tuning's doc comment, session.hpp).
+        CHECK(default_recheck_window_secs() == 30.0);
+        CHECK(default_recheck_threshold() == 2);
+
+        // A GUI Settings window's value takes effect immediately, process-wide.
+        set_default_recheck_tuning(15.0, 4);
+        CHECK(default_recheck_window_secs() == 15.0);
+        CHECK(default_recheck_threshold() == 4);
+
+        // Out-of-range input is CLAMPED, not rejected or ignored — a GUI
+        // control already limited to its own min/max can never actually
+        // trigger this, but a hand-edited settings file might.
+        set_default_recheck_tuning(1.0, 50);
+        CHECK(default_recheck_window_secs() == 5.0);  // kMinRecheckSecs
+        CHECK(default_recheck_threshold() == 10);      // kMaxLegacyMissThreshold
+
+        set_default_recheck_tuning(10000.0, 1);
+        CHECK(default_recheck_window_secs() == 300.0); // kMaxRecheckSecs
+        CHECK(default_recheck_threshold() == 2);        // kMinLegacyMissThreshold
+
+        // <= 0 leaves that field UNCHANGED, so a caller adjusting only one
+        // of the two fields doesn't need to already know the other's value.
+        set_default_recheck_tuning(20.0, 0);
+        CHECK(default_recheck_window_secs() == 20.0);
+        CHECK(default_recheck_threshold() == 2); // unchanged from just above
+        set_default_recheck_tuning(0.0, 6);
+        CHECK(default_recheck_window_secs() == 20.0); // unchanged
+        CHECK(default_recheck_threshold() == 6);
+
+        // Restore the factory default so this global doesn't leak into any
+        // other test (or a future one) that relies on the out-of-the-box
+        // 30s/2 behavior.
+        set_default_recheck_tuning(30.0, 2);
+        CHECK(default_recheck_window_secs() == 30.0);
+        CHECK(default_recheck_threshold() == 2);
     }
 
     std::printf("[session resolve]\n");

@@ -155,8 +155,33 @@ rust::String list_interfaces_json() {
     std::string j = "[";
     for (size_t i = 0; i < ifs.size(); ++i) {
         if (i) j += ",";
+        // "kind" (FEATURE: "add more details" to the source-Interface
+        // dropdown) — Wi-Fi/Ethernet/Virtual/Other, see NetInterface's own
+        // doc comment (transport.hpp) — lets the dropdown say "Wi-Fi"
+        // explicitly instead of leaving the user to guess from a driver-
+        // assigned adapter name.
         j += "{\"name\":\"" + esc(ifs[i].name) + "\",\"address\":\"" + esc(ifs[i].address)
-           + "\",\"v6\":" + (ifs[i].v6 ? "true" : "false") + "}";
+           + "\",\"v6\":" + (ifs[i].v6 ? "true" : "false")
+           + ",\"kind\":\"" + esc(ifs[i].kind) + "\"}";
+    }
+    j += "]";
+    return rust::String(j);
+}
+
+rust::String list_interfaces_detailed_json() {
+    auto ifs = list_interfaces(/*include_all=*/true);
+    std::string j = "[";
+    for (size_t i = 0; i < ifs.size(); ++i) {
+        if (i) j += ",";
+        bool usable = is_cacheable_ip(ifs[i].address);
+        j += "{\"name\":\"" + esc(ifs[i].name) + "\",\"address\":\"" + esc(ifs[i].address)
+           + "\",\"v6\":" + (ifs[i].v6 ? "true" : "false")
+           + ",\"up\":" + (ifs[i].up ? "true" : "false")
+           + ",\"loopback\":" + (ifs[i].loopback ? "true" : "false")
+           + ",\"mtu\":" + std::to_string(ifs[i].mtu)
+           + ",\"usable\":" + (usable ? "true" : "false")
+           + ",\"kind\":\"" + esc(ifs[i].kind) + "\""
+           + "}";
     }
     j += "]";
     return rust::String(j);
@@ -316,6 +341,20 @@ void play_alert_sound(rust::Str kind) {
     // notification sound is not worth failing the surrounding dialog over.
     (void)k;
 #endif
+}
+
+void set_recheck_tuning(double window_secs, int threshold) {
+    // Pure pass-through — see netpulse::set_default_recheck_tuning's doc
+    // comment (session.hpp) for the clamping/leave-unchanged rules; no
+    // reason to duplicate that logic here.
+    netpulse::set_default_recheck_tuning(window_secs, threshold);
+}
+
+rust::String get_recheck_tuning_json() {
+    std::ostringstream os;
+    os << "{\"windowSecs\":" << netpulse::default_recheck_window_secs()
+       << ",\"threshold\":" << netpulse::default_recheck_threshold() << "}";
+    return rust::String(os.str());
 }
 
 } // namespace netpulse_ffi

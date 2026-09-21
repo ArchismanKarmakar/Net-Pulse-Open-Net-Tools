@@ -1308,3 +1308,43 @@ MSVC output tree (both a `.exe` and a `.exe.recipe` present) — old pattern
 returned both paths, new one returns exactly the real binary.
 
 **Docs updated**: `CHANGELOG.md`, this file.
+
+## 32. Fixed: Windows installer bundling failed — `Plugin not found, cannot call EnVar::SetHKCU`
+
+**Bug report** (CI log, "windows build failed again"): sidecar build and
+the full Rust/Tauri release build both succeeded this time (round 30 and
+31's fixes held), but `makensis` then failed while packaging the
+installer:
+```
+Plugin not found, cannot call EnVar::SetHKCU
+Error in macro NSIS_HOOK_POSTINSTALL on macroline 36
+Error in script "...\installer.nsi" on line 706 -- aborting creation process
+```
+
+**Root cause**: `windows/hooks.nsh` used the third-party **EnVar** NSIS
+plugin to add/remove `$INSTDIR` from the user's `PATH`, on the assumption
+that Tauri's downloaded NSIS toolchain ships it. It doesn't — Tauri only
+brings its own `nsis_tauri_utils` plugin; EnVar is separate and nothing in
+this pipeline fetches it. Confirmed by installing a stock NSIS locally
+(`apt install nsis`, same bare toolchain as CI) and reproducing the
+identical "Plugin not found" error from a minimal script calling
+`EnVar::SetHKCU`.
+
+**Fix**: rewrote the `PATH` add/remove logic in `windows/hooks.nsh` to use
+only NSIS's own built-in instructions (no plugin), with a small
+public-domain `StrStr` helper for substring search (defined once for
+install, once as `un.StrStr` for uninstall, per NSIS's scoping rules).
+
+**Verification**: installed `nsis` + `wine`/`wine32` in this environment.
+First reproduced the exact CI failure against stock NSIS. Then compiled
+the *actual* `hooks.nsh` into a throwaway installer/uninstaller and ran
+both under Wine, checking the real registry after each step — empty-PATH
+install, repeat install (no duplicate), append onto an existing PATH,
+repeat append (no duplicate), and uninstall with the entry in the middle,
+at the start, at the end, as the sole value, absent, and duplicated —
+10 cases, all correct. This caught a real bug in the first draft of the
+`StrStr` helper (used the haystack's length instead of the needle's for
+the comparison window) that `makensis` happily compiled but that silently
+broke every match — only running the compiled binaries caught it.
+
+**Docs updated**: `CHANGELOG.md`, this file.

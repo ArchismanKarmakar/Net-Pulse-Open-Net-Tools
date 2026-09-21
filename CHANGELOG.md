@@ -2,6 +2,61 @@
 
 ## 1.2.4
 
+### Fixed: Windows installer bundling failed — `Plugin not found, cannot call EnVar::SetHKCU`
+
+**Bug report** (CI log, "windows build failed again"): the previous two CI
+fixes both held — the sidecar built and copied cleanly, and the full
+Rust/Tauri release build succeeded (`Finished \`release\` profile`, `Built
+application at: ...\target\release\netpulse.exe`) — but `makensis` then
+failed while producing the installer:
+```
+Plugin not found, cannot call EnVar::SetHKCU
+Error in macro NSIS_HOOK_POSTINSTALL on macroline 36
+Error in script "...\installer.nsi" on line 706 -- aborting creation process
+failed to bundle project: `Failed to bundle app with makensis`
+```
+
+**Root cause**: `windows/hooks.nsh`'s `NSIS_HOOK_POSTINSTALL`/
+`NSIS_HOOK_POSTUNINSTALL` macros used the third-party **EnVar** NSIS plugin
+(`EnVar::SetHKCU`, `EnVar::AddValue`, `EnVar::DeleteValue`) to add/remove
+`$INSTDIR` from the current user's `PATH`, on the assumption — recorded in
+the hook file's own (now corrected) comment — that "Tauri's bundled NSIS
+template ships common plugins including EnVar." That assumption was wrong:
+`tauri-action`/`tauri-bundler` download a fresh NSIS plus Tauri's own
+`nsis_tauri_utils` plugin only (visible succeeding a few lines above the
+failure in the CI log) — EnVar is a separate, third-party plugin nothing in
+this pipeline fetches. Reproduced locally: a stock `apt install nsis`
+(v3.09, the same bare NSIS this pipeline effectively gets) has no
+`EnVar.dll` in any of its `Plugins/*` directories, and a minimal script
+calling `EnVar::SetHKCU` against it fails with the identical "Plugin not
+found" error.
+
+**Fix**: dropped the EnVar dependency entirely. The `PATH` add/remove logic
+in `windows/hooks.nsh` now uses only NSIS's own built-in instructions
+(`ReadRegStr`/`WriteRegExpandStr`/`StrCpy`/`StrLen`/`IntOp`/`SendMessage`),
+plus a small public-domain `StrStr` substring-search helper (defined once
+for the installer and once, as `un.StrStr`, for the uninstaller, per NSIS's
+own install/uninstall scoping rules) — no plugin required at all, so
+nothing can go missing from the CI-downloaded NSIS toolchain again.
+
+**Verification**: this one is easy to get subtly wrong (and did, once — see
+below), so it was checked by actually running the compiled installer and
+uninstaller, not just by getting `makensis` to accept the script. Installed
+`nsis` and `wine`/`wine32` locally, reproduced the exact CI error first
+(`EnVar::SetHKCU` against a stock NSIS: "Plugin not found"), then compiled
+the real `hooks.nsh` into a throwaway test installer/uninstaller and ran
+both under Wine, checking `HKCU\Environment\Path` after each step:
+install with an empty `PATH`, install again (no duplicate), install onto an
+existing unrelated `PATH` (correct `;`-join), install again (still no
+duplicate), and uninstall with the entry in the middle/at the
+start/at the end/as the sole value/not present/appearing twice — all ten
+cases produced the correct `PATH` value. This caught a real bug in the
+first draft of the `StrStr` helper (it measured the *haystack's* length
+instead of the *needle's* for the comparison window), which compiled
+cleanly and even made "install" appear to work, but silently made every
+match fail, so "uninstall" would never have actually removed the `PATH`
+entry — `makensis` compiling without error would not have caught this.
+
 ### Fixed: "build installer (windows-latest)" failed — `cp: cannot stat` two filenames at once
 
 **Bug report** (CI log): the "Build CLI sidecar (npulse)" step compiled

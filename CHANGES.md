@@ -1284,3 +1284,27 @@ confirmed it panicked before the fix, and `cargo build`/`cargo check`
 complete cleanly with a real working sidecar binary produced after it.
 
 **Docs updated**: `CHANGELOG.md`, this file.
+
+## 31. Fixed the next CI failure: "build installer (windows-latest)" — cp choking on two filenames at once
+
+Progress from the last fix: the CMakeCache issue is gone, sidecar compiled
+fine this time. New failure, right after: `cp: cannot stat` a string with
+a newline in it, made of two filenames glued together.
+
+**Root cause**: `find build-cli -name "npulse-${TRIPLE}*" -type f` (a
+trailing wildcard, meant to handle Ninja vs Visual Studio putting the
+binary in different subdirectories) also matched
+`npulse-<triple>.exe.recipe` on Windows — an MSBuild-generated
+intermediate file, not a binary, that sits right next to the real `.exe`
+on the multi-config generator. `find` returned both, `$SIDECAR` became one
+argument with an embedded newline, `cp` failed trying to stat it.
+
+**Fix**: all three workflows (`tauri-release.yml`, `tauri-ci.yml`,
+`tauri-canary-build.yml` — same line, copy-pasted in each) now build the
+exact expected filename (`.exe` appended only on Windows, matching
+`build.rs`'s own logic for the same binary) and match on that exactly
+instead of a wildcard. Reproduced the exact bug locally against a fake
+MSVC output tree (both a `.exe` and a `.exe.recipe` present) — old pattern
+returned both paths, new one returns exactly the real binary.
+
+**Docs updated**: `CHANGELOG.md`, this file.

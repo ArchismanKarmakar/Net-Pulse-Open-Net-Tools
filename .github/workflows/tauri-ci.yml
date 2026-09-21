@@ -144,7 +144,16 @@ jobs:
           # reasoning tauri-release.yml's own "Collect installer files"
           # step already uses for the analogous Cargo target/<triple>/
           # nesting difference.
-          SIDECAR=$(find build-cli -name "npulse-${TRIPLE}*" -type f)
+          # BUG FIX (reported CI failure on windows-latest, tauri-release.yml's
+          # identical step): a trailing wildcard here also matches MSVC's
+          # `npulse-<triple>.exe.recipe` intermediate metadata file sitting
+          # next to the real .exe on the multi-config generator — `find`
+          # then returns two lines, and `cp` fails trying to stat that as
+          # one (newline-embedded) argument. Matching the exact expected
+          # filename instead of a wildcard rules that out.
+          SIDECAR_EXT=""
+          case "$TRIPLE" in *windows*) SIDECAR_EXT=".exe" ;; esac
+          SIDECAR=$(find build-cli -name "npulse-${TRIPLE}${SIDECAR_EXT}" -type f)
           echo "Sidecar: $SIDECAR"
           cp "$SIDECAR" tauri-app/src-tauri/binaries/
 

@@ -279,7 +279,23 @@ jobs:
           # for why (multi-config vs single-config generator output nesting
           # differs, same class of issue this workflow's own "Collect
           # installer files" step already works around for Cargo's output).
-          SIDECAR=$(find build-cli -name "npulse-${TRIPLE}*" -type f)
+          #
+          # BUG FIX (reported CI failure, windows-latest): this used to
+          # `-name "npulse-${TRIPLE}*"` (trailing wildcard) — on the
+          # Windows/MSVC multi-config generator that ALSO matches
+          # `npulse-<triple>.exe.recipe`, an MSBuild-generated intermediate
+          # metadata file (not a real binary) that sits right next to the
+          # actual .exe under the same Release/ directory. `find` returned
+          # BOTH paths on two lines, `$SIDECAR` became one argument
+          # containing an embedded newline, and `cp` failed with "cannot
+          # stat" that whole two-line string. Building the EXACT expected
+          # filename (matching build.rs's own `ext` logic for the CLI
+          # sidecar built via cargo) and dropping the wildcard makes this
+          # an exact match again — it can't accidentally also match a
+          # same-stem file with more after it, `.recipe` or otherwise.
+          SIDECAR_EXT=""
+          case "$TRIPLE" in *windows*) SIDECAR_EXT=".exe" ;; esac
+          SIDECAR=$(find build-cli -name "npulse-${TRIPLE}${SIDECAR_EXT}" -type f)
           echo "Sidecar: $SIDECAR"
           cp "$SIDECAR" tauri-app/src-tauri/binaries/
           # Shared with the "Collect installer files" step below (a separate

@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.2.4
+## 1.2.5
 
 ### Added: MSIX packaging workflow for Microsoft Store distribution
 

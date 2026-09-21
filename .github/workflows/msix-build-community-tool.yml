@@ -1,0 +1,143 @@
+name: MSIX Build (community tool — NOT VALIDATED, do not rely on this yet)
+
+# ============================================================================
+# STATUS: scaffolded, deliberately UNUSED. Do not wire this to push/tag/PR
+# triggers and do not treat its output as ready for a real Store submission
+# without first running it, sideloading the result on a real Windows
+# machine, and moving these notes into msix-build.yml's own history once
+# it's actually been exercised.
+#
+# This is the SECOND of two MSIX packaging approaches for NetPulse (see
+# docs/MSIX_DISTRIBUTION.md for the full comparison) — the primary,
+# currently-used one is msix-build.yml, hand-rolled against nothing but the
+# Windows SDK tools (makeappx.exe/signtool.exe) that already ship on
+# windows-latest, with zero third-party CI dependencies.
+#
+# This one instead uses @choochmeque/tauri-windows-bundle
+# (github.com/Choochmeque/tauri-windows-bundle), a single-maintainer npm
+# package (created Jan 2026, latest 0.2.0 as of Sep 2026 — genuinely new,
+# no long track record yet) that automates away most of what msix-build.yml
+# does by hand: manifest generation from tauri.conf.json, Store tile asset
+# generation, multi-arch (x64+arm64) support, and a growing set of optional
+# Windows integrations (file associations, protocol handlers, startup
+# tasks, etc.) that would otherwise mean hand-editing AppxManifest.xml
+# further as NetPulse's Windows-specific feature set grows.
+#
+# Why it's not the default yet: it's a third-party dependency that runs
+# arbitrary code inside CI/release pipelines with no long usage history to
+# lean on — exactly the kind of unverified assumption that caused this
+# project's real EnVar NSIS-plugin CI failure (see CHANGELOG.md/CHANGES.md
+# for that writeup). Kept here, implemented and ready, specifically so
+# switching later is a config change instead of a from-scratch rewrite once
+# either (a) this has actually been run and its output verified on a real
+# Windows machine, or (b) the hand-rolled approach's maintenance burden
+# (manually keeping AppxManifest.xml.template in sync with new Windows
+# integrations) outweighs the trust cost of adopting this dependency.
+#
+# Deliberately does NOT modify package.json/Cargo.toml to add this as a
+# permanent dependency — `init` below runs fresh inside this workflow's own
+# checkout every time it's manually triggered, so nothing about this
+# affects the normal build (npm ci, cargo build, tauri-ci.yml, etc.) until
+# someone deliberately promotes this path.
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: >-
+          Type EXACTLY "I understand this is unvalidated" to run this
+          workflow — a speed bump against triggering it by accident from
+          the Actions tab.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Confirm intent
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check confirmation phrase
+        shell: bash
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "I understand this is unvalidated" ]; then
+            echo "::error::Confirmation phrase did not match — refusing to run the unvalidated MSIX community-tool path. See this workflow file's header comment."
+            exit 1
+          fi
+
+  build:
+    name: build MSIX via @choochmeque/tauri-windows-bundle (x64 + arm64)
+    needs: guard
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - name: Install Rust toolchain (x64 + arm64 targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc, aarch64-pc-windows-msvc
+
+      - name: Install frontend deps
+        working-directory: tauri-app
+        run: npm ci
+
+      - name: Install Tauri CLI
+        working-directory: tauri-app
+        run: npm install --no-save @tauri-apps/cli
+
+      # Same sidecar step as msix-build.yml / tauri-release.yml — the CLI
+      # still needs to exist for tauri.conf.json's bundle.externalBin to
+      # pick up, regardless of which tool turns the app into an MSIX.
+      - name: Build CLI sidecar (npulse)
+        shell: bash
+        run: |
+          TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
+          cmake -S . -B build-cli -DCMAKE_BUILD_TYPE=Release -DNETPULSE_CLI_SIDECAR_TRIPLE="$TRIPLE"
+          cmake --build build-cli --config Release --target npulse
+          mkdir -p tauri-app/src-tauri/binaries
+          SIDECAR_EXT=""
+          case "$TRIPLE" in *windows*) SIDECAR_EXT=".exe" ;; esac
+          SIDECAR=$(find build-cli -name "npulse-${TRIPLE}${SIDECAR_EXT}" -type f)
+          cp "$SIDECAR" tauri-app/src-tauri/binaries/
+
+      # Not added to package.json — installed fresh into this run's own
+      # node_modules only. `@latest` deliberately: this whole path is
+      # explicitly unvalidated already, so pinning a version buys little;
+      # revisit (pin a version) if/when this is ever promoted to real use.
+      - name: Install @choochmeque/tauri-windows-bundle
+        working-directory: tauri-app
+        run: npm install -D @choochmeque/tauri-windows-bundle@latest
+
+      # Generates src-tauri/gen/windows/ (manifest template, Assets/,
+      # bundle.config.json) from this repo's own tauri.conf.json fields —
+      # see this file's header comment and docs/MSIX_DISTRIBUTION.md for
+      # what ends up in bundle.config.json and what still needs a real
+      # Partner Center publisher identity before Store submission, exactly
+      # as msix-build.yml's own manifest template requires.
+      - name: Initialize tauri-windows-bundle project structure
+        working-directory: tauri-app
+        run: npx @choochmeque/tauri-windows-bundle init
+
+      - name: Build MSIX bundle (x64 + arm64)
+        working-directory: tauri-app
+        run: npx @choochmeque/tauri-windows-bundle build --arch x64,arm64 --runner npm
+
+      - name: List produced bundle artifacts (diagnostic)
+        shell: bash
+        run: find tauri-app/src-tauri/target/msix -type f 2>/dev/null | sort || echo "no msix output found under target/msix"
+
+      - name: Upload MSIX bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: netpulse-msix-community-tool
+          path: tauri-app/src-tauri/target/msix/*.msixbundle
+          if-no-files-found: warn
+          retention-days: 14

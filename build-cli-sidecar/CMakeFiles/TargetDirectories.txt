@@ -1,0 +1,7 @@
+C:/Users/Archisman/Downloads/NetPulse-cpp-web/33/NetPulse-cpp-web/build-cli-sidecar/CMakeFiles/netpulse_core.dir
+C:/Users/Archisman/Downloads/NetPulse-cpp-web/33/NetPulse-cpp-web/build-cli-sidecar/CMakeFiles/netpulse_tests.dir
+C:/Users/Archisman/Downloads/NetPulse-cpp-web/33/NetPulse-cpp-web/build-cli-sidecar/CMakeFiles/RUN_TESTS.dir
+C:/Users/Archisman/Downloads/NetPulse-cpp-web/33/NetPulse-cpp-web/build-cli-sidecar/CMakeFiles/ALL_BUILD.dir
+C:/Users/Archisman/Downloads/NetPulse-cpp-web/33/NetPulse-cpp-web/build-cli-sidecar/CMakeFiles/ZERO_CHECK.dir
+C:/Users/Archisman/Downloads/NetPulse-cpp-web/33/NetPulse-cpp-web/build-cli-sidecar/cli/CMakeFiles/npulse.dir
+C:/Users/Archisman/Downloads/NetPulse-cpp-web/33/NetPulse-cpp-web/build-cli-sidecar/cli/CMakeFiles/RUN_TESTS.dir

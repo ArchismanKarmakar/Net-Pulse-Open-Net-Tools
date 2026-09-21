@@ -10,7 +10,7 @@
    source for Tailwind's scanner to find. @source inline() is v4's
    replacement for the old JS-config safelist array. */
 @source inline("s-{discovering,settling,ok,okloss,warn,bad,down}");
-@source inline("st-{discovering,settling,ok,okloss,minor,loss,warn,bad,down,silent}");
+@source inline("st-{discovering,settling,ok,okloss,minor,loss,warn,bad,down,silent,pending}");
 
 @theme {
   --color-bg: var(--bg);
@@ -671,6 +671,12 @@
   .hopdot.st-bad    { background: var(--bad); box-shadow: var(--shadow-led); color: var(--bad); }
   .hopdot.st-down   { background: var(--danger); box-shadow: var(--shadow-led); color: var(--danger); }
   .hopdot.st-silent { background: var(--faint); opacity: .45; } /* no ICMP reply — normal, not a fault */
+  /* Never probed yet (TCP/UDP hop-discovery hasn't reached this TTL, or it's
+     past the confirmed destination) — a HOLLOW ring, not a filled dot, so it
+     reads unmistakably different from both a real 'ok' reply and a 'silent'
+     (asked, got nothing) hop at a glance, instead of collapsing into the
+     same green as a healthy hop. */
+  .hopdot.st-pending { background: transparent; box-shadow: 0 0 0 1.5px var(--border2) inset; opacity: .55; }
 
   /* ---- status bar / config strip / edit panel ----
      Tinted by the open target's own health so the state is legible at a
@@ -911,8 +917,60 @@
 .tab:hover { color: var(--text); background: var(--btn-hover); box-shadow: none; }
 .tab.active { color: var(--text); background: var(--bg); border-color: var(--border);
   position: relative; top: 1px; font-weight: 600; }
-.toolpage { padding: 18px 22px; max-width: 900px; }
-.toolpage h2 { margin: 0 0 14px; font-size: 18px; }
+/* Tool pages (Interfaces, Settings, DNS, Port Scanner, Ping) — this used to
+   be nothing but padding + a max-width, so a table or a form sat directly
+   on the window background with no visual boundary at all: flat and
+   "pasted-in" next to the dashboard's own cards, headers and shadows. The
+   header rule and .tool-section below exist so every tool page reads as
+   part of the same designed app instead of a bare content dump. */
+/* BUG FIX: every tool page (Interfaces, Settings, DNS, Port Scanner, Ping)
+   is rendered as a direct sibling of <nav class="tabbar"> inside `.app`
+   (App.jsx) — and `.app` itself is a fixed-height flex column
+   (`flex flex-col h-screen overflow-hidden`, above). A plain `<div
+   className="toolpage">` with no flex/overflow rules of its own has no way
+   to shrink or scroll when its content is taller than whatever's left of
+   that fixed height — the parent's own `overflow: hidden` just clips
+   everything past the bottom edge, with nothing to scroll: on a small
+   window (reported: Settings' "Appearance" section and the bottom of the
+   Interfaces table both went fully unreachable, no scrollbar at all).
+   `flex: 1 1 auto` lets it take the remaining column height instead of its
+   content's natural height; `min-height: 0` is required for a flex child
+   to be allowed to shrink below that content height in the first place
+   (the flexbox default is `min-height: auto`, which — counterintuitively —
+   means "at least as tall as my content", exactly defeating `overflow`
+   here); `overflow-y: auto` is what actually turns the clipped remainder
+   into a scrollable one. */
+.toolpage { padding: 22px 26px 32px; max-width: 900px; flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+/* For a page whose content is a data table (Interfaces) rather than a
+   prose form (Settings/DNS/Ping) — a fixed reading-width column is wrong
+   here: it wastes the rest of the window as dead space AND forces the
+   table into its own cramped horizontal scroll well before it needed to.
+   Table columns should get to use whatever real width the window has. */
+.toolpage.fluid { max-width: none; }
+.toolpage h2 { margin: 0 0 4px; font-size: 19px; letter-spacing: -0.01em; }
+.toolpage > h2:first-child,
+.toolpage > .toolpage-header {
+  padding-bottom: 14px; margin-bottom: 18px; border-bottom: 1px solid var(--border);
+}
+.toolpage-header { display: flex; flex-direction: column; gap: 3px; }
+.toolpage-header h2 { margin: 0; padding: 0; border: none; }
+.toolpage-header .sub { font-size: 12.5px; color: var(--muted); }
+
+/* A titled card section — the building block for a page made of a few
+   distinct groups (Settings' "Auto-refresh"/"New target defaults"/
+   "Appearance", say), each visually separated the same way a .dcard on the
+   dashboard is: real background, border, radius and depth rather than a
+   plain <div> with margin between headings. */
+.tool-section {
+  background: var(--panel); border: 1px solid var(--border2); border-radius: 12px;
+  padding: 16px 18px; box-shadow: var(--shadow-sm, 0 1px 2px rgba(0,0,0,.18));
+}
+.tool-section + .tool-section { margin-top: 14px; }
+.tool-section h3 {
+  margin: 0 0 4px; font-size: 12.5px; text-transform: uppercase; letter-spacing: 0.045em;
+  color: var(--muted); font-weight: 700;
+}
+.tool-section .tool-section-desc { font-size: 12px; color: var(--muted); line-height: 1.55; margin-bottom: 12px; }
 .tool-row { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
 .tool-row label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
 .tool-row input { background: var(--btn-bg); border: 1px solid var(--border2); color: var(--text);
@@ -932,6 +990,58 @@
   border-radius: 8px; padding: 4px 9px; font-size: 12.5px; }
 .port-chip em { color: var(--muted); font-style: normal; margin-left: 6px; }
 .toolpage .danger { color: var(--danger); }
+
+/* Critical alert card (no-IPv4/no-IPv6 banners on InterfacesPage) —
+   distinct from the plain `.danger` text-color utility above: this is a
+   background-tinted card meant to actually read as urgent at a glance,
+   not just colored text buried among normal cards. */
+.tool-card.danger { background: color-mix(in srgb, var(--danger) 14%, var(--panel));
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border2)); color: var(--text); }
+.tool-card.danger b { color: var(--danger); }
+.tool-card.success { background: color-mix(in srgb, var(--good) 14%, var(--panel));
+  border-color: color-mix(in srgb, var(--good) 45%, var(--border2)); color: var(--text); }
+
+.ok { color: var(--good); }
+
+/* Network Interfaces page — the table now sits inside a real card
+   (.iface-table-wrap) instead of directly on the window background, with a
+   shaded header row and zebra striping so a 15+ adapter list (common once
+   VMware/WSL/VPN virtual adapters are counted) stays readable at a glance. */
+/* BUG FIX: `overflow: hidden` here didn't just clip the rounded corners —
+   with more columns than a narrow window has room for (this table gained
+   a Kind column; MTU and Egress already made it wide even before that),
+   it silently clipped the whole right side of the table, MTU/Egress
+   columns included, with no scrollbar to reach them — the columns weren't
+   "not present", they were rendered and then cut off. `overflow-x: auto`
+   (leaving Y unset — nothing here is ever taller than its own rows) keeps
+   the rounded-corner card look when everything fits, and grows a real
+   horizontal scrollbar on a narrow window instead of just hiding data. */
+.iface-table-wrap {
+  background: var(--panel); border: 1px solid var(--border2); border-radius: 12px;
+  overflow-x: auto; box-shadow: var(--shadow-sm, 0 1px 2px rgba(0,0,0,.18));
+}
+/* BUG FIX: an earlier pass added an explicit `min-width: 660px` here,
+   reasoning (wrongly) that `width: 100%` alone would let the table just
+   shrink-squish illegibly on a narrow wrapper with no scrollbar ever
+   appearing. It doesn't need that: `white-space: nowrap` below already
+   stops any individual cell's text from wrapping/collapsing, so the table
+   already has a real, content-driven minimum width — an *explicit* extra
+   floor on top of that only made a horizontal scrollbar trigger MORE
+   often than the content actually required (visible once the page went
+   `.fluid` above: plenty of real width available, table still boxed into
+   660px and scrolling sideways). `width: 100%` here means "fill whatever
+   the (now fluid) wrapper has, but never shrink past your own content". */
+.iface-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.iface-table th { text-align: left; color: var(--muted); font-weight: 700; font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.04em; padding: 10px 14px; background: var(--panel2);
+  border-bottom: 1px solid var(--border2); white-space: nowrap; }
+.iface-table td { padding: 9px 14px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.iface-table tbody tr:last-child td { border-bottom: none; }
+.iface-table tbody tr:nth-child(even) { background: color-mix(in srgb, var(--panel2) 45%, transparent); }
+.iface-table tbody tr:hover { background: var(--card-hover, var(--btn-hover)); }
+.iface-table tr.muted td { opacity: 0.55; }
+.iface-table code { background: var(--btn-bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 2px 7px; font-size: 12px; }
 
 /* Per-hop pause control (added) */
 .hop-pause { opacity: 0; background: transparent; border: none; color: var(--muted);

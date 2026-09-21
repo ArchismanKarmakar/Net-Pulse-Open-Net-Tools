@@ -3,6 +3,7 @@
 #include "netpulse/platform.hpp"
 
 #include <cstring>
+#include <cctype>
 #include <chrono>
 #include <map>
 #include <memory>
@@ -40,6 +41,8 @@ using socklen_t = int;
 #  include <cerrno>
 #  include <ifaddrs.h>
 #  include <net/if.h>
+#  include <sys/ioctl.h> // SIOCGIFMTU (list_interfaces' include_all MTU lookup)
+#  include <sys/stat.h> // stat() (list_interfaces' Wi-Fi-vs-Ethernet kind detection, Linux /sys/class/net probe)
 #  define CLOSESOCK ::close
 #  define LASTERR errno
 #  define WOULDBLOCK EWOULDBLOCK
@@ -330,7 +333,63 @@ std::vector<std::shared_ptr<Prober>> list_active_pooled_sockets() {
     return out;
 }
 
-std::vector<NetInterface> list_interfaces() {
+namespace {
+// Best-effort virtual/hypervisor/VPN adapter name heuristic — shared by both
+// platform branches below. These are never Wi-Fi or "real" Ethernet, and
+// calling them "Ethernet" (the generic fallback) would be actively
+// misleading in the diagnostics list, so they get their own bucket.
+bool looks_virtual(const std::string& name) {
+    static const char* prefixes[] = {
+        "veth", "docker", "br-", "virbr", "tun", "tap", "vmnet", "vmware",
+        "vethernet", "vEthernet", "VMware", "Hyper-V", "WSL", "utun",
+        "bridge", "zt", "tailscale", "wg",
+    };
+    std::string lower = name;
+    for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (auto* p : prefixes) {
+        std::string pl = p;
+        for (auto& c : pl) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (lower.rfind(pl, 0) == 0) return true;
+    }
+    return false;
+}
+} // namespace
+
+#ifdef _WIN32
+// Windows: IF_TYPE_IEEE80211 (71) is the standard IANA ifType for Wi-Fi
+// adapters (ipifcons.h — checked by value like IF_TYPE_SOFTWARE_LOOPBACK
+// above, for the same MinGW/MSVC-SDK-header-variance reason).
+// IF_TYPE_ETHERNET_CSMACD (6) covers real wired NICs.
+static std::string classify_kind(ULONG if_type, const std::string& name) {
+    if (looks_virtual(name)) return "Virtual";
+    if (if_type == 71) return "Wi-Fi";
+    if (if_type == 6) return "Ethernet";
+    return "Other";
+}
+#else
+// POSIX: a genuinely wireless net device exposes a "wireless" (legacy WEXT)
+// or "phy80211" (modern nl80211/cfg80211) entry under
+// /sys/class/net/<name>/ on Linux — checking for either covers old and new
+// kernels without needing a wireless-extensions header this project doesn't
+// otherwise depend on. This is Linux-specific (no /sys on macOS/BSD); on
+// those platforms it falls through to the name heuristic below, which is
+// necessarily weaker (macOS's "en0" convention doesn't distinguish Wi-Fi
+// from Ethernet in the name at all) — best-effort, not exhaustive.
+static std::string classify_kind(const std::string& name) {
+    if (looks_virtual(name)) return "Virtual";
+#ifdef __linux__
+    struct stat st{};
+    if (::stat(("/sys/class/net/" + name + "/wireless").c_str(), &st) == 0) return "Wi-Fi";
+    if (::stat(("/sys/class/net/" + name + "/phy80211").c_str(), &st) == 0) return "Wi-Fi";
+#endif
+    // Common cross-distro/BSD wireless naming conventions as a fallback.
+    if (name.rfind("wl", 0) == 0 || name.rfind("wifi", 0) == 0) return "Wi-Fi";
+    if (name.rfind("en", 0) == 0 || name.rfind("eth", 0) == 0) return "Ethernet";
+    return "Other";
+}
+#endif
+
+std::vector<NetInterface> list_interfaces(bool include_all) {
     ensure_winsock_ready();
     std::vector<NetInterface> out;
 #ifdef _WIN32
@@ -344,18 +403,28 @@ std::vector<NetInterface> list_interfaces() {
     }
     if (GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, addrs, &size) == NO_ERROR) {
         for (auto* a = addrs; a; a = a->Next) {
-            if (a->OperStatus != IfOperStatusUp) continue;
+            bool up = (a->OperStatus == IfOperStatusUp);
+            if (!up && !include_all) continue;
+            // IF_TYPE_SOFTWARE_LOOPBACK == 24 (standard IANA ifType value,
+            // ipifcons.h) — checked by value rather than requiring that
+            // header directly, since which header actually defines it
+            // varies across MinGW/MSVC SDK versions and iphlpapi.h already
+            // transitively provides everything else this function needs.
+            bool loopback = (a->IfType == 24);
+            if (loopback && !include_all) continue;
             char name[256] = {0};
             WideCharToMultiByte(CP_UTF8, 0, a->FriendlyName, -1, name, sizeof(name), nullptr, nullptr);
+            uint32_t mtu = (a->Mtu != 0xFFFFFFFF) ? static_cast<uint32_t>(a->Mtu) : 0; // 0xFFFFFFFF = "unknown" per MSDN
+            std::string kind = loopback ? "Other" : classify_kind(a->IfType, name);
             for (auto* u = a->FirstUnicastAddress; u; u = u->Next) {
                 char ip[INET6_ADDRSTRLEN] = {0};
                 auto* sa = u->Address.lpSockaddr;
                 if (sa->sa_family == AF_INET) {
                     inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in*>(sa)->sin_addr, ip, sizeof(ip));
-                    out.push_back({name, ip, false});
+                    out.push_back({name, ip, false, up, loopback, mtu, kind});
                 } else if (sa->sa_family == AF_INET6) {
                     inet_ntop(AF_INET6, &reinterpret_cast<sockaddr_in6*>(sa)->sin6_addr, ip, sizeof(ip));
-                    out.push_back({name, ip, true});
+                    out.push_back({name, ip, true, up, loopback, mtu, kind});
                 }
             }
         }
@@ -365,21 +434,119 @@ std::vector<NetInterface> list_interfaces() {
     if (getifaddrs(&ifap) == 0) {
         for (auto* ifa = ifap; ifa; ifa = ifa->ifa_next) {
             if (!ifa->ifa_addr) continue;
-            if (!(ifa->ifa_flags & IFF_UP)) continue;
-            if (ifa->ifa_flags & IFF_LOOPBACK) continue;
+            bool up = !!(ifa->ifa_flags & IFF_UP);
+            bool loopback = !!(ifa->ifa_flags & IFF_LOOPBACK);
+            if (!include_all && (!up || loopback)) continue;
+            uint32_t mtu = 0;
+            if (include_all && ifa->ifa_name) {
+                // ifaddrs doesn't carry MTU itself — SIOCGIFMTU is the
+                // portable (Linux/BSD/macOS) way to ask for it. Best-effort:
+                // a failure (e.g. sandboxed/restricted environment) just
+                // leaves mtu at its "unknown" default of 0, same as an
+                // OS/adapter that genuinely doesn't report one.
+                int mtu_fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+                if (mtu_fd >= 0) {
+                    struct ifreq ifr{};
+                    std::strncpy(ifr.ifr_name, ifa->ifa_name, IFNAMSIZ - 1);
+                    if (::ioctl(mtu_fd, SIOCGIFMTU, &ifr) == 0) mtu = static_cast<uint32_t>(ifr.ifr_mtu);
+                    ::close(mtu_fd);
+                }
+            }
             char ip[INET6_ADDRSTRLEN] = {0};
+            std::string ifname = ifa->ifa_name ? ifa->ifa_name : "";
+            std::string kind = loopback ? "Other" : classify_kind(ifname);
             if (ifa->ifa_addr->sa_family == AF_INET) {
                 inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in*>(ifa->ifa_addr)->sin_addr, ip, sizeof(ip));
-                out.push_back({ifa->ifa_name ? ifa->ifa_name : "", ip, false});
+                out.push_back({ifname, ip, false, up, loopback, mtu, kind});
             } else if (ifa->ifa_addr->sa_family == AF_INET6) {
                 inet_ntop(AF_INET6, &reinterpret_cast<sockaddr_in6*>(ifa->ifa_addr)->sin6_addr, ip, sizeof(ip));
-                out.push_back({ifa->ifa_name ? ifa->ifa_name : "", ip, true});
+                out.push_back({ifname, ip, true, up, loopback, mtu, kind});
             }
         }
         freeifaddrs(ifap);
     }
 #endif
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// Local egress address for a destination — the "UDP connect() trick".
+//
+// Exists to let the shared-hop cache (SharedHopTable, session.cpp) safely
+// extend cross-target caching to PRIVATE/CGNAT hop IPs, not just public ones.
+// The original public-only restriction is because a private IP (192.168.x,
+// 10.x, ...) is only unambiguous WITHIN one routing domain — the same
+// address can be two different physical devices reached via two different
+// local interfaces (e.g. the physical NIC vs. a VPN's virtual adapter). The
+// cache is already keyed in part by the session's configured `source_addr`,
+// but that's usually left empty (most targets don't explicitly bind an
+// egress interface), which collapses every such session onto the same empty
+// key component regardless of which interface the OS actually routes them
+// through — exactly the ambiguity the public-only restriction exists to
+// avoid.
+//
+// A raw ICMP socket that isn't bound or connected doesn't help here:
+// getsockname() on it just returns the unspecified address (0.0.0.0/::)
+// until the kernel has actually committed to a route, which sendto() does
+// per-packet rather than once up front. Instead, this opens a throwaway
+// UDP socket, connect()s it to the real destination (this never sends a
+// packet — UDP connect() only consults the routing table and records which
+// local address it would use), reads that decision back via getsockname(),
+// and closes the socket immediately. That's the OS's own routing table
+// answering "which interface would traffic to THIS destination actually
+// leave from" — the same decision it makes for the real probes — so two
+// sessions whose destinations route out different interfaces get
+// correspondingly different keys automatically, with no configuration
+// required, while two sessions that genuinely share an egress (the common
+// case) correctly collapse onto the same one and share the cache benefit.
+//
+// std::nullopt on any failure (no route, sandboxed/offline environment,
+// etc.) — callers must treat that as "could not establish a safe cache key"
+// and fall back to the existing public-only behavior for that session
+// rather than guessing.
+std::optional<std::string> local_egress_ip(Family family, const std::string& dest_ip) {
+    if (dest_ip.empty()) return std::nullopt;
+    ensure_winsock_ready();
+    int af = (family == Family::V4) ? AF_INET : AF_INET6;
+#ifdef _WIN32
+    SOCKET fd = socket(af, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd == INVALID_SOCKET) return std::nullopt;
+#else
+    int fd = socket(af, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd < 0) return std::nullopt;
+#endif
+    bool ok = false;
+    std::string result;
+    if (family == Family::V4) {
+        sockaddr_in dst{};
+        dst.sin_family = AF_INET;
+        dst.sin_port = htons(53); // arbitrary — never actually sent to
+        if (inet_pton(AF_INET, dest_ip.c_str(), &dst.sin_addr) == 1 &&
+            connect(fd, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) == 0) {
+            sockaddr_in local{};
+            socklen_t len = sizeof(local);
+            if (getsockname(fd, reinterpret_cast<sockaddr*>(&local), &len) == 0) {
+                char ip[INET6_ADDRSTRLEN] = {0};
+                if (inet_ntop(AF_INET, &local.sin_addr, ip, sizeof(ip))) { result = ip; ok = true; }
+            }
+        }
+    } else {
+        sockaddr_in6 dst{};
+        dst.sin6_family = AF_INET6;
+        dst.sin6_port = htons(53);
+        if (inet_pton(AF_INET6, dest_ip.c_str(), &dst.sin6_addr) == 1 &&
+            connect(fd, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) == 0) {
+            sockaddr_in6 local{};
+            socklen_t len = sizeof(local);
+            if (getsockname(fd, reinterpret_cast<sockaddr*>(&local), &len) == 0) {
+                char ip[INET6_ADDRSTRLEN] = {0};
+                if (inet_ntop(AF_INET6, &local.sin6_addr, ip, sizeof(ip))) { result = ip; ok = true; }
+            }
+        }
+    }
+    CLOSESOCK(fd);
+    if (!ok || result.empty() || result == "0.0.0.0" || result == "::") return std::nullopt;
+    return result;
 }
 
 } // namespace netpulse

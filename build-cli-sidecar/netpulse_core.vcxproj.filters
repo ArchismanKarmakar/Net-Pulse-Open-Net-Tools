@@ -1,0 +1,37 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="C:\Users\Archisman\Downloads\NetPulse-cpp-web\33\NetPulse-cpp-web\core\src\icmp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\Archisman\Downloads\NetPulse-cpp-web\33\NetPulse-cpp-web\core\src\ping_run.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\Archisman\Downloads\NetPulse-cpp-web\33\NetPulse-cpp-web\core\src\probe_http.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\Archisman\Downloads\NetPulse-cpp-web\33\NetPulse-cpp-web\core\src\probe_tcp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\Archisman\Downloads\NetPulse-cpp-web\33\NetPulse-cpp-web\core\src\probe_udp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\Archisman\Downloads\NetPulse-cpp-web\33\NetPulse-cpp-web\core\src\session.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\Archisman\Downloads\NetPulse-cpp-web\33\NetPulse-cpp-web\core\src\stats.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\Archisman\Downloads\NetPulse-cpp-web\33\NetPulse-cpp-web\core\src\transport.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\Archisman\Downloads\NetPulse-cpp-web\33\NetPulse-cpp-web\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{03D44F49-E6CA-31F8-9DDA-534E04CE9B62}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

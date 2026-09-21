@@ -81,6 +81,15 @@ rust::String export_target_full_csv(uint64_t id);
 rust::String export_all_targets_full_csv();
 
 rust::String list_interfaces_json();
+// Full diagnostic listing — every adapter (up or down, including loopback),
+// with up/loopback/mtu, plus a computed `usable` flag (is_cacheable_ip() on
+// the address — the same classification the engine itself uses to decide
+// whether an address is a real, routing-domain-scoped egress rather than
+// link-local/loopback noise). Backs the interfaces diagnostics page and the
+// no-IPv4/no-IPv6 critical alert — list_interfaces_json() above stays
+// unchanged (still filtered, still 3 fields) so the existing source-address
+// dropdown's behavior and payload shape don't shift under it.
+rust::String list_interfaces_detailed_json();
 
 // Build tag of the compiled engine (see NETPULSE_ENGINE_BUILD) — lets the app
 // verify at runtime which binary (normal vs. NETPULSE_OBFUSCATE) is loaded,
@@ -161,5 +170,21 @@ rust::String set_debug_logging(bool on, rust::Str dir);
 // no-op if unavailable rather than a hard failure — losing a notification
 // chime is not worth erroring the whole dialog over.
 void play_alert_sound(rust::Str kind);
+
+
+// Settings window support: the process-wide default cadence/threshold for
+// the passive background "auto refresh" mechanism (see
+// netpulse::set_default_recheck_tuning's doc comment, session.hpp, for the
+// full rationale — this is a thin pass-through, no logic of its own).
+// window_secs/threshold <= 0 leaves that field unchanged, same convention as
+// the C++ function underneath. Applies immediately, process-wide, to every
+// currently-running and future target.
+void set_recheck_tuning(double window_secs, int threshold);
+// `{"windowSecs":<number>,"threshold":<number>}` — what's actually in
+// effect right now (the compiled-in 30s/2 default until something changes
+// it), for the Settings window to display on open/reload, independent of
+// whatever a settings file on disk says (which may not have been applied
+// yet, e.g. right after a fresh install with no settings file at all).
+rust::String get_recheck_tuning_json();
 
 } // namespace netpulse_ffi

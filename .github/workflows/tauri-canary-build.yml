@@ -83,6 +83,22 @@ jobs:
         working-directory: tauri-app
         run: npm install --no-save @tauri-apps/cli
 
+      # See tauri-release.yml's identically-named step / tauri-app/src-tauri/
+      # binaries/README.md for the full convention — same sidecar, same
+      # externalBin config (tauri.conf.json, inherited by the canary config
+      # merge since tauri.canary.conf.json doesn't override bundle.externalBin),
+      # so a canary install gets the CLI too, not just a production one.
+      - name: Build CLI sidecar (npulse)
+        shell: bash
+        run: |
+          TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
+          cmake -S . -B build-cli -DCMAKE_BUILD_TYPE=Release -DNETPULSE_CLI_SIDECAR_TRIPLE="$TRIPLE"
+          cmake --build build-cli --config Release --target npulse
+          mkdir -p tauri-app/src-tauri/binaries
+          SIDECAR=$(find build-cli -name "npulse-${TRIPLE}*" -type f)
+          echo "Sidecar: $SIDECAR"
+          cp "$SIDECAR" tauri-app/src-tauri/binaries/
+
       # --features canary → Cargo.toml's `canary = ["tauri/devtools"]`
       # --config tauri.canary.conf.json → merged over the base config:
       #   distinct productName/identifier/window title, same CSP/behavior

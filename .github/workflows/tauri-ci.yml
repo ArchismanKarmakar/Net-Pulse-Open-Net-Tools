@@ -40,6 +40,23 @@ jobs:
       - name: Run unit tests (netpulse_tests)
         run: ctest --test-dir build -C Release --output-on-failure
 
+      # FEATURE: the CLI (cli/, target `npulse`) is built automatically by
+      # the step above already — NETPULSE_BUILD_CLI defaults ON in the
+      # top-level CMakeLists.txt precisely so a plain `cmake --build`
+      # produces it with no extra flags, here included. This step is a
+      # cheap, real smoke test on top of that: confirm the binary actually
+      # runs and dispatches its subcommands correctly on every OS, not just
+      # that it links. `ifconfig` and `help` need no network and no
+      # elevated privileges, so they're safe to run unconditionally in CI
+      # regardless of the runner's own network/privilege posture.
+      - name: Smoke-test the CLI (npulse)
+        shell: bash
+        run: |
+          BIN=$(find build -name 'npulse*' -type f \( -perm -u+x -o -name '*.exe' \) | head -1)
+          echo "Testing $BIN"
+          "$BIN" help
+          "$BIN" ifconfig
+
   tauri:
     name: Tauri app (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -104,6 +121,32 @@ jobs:
       - name: Install Tauri CLI
         working-directory: tauri-app
         run: npm install --no-save @tauri-apps/cli
+
+      # FEATURE: builds the same CLI sidecar the release workflow bundles
+      # into real installers (see tauri-release.yml's identically-named
+      # step and tauri-app/src-tauri/binaries/README.md for the full
+      # convention) so this job's packaging smoke test below actually
+      # exercises the externalBin path too, not just the main app bundle —
+      # a config mistake there would otherwise only surface on a real
+      # tagged release, the worst possible place to find it for the first
+      # time.
+      - name: Build CLI sidecar (npulse)
+        shell: bash
+        run: |
+          TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
+          cmake -S . -B build-cli -DCMAKE_BUILD_TYPE=Release -DNETPULSE_CLI_SIDECAR_TRIPLE="$TRIPLE"
+          cmake --build build-cli --config Release --target npulse
+          mkdir -p tauri-app/src-tauri/binaries
+          # `find`, not a hardcoded path: a multi-config generator (Visual
+          # Studio, CMake's default on windows-latest) nests output under
+          # an extra Release/ directory a single-config generator
+          # (Makefiles/Ninja, the Linux/macOS default) doesn't — same
+          # reasoning tauri-release.yml's own "Collect installer files"
+          # step already uses for the analogous Cargo target/<triple>/
+          # nesting difference.
+          SIDECAR=$(find build-cli -name "npulse-${TRIPLE}*" -type f)
+          echo "Sidecar: $SIDECAR"
+          cp "$SIDECAR" tauri-app/src-tauri/binaries/
 
       - name: tauri build (packaging smoke test)
         working-directory: tauri-app

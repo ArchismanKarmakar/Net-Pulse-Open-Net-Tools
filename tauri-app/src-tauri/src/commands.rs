@@ -187,6 +187,17 @@ pub fn list_interfaces() -> String {
     ffi::list_interfaces_json()
 }
 
+/// Full diagnostic listing (every adapter, up or down, including loopback,
+/// with up/loopback/mtu/usable) — backs the interfaces diagnostics page and
+/// the no-IPv4/no-IPv6 critical alert. See list_interfaces_detailed_json's
+/// doc comment (netpulse_ffi.hpp) for why this is a separate command rather
+/// than a flag on list_interfaces() above: that one's payload shape and
+/// filtering are relied on by the existing source-address dropdown.
+#[tauri::command]
+pub fn list_interfaces_detailed() -> String {
+    ffi::list_interfaces_detailed_json()
+}
+
 /// Every raw sample this target has ever recorded, across every hop —
 /// deliberately separate from get_state (see export_target_full_csv's doc
 /// comment in manager.hpp) rather than a flag on it, since this reads
@@ -455,3 +466,141 @@ pub fn set_debug_logging(app: tauri::AppHandle, on: bool) -> Result<String, Stri
 pub fn play_alert_sound(kind: String) {
     ffi::play_alert_sound(&kind);
 }
+
+// ---------------------------------------------------------------------------
+// App-wide Settings window: a separate, savable/loadable settings surface —
+// FEATURE (user-requested) — covering both the passive "auto refresh"
+// engine tuning (see set_default_recheck_tuning's doc comment, session.hpp,
+// for the full mechanism this changes) and the defaults every NEW target
+// starts from (App.jsx's `form` state used to hardcode these inline; they're
+// now sourced from here instead, so changing them here changes what a
+// freshly opened "Add target" form starts pre-filled with, without touching
+// any already-running target). Persisted as one JSON file in the app's own
+// config directory — survives an update/reinstall that leaves user data
+// alone, same directory class Tauri itself recommends for this
+// (`app_config_dir`, distinct from `app_local_data_dir` used for the engine's
+// cold-tier stats store above in lib.rs — config vs. bulk data).
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSettings {
+    // Passive background "auto refresh" (guarded-wipe) tuning — see
+    // set_default_recheck_tuning's doc comment (session.hpp) for what these
+    // actually control, and ARCHITECTURE.md §6 for the full mechanism and
+    // why this is much slower by design than the per-target Force Recheck
+    // button. 30s/2 misses out of the box (lowered from the old hardcoded
+    // 45s per explicit request).
+    #[serde(default = "default_auto_refresh_secs")]
+    pub auto_refresh_secs: f64,
+    #[serde(default = "default_auto_refresh_threshold")]
+    pub auto_refresh_threshold: i32,
+
+    // Defaults a freshly opened "Add target" form starts pre-filled with —
+    // same fields/defaults as TargetConfig above, intentionally: changing
+    // one of these is exactly "change what a new target defaults to",
+    // nothing more (an already-added target keeps whatever it was given at
+    // the time, exactly like editing this doesn't retroactively touch
+    // targets added under the old default).
+    #[serde(default = "default_probe")]
+    pub default_probe: f64,
+    #[serde(default = "default_trace")]
+    pub default_trace: f64,
+    #[serde(default)]
+    pub default_timeout: f64,
+    #[serde(default = "default_payload")]
+    pub default_payload: f64,
+    #[serde(default = "default_maxhops")]
+    pub default_maxhops: f64,
+    #[serde(default = "default_raw")]
+    pub default_raw: bool,
+    #[serde(default = "default_family")]
+    pub default_family: String,
+    #[serde(default = "default_protocol")]
+    pub default_protocol: String,
+    #[serde(default = "default_dest_port")]
+    pub default_dest_port: f64,
+
+    // Consolidates the theme toggle that used to live ONLY in localStorage
+    // (App.jsx's `np-theme` key) — kept working the same way for the main
+    // window's own instant-apply toggle, but now also settable/visible from
+    // the Settings window and included in the same saved/loaded file, so
+    // "export my settings" or a fresh machine picks it up too.
+    #[serde(default = "default_theme")]
+    pub theme: String,
+}
+
+fn default_auto_refresh_secs() -> f64 { 30.0 }
+fn default_auto_refresh_threshold() -> i32 { 2 }
+fn default_theme() -> String { "dark".into() }
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            auto_refresh_secs: default_auto_refresh_secs(),
+            auto_refresh_threshold: default_auto_refresh_threshold(),
+            default_probe: default_probe(),
+            default_trace: default_trace(),
+            default_timeout: 0.0,
+            default_payload: default_payload(),
+            default_maxhops: default_maxhops(),
+            default_raw: default_raw(),
+            default_family: default_family(),
+            default_protocol: default_protocol(),
+            default_dest_port: default_dest_port(),
+            theme: default_theme(),
+        }
+    }
+}
+
+fn settings_file_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    use tauri::Manager;
+    let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("settings.json"))
+}
+
+// Loads the saved settings file if one exists (falling back to built-in
+// defaults for a fresh install, OR for a corrupt/hand-edited file that
+// fails to parse — a bad settings file degrading to defaults, rather than
+// breaking app startup outright, matches the same "clamp/degrade, don't
+// hard-fail" philosophy set_default_recheck_tuning already uses for
+// out-of-range values). ALSO applies the loaded auto-refresh tuning to the
+// engine immediately — called once from lib.rs's `.setup()`, before any
+// target can be added, so the very first target already sees the saved
+// default rather than the compiled-in one until the Settings window happens
+// to be opened.
+#[tauri::command]
+pub fn load_app_settings(app: tauri::AppHandle) -> Result<AppSettings, String> {
+    let path = settings_file_path(&app)?;
+    let settings = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<AppSettings>(&text).unwrap_or_default(),
+        Err(_) => AppSettings::default(), // no file yet — first run
+    };
+    ffi::set_recheck_tuning(settings.auto_refresh_secs, settings.auto_refresh_threshold);
+    Ok(settings)
+}
+
+// Reads back what the ENGINE currently has in effect right now (not what's
+// in the settings file, which — if this ever disagrees with the file after
+// a Save — would itself be worth surfacing as a bug). Used by the Settings
+// window as a "confirmed applied" readout after Save, independent of
+// trusting that the write-then-set_recheck_tuning sequence in
+// save_app_settings actually took.
+#[tauri::command]
+pub fn get_recheck_tuning() -> serde_json::Value {
+    serde_json::from_str(&ffi::get_recheck_tuning_json()).unwrap_or_default()
+}
+
+// Persists the settings file and applies the auto-refresh tuning immediately
+// (process-wide, live — see set_default_recheck_tuning's doc comment) so
+// Save takes effect without restarting the app.
+#[tauri::command]
+pub fn save_app_settings(app: tauri::AppHandle, settings: AppSettings) -> Result<(), String> {
+    let path = settings_file_path(&app)?;
+    let text = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    std::fs::write(&path, text).map_err(|e| e.to_string())?;
+    ffi::set_recheck_tuning(settings.auto_refresh_secs, settings.auto_refresh_threshold);
+    Ok(())
+}
+

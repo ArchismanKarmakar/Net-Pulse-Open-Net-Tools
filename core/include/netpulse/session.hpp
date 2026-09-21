@@ -59,6 +59,34 @@ struct Settings {
     int legacy_miss_threshold = 0;
 };
 
+// Process-wide DEFAULT tuning for the passive background "auto refresh"
+// mechanism (the guarded-wipe path — see its full rationale in session.cpp,
+// right where these are defined) — the cadence any target uses UNLESS it
+// sets its own per-target override (Settings::legacy_miss_window_secs/
+// legacy_miss_threshold above). Out of the box this is 30 seconds / 2
+// misses; a GUI Settings window can change it at runtime (no rebuild) via
+// set_default_recheck_tuning(), which is what the Tauri command
+// `set_recheck_tuning` (netpulse_ffi.cpp) calls. Takes effect immediately
+// for every currently-running AND future target, since it's a live global,
+// not a per-session snapshot taken at construction time.
+//
+// window_secs/threshold <= 0 leaves that field UNCHANGED (so a caller that
+// only wants to adjust one of the two doesn't need to already know the
+// other's current value); a positive value is clamped into a sane range
+// (kMinRecheckSecs..kMaxRecheckSecs seconds, kMinLegacyMissThreshold..
+// kMaxLegacyMissThreshold misses — session.cpp) rather than rejected, so a
+// GUI control already limited to that range can never actually send an
+// out-of-range value anyway, and a stale/bad number from a saved settings
+// file degrades to the nearest sane value instead of being silently
+// ignored.
+void set_default_recheck_tuning(double window_secs, int threshold);
+// Read back what's currently in effect (e.g. for a Settings window to show
+// the real value, including the factory default before anything overrode
+// it) — NOT what's stored in a settings file, which may differ if it was
+// never applied yet.
+double default_recheck_window_secs();
+int default_recheck_threshold();
+
 struct NewPoint {
     uint8_t hop;
     double ts;
@@ -133,6 +161,17 @@ double silence_backoff_threshold(double base_threshold, int consecutive_silence_
 // it, and so the shared-hop cache gate below is independently testable. See
 // the full rationale in session.cpp next to SharedHopTable.
 bool is_public_ip(const std::string& ip);
+// Looser companion — see its doc comment (session.cpp) for the full
+// rationale. True for is_public_ip()'s "public" set PLUS private/CGNAT
+// ranges; false only for genuinely meaningless/non-routing-domain-scoped
+// values (empty/"*", loopback, unspecified, link-local, multicast/
+// reserved). Used both by the shared-hop cache gate (cache_gate,
+// session.cpp) and by Session::run()'s local-egress-availability check
+// (has_local_v4/has_local_v6) — a private/CGNAT local address is a
+// perfectly real egress (a home LAN behind NAT), but a link-local one
+// (auto-assigned to every interface regardless of real connectivity,
+// IPv6 SLAAC in particular) is not proof of anything and must not count.
+bool is_cacheable_ip(const std::string& ip);
 
 // Shared-hop cross-target cache (see the full design rationale in
 // session.cpp, right above these types' definitions there). Declared here —
@@ -147,43 +186,79 @@ struct SharedSample {
     uint8_t hop = 0;                // the publisher's hop index for this sample, for attribution/debugging
     std::string predecessor;        // the publisher's predecessor address (or "SRC"), redundant with the key but kept for a future debug surface
 };
+// One entry of the ip_last_seen secondary index below: the most recent
+// publish for a given responder IP, and WHO published it. The owner is what
+// lets shared_last_seen_from() tell "another target is genuinely still
+// hearing from this IP" apart from "this is just my own last reply from
+// right before I went stale" — see the BUG FIX note on shared_last_seen_from
+// (session.cpp) for the real report this was added to fix.
+struct IpLastSeen {
+    double ts = 0;
+    uint64_t owner_session_id = 0;
+};
 struct SharedHopTable {
     std::shared_mutex mtx; // multiple concurrent adopters (readers) never block each other; publish (writer) is exclusive
     std::unordered_map<std::string, SharedSample> map; // key: source_addr "\x1f" predecessor "\x1f" responder_ip
     // Secondary index over the same publishes, keyed by responder IP alone
-    // (last-seen timestamp only, no rtt/edge attribution) — see
+    // (last-seen timestamp + publisher only, no rtt/edge attribution) — see
     // shared_last_seen_from()'s doc comment for what this is for. Kept as
     // part of THIS table, updated by the same shared_publish_to() call that
     // updates `map` above, rather than as a separate cache: it's the exact
     // same underlying event (a real reply was published), just indexed a
     // second way for a query `map` can't answer efficiently — "is this IP
-    // alive via *any* edge", not "alive via this specific edge".
-    std::unordered_map<std::string, double> ip_last_seen;
+    // alive via *any* edge", not "alive via this specific edge". Last-writer-
+    // wins, same as `map`: only the single most recent (ts, owner) survives,
+    // so if two different sessions are both actively hearing from this IP
+    // right now, whichever published most recently is the one this index
+    // reflects — good enough for "is anyone (else) hearing from it right
+    // now", not a full multi-writer history.
+    std::unordered_map<std::string, IpLastSeen> ip_last_seen;
 };
-// Publish a real measurement. No-op for private/CGNAT or empty `ip` (see
-// is_public_ip) — those are never cross-target-cached.
+// Publish a real measurement. No-op for empty/meaningless `ip` (see
+// is_cacheable_ip, session.cpp), and for a private/CGNAT `ip` unless `src`
+// is non-empty (see cache_gate, session.cpp) — an empty `src` can't
+// disambiguate which routing domain a private IP was seen on, so those
+// stay public-IP-only exactly as before that distinction existed.
 void shared_publish_to(SharedHopTable& sh, const std::string& src, const std::string& predecessor,
                        const std::string& ip, double ts, double rtt, uint64_t owner_session_id, uint8_t hop);
 // Returns a fresh (<= max_age old), different-owner sample's rtt for this
 // exact (source, predecessor, responder) edge, if one exists. std::nullopt
-// for private/CGNAT/empty `ip`, no entry, same owner, or a stale entry.
+// for empty/meaningless `ip`, a private/CGNAT `ip` with an empty `src` (see
+// shared_publish_to's doc comment above), no entry, same owner, or a stale
+// entry.
 std::optional<double> shared_adopt_from(SharedHopTable& sh, const std::string& src, const std::string& predecessor,
                                         const std::string& ip, uint64_t self_session_id, double now, double max_age);
-// Last time ANY session (any source, any predecessor edge, including the
-// caller's own) published a real reply from `ip`, if within max_age —
-// std::nullopt for private/CGNAT/empty ip or nothing recent enough. This is
-// the read used to tell a stale hop apart from a genuinely-gone one: a hop
-// can legitimately go silent for ONE target's edge (asymmetric/ECMP per-flow
-// routing) while a different target's edge to the same public IP keeps
-// getting real replies — this answers "is anyone still hearing from it right
-// now", using the exact same publishes shared_adopt_from() already relies on
-// for send-suppression, not a second independently-maintained cache.
-std::optional<double> shared_last_seen_from(SharedHopTable& sh, const std::string& ip, double now, double max_age);
+// Last time a DIFFERENT session (any source, any predecessor edge — just not
+// `self_session_id`) published a real reply from `ip`, if within max_age —
+// std::nullopt for empty/meaningless `ip`, nothing recent enough, or the only
+// recent publish being the caller's own (a private `ip` that was never
+// publishable in the first place, per shared_publish_to's own gate, simply
+// never has an entry to find here).
+//
+// BUG FIX: this used to ignore who published (`ip_last_seen` stored only a
+// timestamp), so it answered "did *anyone*, including me, hear from this IP
+// in the last max_age seconds" — and since a hop's own last real reply right
+// before it goes stale is, by definition, always within that window, a
+// SINGLE target's stale hop would routinely (almost always) show as "live
+// via another target" even with only one target running and no other
+// session ever having touched that IP. Now `ip_last_seen` also records the
+// publisher, and an entry whose owner is the caller itself is treated as no
+// signal — the caller's own pre-staleness reply doesn't count as "elsewhere".
+//
+// This is the read used to tell a stale hop apart from a genuinely-gone one:
+// a hop can legitimately go silent for ONE target's edge (asymmetric/ECMP
+// per-flow routing) while a DIFFERENT target's edge to the same public IP
+// keeps getting real replies — this answers "is anyone else still hearing
+// from it right now", using the exact same publishes shared_adopt_from()
+// already relies on for send-suppression, not a second independently-
+// maintained cache.
+std::optional<double> shared_last_seen_from(SharedHopTable& sh, const std::string& ip,
+                                            uint64_t self_session_id, double now, double max_age);
 // Process-global-singleton-backed wrapper around shared_last_seen_from(), for
 // callers outside session.cpp (e.g. stats.cpp's stale-hop display) that have
 // no SharedHopTable of their own and want the same table the real probe loop
 // publishes into.
-std::optional<double> shared_last_seen(const std::string& ip, double now, double max_age);
+std::optional<double> shared_last_seen(const std::string& ip, uint64_t self_session_id, double now, double max_age);
 
 // Anything that can own an ICMP id and receive replies addressed to it via
 // the shared registry/RX-dispatcher (see register_icmp_owner below and the
@@ -358,6 +433,20 @@ public:
 private:
     uint16_t next_seq();
     Snapshot snapshot(bool running, std::vector<NewPoint> new_points) const;
+    // The `source` component to feed shared_publish/shared_adopt calls with
+    // (session.cpp) — the session's explicitly configured source_addr when
+    // one is set (already unambiguous, same as before this existed), else
+    // local_egress_ if resolve() managed to determine it (see its own doc
+    // comment above and local_egress_ip's in transport.cpp), else empty
+    // (falls back to the original public-IP-only caching behavior for this
+    // session — see cache_gate() in session.cpp). Takes the configured
+    // source explicitly, rather than always reading settings_ itself,
+    // since every call site already has its own local Settings snapshot
+    // (s/s0) in scope and passing it in keeps this a pure function of that
+    // snapshot instead of a second, potentially-stale settings read.
+    std::string effective_cache_source(const std::string& configured_source) const {
+        return !configured_source.empty() ? configured_source : local_egress_.value_or(std::string());
+    }
     // Separate, deliberately simpler control loop for UDP mode — see its
     // own doc comment in session.cpp for exactly why this isn't just
     // another branch inside the main ICMP loop: UDP has no equivalent of
@@ -418,6 +507,13 @@ private:
     // has both records but one family is unreachable).
     std::optional<std::string> resolved_v4_;
     std::optional<std::string> resolved_v6_;
+    // The local address the OS routing table actually uses to reach dest_ —
+    // see transport.hpp's local_egress_ip() doc comment for how it's
+    // determined and why. Recomputed in resolve() whenever dest_/family_
+    // are (re)established. std::nullopt if it couldn't be determined; see
+    // effective_cache_source() in session.cpp for how callers fall back
+    // when that's the case.
+    std::optional<std::string> local_egress_;
     uint16_t icmp_id_;
     // Fixed per-session IPv4 checksum-pin target (Paris-traceroute-style ECMP
     // flow pinning — see build_echo()'s doc comment in icmp.hpp and the

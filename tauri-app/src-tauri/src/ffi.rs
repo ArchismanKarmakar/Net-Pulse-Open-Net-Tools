@@ -56,6 +56,7 @@ mod ffi {
         fn export_target_full_csv(id: u64) -> String;
         fn export_all_targets_full_csv() -> String;
         fn list_interfaces_json() -> String;
+        fn list_interfaces_detailed_json() -> String;
         fn engine_build() -> String;
         fn set_data_dir(dir: &str);
 
@@ -88,6 +89,12 @@ mod ffi {
         ) -> Result<String>;
         fn ping_stop(id: u64);
         fn ping_poll(id: u64) -> String;
+
+        // Settings window: process-wide default cadence/threshold for the
+        // passive background "auto refresh" mechanism — see
+        // netpulse_ffi.hpp's doc comment.
+        fn set_recheck_tuning(window_secs: f64, threshold: i32);
+        fn get_recheck_tuning_json() -> String;
     }
 }
 

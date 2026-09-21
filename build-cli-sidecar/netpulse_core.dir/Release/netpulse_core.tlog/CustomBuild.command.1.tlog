@@ -1,0 +1,10 @@
+^C:\USERS\ARCHISMAN\DOWNLOADS\NETPULSE-CPP-WEB\33\NETPULSE-CPP-WEB\CMAKELISTS.TXT
+setlocal
+"C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" -SC:/Users/Archisman/Downloads/NetPulse-cpp-web/33/NetPulse-cpp-web -BC:/Users/Archisman/Downloads/NetPulse-cpp-web/33/NetPulse-cpp-web/build-cli-sidecar --check-stamp-file C:/Users/Archisman/Downloads/NetPulse-cpp-web/33/NetPulse-cpp-web/build-cli-sidecar/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

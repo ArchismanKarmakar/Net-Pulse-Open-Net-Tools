@@ -253,6 +253,45 @@ jobs:
       # merge-latest-json.mjs script was trying to reimplement, and could
       # never succeed at no matter how correct its own logic was, since it
       # depended on a local latest.json file that was never going to exist.
+
+      # FEATURE: builds the netpulse-cli (npulse) sidecar for THIS matrix
+      # job's exact target before tauri-action runs, so tauri.conf.json's
+      # bundle.externalBin picks it up and every installer this workflow
+      # produces includes the CLI alongside the desktop app — see
+      # tauri-app/src-tauri/binaries/README.md for the full naming
+      # convention this depends on. matrix.rust_target is already the
+      # exact per-job Cargo target for the two macOS jobs (see the matrix
+      # strategy's own doc comment above for why those are architecture-
+      # specific); Windows/Linux have no explicit target (rustup's host
+      # default is already correct there — same reasoning the "Install
+      # Rust toolchain" step above already applies), so this falls back to
+      # the actual host triple via rustc for those two.
+      - name: Build CLI sidecar (npulse)
+        shell: bash
+        run: |
+          TRIPLE="${{ matrix.rust_target }}"
+          if [ -z "$TRIPLE" ]; then TRIPLE=$(rustc -vV | sed -n 's/^host: //p'); fi
+          echo "Sidecar target triple: $TRIPLE"
+          cmake -S . -B build-cli -DCMAKE_BUILD_TYPE=Release -DNETPULSE_CLI_SIDECAR_TRIPLE="$TRIPLE"
+          cmake --build build-cli --config Release --target npulse
+          mkdir -p tauri-app/src-tauri/binaries
+          # `find`, not a hardcoded path — see tauri-ci.yml's identical step
+          # for why (multi-config vs single-config generator output nesting
+          # differs, same class of issue this workflow's own "Collect
+          # installer files" step already works around for Cargo's output).
+          SIDECAR=$(find build-cli -name "npulse-${TRIPLE}*" -type f)
+          echo "Sidecar: $SIDECAR"
+          cp "$SIDECAR" tauri-app/src-tauri/binaries/
+          # Shared with the "Collect installer files" step below (a separate
+          # `run:` block is a separate shell — nothing set here as a plain
+          # variable would still be visible there) so it can ALSO publish
+          # this exact binary as its own standalone download, independent
+          # of any installer format — see that step's own doc comment for
+          # why that matters for a distro this project has no native
+          # package for (e.g. Arch — no PKGBUILD/AUR here, and .deb/.AppImage
+          # either don't apply or don't put the CLI on PATH there either).
+          echo "NETPULSE_CLI_SIDECAR=$SIDECAR" >> "$GITHUB_ENV"
+
       - name: tauri-action build
         id: tauri-build
         uses: tauri-apps/tauri-action@v0
@@ -362,6 +401,29 @@ jobs:
             -type f -exec cp -v {} collected/ \;
           find tauri-app/src-tauri/target -path '*/release/bundle/*' -name '*.sig' -type f \
             -exec cp -v {} collected/ \;
+
+          # FEATURE: also publish the CLI as its own standalone download,
+          # separate from every installer above — the CLI has zero GUI
+          # dependency (confirmed: `ldd` on the built binary shows only
+          # libc/libstdc++/libm/libgcc_s, nothing GTK/WebKit/X11-related)
+          # and is meant to run on its own, including on a machine that
+          # will never install the desktop app at all — a headless server,
+          # a minimal/no-DE Linux install (Arch and similar, which this
+          # project has no native package for — .deb doesn't apply outside
+          # Debian-family distros, and while the AppImage DOES contain the
+          # CLI internally via externalBin, an AppImage has no install step
+          # to put anything on PATH, so extracting the CLI back out of one
+          # is not a reasonable way to obtain it). Renamed to something
+          # meaningful on a release page (matrix.artifact_name, not the
+          # raw target-triple filename) — .exe suffix only on the Windows job.
+          if [ -n "${NETPULSE_CLI_SIDECAR:-}" ] && [ -f "$NETPULSE_CLI_SIDECAR" ]; then
+            EXT=""
+            case "${{ matrix.artifact_name }}" in windows-latest) EXT=".exe" ;; esac
+            cp -v "$NETPULSE_CLI_SIDECAR" "collected/npulse-${{ matrix.artifact_name }}${EXT}"
+          else
+            echo "::warning::No CLI sidecar found to publish standalone for ${{ matrix.artifact_name }} — the 'Build CLI sidecar' step above may have failed silently or run before this env var was set."
+          fi
+
           ls -la collected
 
       - name: Upload artifact

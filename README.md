@@ -88,10 +88,43 @@ its backend.
 ```bash
 cd tauri-app
 npm install
-npx tauri dev      # launches the app with hot-reload
+npx tauri dev      # launches the GUI app with hot-reload
 # or:
 npx tauri build    # produces a real installer (NSIS/AppImage/dmg per OS)
 ```
+
+**GUI only, during frontend/UI work** — skips Rust/Cargo entirely, just the
+Vite dev server against the React frontend on its own (no Tauri window, no
+native engine calls — anything that needs `window.netpulse` won't work):
+
+```bash
+cd tauri-app
+npm install
+npm run dev        # Vite only, http://localhost:1420
+```
+
+**CLI only, during engine/`cli/` work** — no Node/Rust/Tauri needed at all,
+same `cmake --build` as "Engine development" below already produces it:
+
+```bash
+cmake -S . -B build
+cmake --build build --target npulse
+./build/cli/npulse ping 1.1.1.1        # Linux/macOS
+# Windows (Visual Studio generator, the default there): build\cli\Debug\npulse.exe
+```
+
+The CLI has zero dependency on the GUI/Tauri stack (confirmed: `ldd` on the
+built binary shows only libc/libstdc++/libm — no WebKit/GTK/X11/Wayland at
+all) — it runs standalone on a machine that will never install the desktop
+app, including a headless server or a minimal/no-desktop-environment Linux
+install (e.g. Arch): build from source with the two commands above, or grab
+the platform-specific `npulse-*` standalone binary published alongside the
+installers on the [Releases page](../../releases) (separate from the
+installers, precisely for this case — see `cli/CLI.md`'s Packaging section
+for the full breakdown of what's bundled where, and which parts of that are
+verified vs. not). This project doesn't currently publish a native Arch
+package (no PKGBUILD/AUR) — the standalone binary or building from source
+are the two working paths there today.
 
 > **`npm install` needs one non-npm-registry download.** The Excel-export
 > feature depends on `xlsx` (SheetJS), whose npm-published build is
@@ -125,6 +158,7 @@ ICMP probing needs raw-socket privileges:
 cmake -S . -B build
 cmake --build build
 ctest --test-dir build      # runs the C++ unit tests
+./build/cli/npulse help     # the CLI (target `npulse`) builds here too — NETPULSE_BUILD_CLI defaults ON
 ```
 
 ## Security
@@ -269,3 +303,33 @@ The app is organized into tabs across the top:
 The Ping, DNS, and Port Scanner tools run in the desktop app (they use the OS
 network stack via the Rust host); they are unavailable in a plain browser dev
 server.
+
+## Settings
+
+**Settings → Open Settings…** opens a separate window (not a panel inside
+the main one) for app-wide configuration. It's saved to a JSON file in the
+app's own config directory and reloaded automatically every time the app
+starts — a change here takes effect immediately (no restart needed) and
+persists across restarts and reinstalls that leave user data alone.
+
+- **Auto-refresh (background stale-route recheck)** — how often an
+  already-resolved hop is quietly re-verified in the background, and how
+  many misses in a row before it's treated as a real route change and
+  rediscovered from scratch. Defaults to **30 seconds / 2 misses**. This is
+  the *passive* mechanism — separate from, and by design much slower than,
+  pressing **Force Recheck** on a target (a few seconds vs. a real minimum
+  of roughly twice this frequency). See `ARCHITECTURE.md` §6 for the full
+  mechanism and why the two aren't meant to behave the same way.
+- **New target defaults** — what a freshly opened "Add target" form starts
+  pre-filled with (probe interval, trace interval, timeout, payload size,
+  max hops, destination port, family, protocol, raw/privileged mode).
+  Changing these only affects targets added *after* the change — an
+  already-running target keeps whatever it was given at the time.
+- **Appearance** — the dark/light theme, consolidated into the same saved
+  file as the toggle under **View → Dark / light theme**.
+
+The window's own file lives at (platform config directory)/settings.json —
+see `tauri-app/src-tauri/src/commands.rs`'s `AppSettings` for the exact
+schema, and `core/include/netpulse/session.hpp`'s
+`set_default_recheck_tuning` for how the auto-refresh values reach the
+engine.

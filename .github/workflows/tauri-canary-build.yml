@@ -95,7 +95,16 @@ jobs:
           cmake -S . -B build-cli -DCMAKE_BUILD_TYPE=Release -DNETPULSE_CLI_SIDECAR_TRIPLE="$TRIPLE"
           cmake --build build-cli --config Release --target npulse
           mkdir -p tauri-app/src-tauri/binaries
-          SIDECAR=$(find build-cli -name "npulse-${TRIPLE}*" -type f)
+          # BUG FIX (reported CI failure on windows-latest, same bug fixed
+          # in tauri-release.yml/tauri-ci.yml's identical step): a trailing
+          # wildcard here also matches MSVC's `npulse-<triple>.exe.recipe`
+          # intermediate metadata file next to the real .exe on the multi-
+          # config generator — `find` then returns two lines and `cp`
+          # fails on that as one newline-embedded argument. Exact filename
+          # match instead of a wildcard rules that out.
+          SIDECAR_EXT=""
+          case "$TRIPLE" in *windows*) SIDECAR_EXT=".exe" ;; esac
+          SIDECAR=$(find build-cli -name "npulse-${TRIPLE}${SIDECAR_EXT}" -type f)
           echo "Sidecar: $SIDECAR"
           cp "$SIDECAR" tauri-app/src-tauri/binaries/
 

@@ -2,6 +2,36 @@
 
 ## 1.2.4
 
+### Fixed: "build installer (windows-latest)" failed — `cp: cannot stat` two filenames at once
+
+**Bug report** (CI log): the "Build CLI sidecar (npulse)" step compiled
+the sidecar successfully, then failed on the very next line —
+`cp: cannot stat 'build-cli/cli/npulse.dir/Release/npulse-x86_64-pc-
+windows-msvc.exe.recipe\nbuild-cli/sidecar/Release/npulse-x86_64-pc-
+windows-msvc.exe': No such file or directory`.
+
+**Root cause**: `SIDECAR=$(find build-cli -name "npulse-${TRIPLE}*" -type
+f)` used a trailing wildcard to handle CMake's generator-dependent output
+nesting (correct idea — a single-config generator like Ninja and a
+multi-config one like Visual Studio put the binary in different places).
+On Windows specifically, MSVC's build also leaves behind
+`npulse-<triple>.exe.recipe` — an MSBuild-generated intermediate metadata
+file for its custom build rule, not a binary — sitting right next to the
+real `.exe`, and the wildcard matched BOTH. `find` printed both paths on
+separate lines, the command substitution captured them as one string with
+an embedded newline, and `cp` tried to `stat` that whole two-line string
+as a single (nonexistent) filename.
+
+**Fix** (`tauri-release.yml`, `tauri-ci.yml`, `tauri-canary-build.yml` —
+all three had the identical line): build the exact expected filename
+(`npulse-<triple>.exe` on Windows, `npulse-<triple>` elsewhere — the same
+`.exe`-if-windows logic `build.rs` already uses for the same binary) and
+match on that exactly instead of a wildcard, so it can't also match a
+same-stem file with anything appended, `.recipe` or otherwise. Reproduced
+locally against a fake MSVC-shaped output tree (both files present): the
+old pattern returned both paths, the new one returns exactly the real
+binary.
+
 ### Fixed: CI (`cargo check --features obfuscate`) failed on Windows, Linux AND macOS with a CMake "CMakeCache.txt directory ... is different" error
 
 **Bug report** (CI logs, all three OS runners): every job failed inside

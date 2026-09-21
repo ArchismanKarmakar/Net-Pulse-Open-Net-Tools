@@ -119,6 +119,34 @@ fn ensure_cli_sidecar(repo_root: &std::path::Path, binaries_dir: &std::path::Pat
     std::fs::create_dir_all(binaries_dir).expect("create tauri-app/src-tauri/binaries/");
 
     let build_dir = repo_root.join("build-cli-sidecar");
+    // BUG FIX (reported CI failure, all three OSes): CMake stores the
+    // absolute source/binary directory paths it was configured with inside
+    // CMakeCache.txt, and refuses to reuse a cache whose recorded paths
+    // don't match the CURRENT ones ("The current CMakeCache.txt directory
+    // ... is different than the directory ... where CMakeCache.txt was
+    // created"), rather than silently reconfiguring — reasonable in
+    // general (it's a real footgun to let a stale cache point somewhere
+    // else), but fatal here specifically because `build-cli-sidecar/`
+    // wasn't in .gitignore (fixed alongside this): a local
+    // `CMakeCache.txt` — recorded against a *developer's own machine's*
+    // absolute path — had been committed, so every fresh clone (including
+    // every CI runner, on all three OSes, which is why the same Windows
+    // local path showed up in the Linux/macOS logs too) inherited a cache
+    // that could never match ITS OWN checkout path, and hard-failed before
+    // ever getting to compile anything.
+    //
+    // Removing the stale committed cache from version control fixes this
+    // for good, but this check makes the build self-healing regardless of
+    // how a mismatched cache gets here again (a moved checkout, a CI cache
+    // action restoring it under a different path, ...): if the cache
+    // exists but doesn't already agree with the CURRENT repo root, wipe
+    // the whole directory and let cmake configure it fresh instead of
+    // panicking on something a clean directory would have just worked
+    // around.
+    if build_dir.join("CMakeCache.txt").exists() && !cmake_cache_matches(&build_dir, repo_root) {
+        std::fs::remove_dir_all(&build_dir)
+            .unwrap_or_else(|e| panic!("stale CMake cache at {} didn't match this checkout ({}) and couldn't be removed to reconfigure: {e}", build_dir.display(), repo_root.display()));
+    }
     let cmake_ok = std::process::Command::new("cmake")
         .args(["-S", ".", "-B"])
         .arg(&build_dir)
@@ -153,6 +181,25 @@ fn ensure_cli_sidecar(repo_root: &std::path::Path, binaries_dir: &std::path::Pat
     let found = find_file_named(&build_dir, &format!("npulse-{target}{ext}"))
         .unwrap_or_else(|| panic!("CLI sidecar build reported success but the output file wasn't found under {}", build_dir.display()));
     std::fs::copy(&found, &dest).expect("copy CLI sidecar into tauri-app/src-tauri/binaries/");
+}
+
+// Reads CMakeCache.txt's own `CMAKE_HOME_DIRECTORY:INTERNAL=<path>` entry
+// (the source directory CMake recorded when this cache was configured) and
+// compares it against the repo root we'd configure with NOW. Best-effort:
+// any read/parse failure is treated as "doesn't match" — safer to wipe and
+// reconfigure from scratch than to trust a cache we couldn't actually
+// verify. Paths are canonicalized before comparing so a difference that's
+// purely symlink/`..`-normalization (not a real relocation) doesn't trigger
+// an unnecessary rebuild.
+fn cmake_cache_matches(build_dir: &std::path::Path, repo_root: &std::path::Path) -> bool {
+    let Ok(cache) = std::fs::read_to_string(build_dir.join("CMakeCache.txt")) else { return false };
+    let Some(recorded) = cache.lines().find_map(|l| l.strip_prefix("CMAKE_HOME_DIRECTORY:INTERNAL=")) else { return false };
+    let recorded_canon = std::fs::canonicalize(recorded);
+    let current_canon = std::fs::canonicalize(repo_root);
+    match (recorded_canon, current_canon) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => recorded == repo_root.to_string_lossy(),
+    }
 }
 
 fn find_file_named(dir: &std::path::Path, name: &str) -> Option<PathBuf> {

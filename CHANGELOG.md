@@ -1,6 +1,55 @@
 # Changelog
 
-## Unreleased
+## 1.2.4
+
+### Fixed: CI (`cargo check --features obfuscate`) failed on Windows, Linux AND macOS with a CMake "CMakeCache.txt directory ... is different" error
+
+**Bug report** (CI logs, all three OS runners): every job failed inside
+`build.rs`'s CLI-sidecar step with `CMake Error: The current
+CMakeCache.txt directory .../build-cli-sidecar/CMakeCache.txt is
+different than the directory c:/Users/Archisman/Downloads/NetPulse-cpp-
+web/33/NetPulse-cpp-web/build-cli-sidecar where CMakeCache.txt was
+created`, then a panic ("Could not automatically build the CLI sidecar").
+
+**Root cause**: `build-cli-sidecar/` wasn't covered by `.gitignore` (only
+the exact name `build/` was listed — `build-cli-sidecar` doesn't match
+that), so a `CMakeCache.txt` generated on a local machine — which bakes
+in the exact absolute source path it was configured from — got committed.
+Every fresh checkout, on every OS (all three jobs' error output shows the
+SAME committer's local Windows path, confirming it's one committed file
+being cloned everywhere), inherited a cache that could never match ITS
+OWN checkout path. CMake correctly refuses to silently reuse a
+cache recorded against a different location, so the build hard-failed
+before compiling anything.
+
+**Fix, two parts**:
+1. `.gitignore`: `build/` widened to `build*/` (directories only — can't
+   match the `build-and-run.sh`/`.ps1` *files* at the repo root) so this
+   whole family of local CMake scratch directories (`build-cli-sidecar/`,
+   `build-cli/`, `build-verify/`, `build-asan/`, and any future one) is
+   covered generically instead of needing a new line every time.
+2. `build.rs` (`ensure_cli_sidecar`): now checks the existing cache's own
+   recorded `CMAKE_HOME_DIRECTORY` against the current repo root before
+   reusing it, and if they don't match, deletes the whole
+   `build-cli-sidecar/` directory and reconfigures from scratch instead of
+   handing CMake a cache it will just refuse and panic on. Makes the build
+   self-healing regardless of how a mismatched cache gets there again (a
+   moved checkout, a CI cache-restore action, ...), not just for this one
+   already-committed file.
+
+**Action still needed** (can't be done from a code patch alone): the
+already-committed `build-cli-sidecar/CMakeCache.txt` needs removing from
+version control in the real repository —
+`git rm -r --cached build-cli-sidecar` (and any other stray `build*`
+directory `git status` shows as tracked), then commit. The `build.rs`
+self-heal above means CI will now recover even before that cleanup
+lands, but the stale file should still come out of history.
+
+**Verified**: reproduced the exact failure locally (planted a
+`CMakeCache.txt` with a bogus `CMAKE_HOME_DIRECTORY`, deleted the sidecar
+binary to force a rebuild) — confirmed it previously panicked, and with
+this fix `cargo build` completes cleanly and produces a real, working
+sidecar binary instead.
 
 ### Fixed: Settings tab was also boxed into a fixed ~640px column, same as the Interfaces table
 

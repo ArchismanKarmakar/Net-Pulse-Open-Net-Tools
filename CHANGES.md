@@ -1,4 +1,4 @@
-# NetPulse v1.2.4 — fixes and review
+# NetPulse v1.1.2 — fixes and review
 
 Drop these files into the corresponding paths in the repo (they're full-file
 replacements, not patches). All C++ changes were verified with:
@@ -1241,5 +1241,46 @@ the window widens instead of leaving space unused — 6 per row at 1900px,
 **Verification**: real `vite build`, then a headless run confirming both
 window sizes look right and the vertical-scroll fix from two rounds ago
 is still intact.
+
+**Docs updated**: `CHANGELOG.md`, this file.
+
+## 30. Fixed CI failure on all three OSes: stale committed CMakeCache.txt with your local Windows path baked in
+
+Your CI logs showed it clearly: `build-cli-sidecar/CMakeCache.txt` was
+recorded against `c:/Users/Archisman/Downloads/NetPulse-cpp-web/33/
+NetPulse-cpp-web/build-cli-sidecar` — your own local machine's absolute
+path — and that exact file is what every CI runner (Windows, Linux, AND
+macOS all showed the same local Windows path) inherited from a fresh
+clone. CMake correctly refuses to reuse a cache recorded against a
+different location, so `build.rs`'s CLI-sidecar step panicked before
+compiling anything, on all three platforms.
+
+**Root cause**: `.gitignore` only had `build/` (an exact match), which
+doesn't cover `build-cli-sidecar/` — so that directory's CMake cache
+wasn't excluded and ended up committed.
+
+**Fix**:
+- `.gitignore`: `build/` → `build*/` (directory-only glob, so it can't
+  touch the `build-and-run.sh`/`.ps1` files) — covers `build-cli-sidecar`,
+  `build-cli`, `build-verify`, `build-asan`, and any future one, in one
+  line instead of a new entry every time this happens.
+- `build.rs`: now checks a cache's own recorded source directory against
+  the current one before trusting it, and wipes + reconfigures from
+  scratch on a mismatch instead of handing CMake something it will refuse.
+  This makes the build self-healing even if a mismatched cache shows up
+  again some other way.
+
+**Still needed on your end**: I can't push to your actual GitHub repo
+from here, so the already-committed `build-cli-sidecar/CMakeCache.txt`
+needs removing in a real commit —
+`git rm -r --cached build-cli-sidecar` (and any other stray `build*` dir
+`git status` shows tracked), then commit and push. CI should actually
+recover even before you do that, thanks to the `build.rs` self-heal, but
+the stale file shouldn't stay in history.
+
+**Verification**: reproduced the exact failure locally by planting a
+`CMakeCache.txt` with a bogus recorded path and forcing a rebuild —
+confirmed it panicked before the fix, and `cargo build`/`cargo check`
+complete cleanly with a real working sidecar binary produced after it.
 
 **Docs updated**: `CHANGELOG.md`, this file.

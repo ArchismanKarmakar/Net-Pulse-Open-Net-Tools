@@ -1348,3 +1348,53 @@ the comparison window) that `makensis` happily compiled but that silently
 broke every match — only running the compiled binaries caught it.
 
 **Docs updated**: `CHANGELOG.md`, this file.
+
+## 33. Added: MSIX packaging workflow for Microsoft Store distribution
+
+**Request**: package NetPulse as an MSIX for Microsoft Store distribution.
+
+**Finding**: Tauri has no MSIX bundler target at all — only NSIS/MSI for
+Windows. Its own docs' Microsoft Store guidance is to list a plain
+NSIS/MSI installer that "only links to the unpacked application," not a
+real MSIX. Getting an actual `.msix` needs either hand-rolling it with
+Microsoft's own SDK tools, or a third-party automation tool. Asked the
+user which they wanted; they chose: hand-rolled as the active path now,
+the community tool implemented but parked for later, both documented.
+
+**Option 1 (active)** — `.github/workflows/msix-build.yml`: builds the app
+with `tauri build --no-bundle`, generates the four required Store tile
+PNGs from the existing icon (`windows/msix/generate-assets.py`), renders
+`AppxManifest.xml` from a template mirrored against Microsoft's own manual
+MSIX-packaging docs, and packs/signs it with `makeappx.exe`/`signtool.exe`
+— both already on the `windows-latest` runner's Windows SDK, so zero new
+CI dependencies. Manual (`workflow_dispatch`) only, since real Store
+submission needs a Partner Center-issued package identity this workflow
+can't know on its own.
+
+**Option 2 (scaffolded, not wired up)** —
+`.github/workflows/msix-build-community-tool.yml`, using the npm package
+`@choochmeque/tauri-windows-bundle`. Gated behind manual dispatch AND a
+typed confirmation phrase. Deliberately not the default: it's a young
+(created Jan 2026), single-maintainer dependency, and trusting an
+unverified third party in the release pipeline is exactly what caused
+round 32's real EnVar CI failure. Kept implemented so switching later, if
+it earns that trust (or Option 1's manual manifest maintenance becomes a
+real burden), is a config change rather than a rewrite.
+
+**Verification**: installed a real PowerShell 7 (`pwsh`) in this sandbox
+and parsed every `.ps1` step in `msix-build.yml` with
+`[System.Management.Automation.Language.Parser]::ParseFile` (once with the
+`${{ }}` GitHub-expression placeholders substituted for realistic values)
+— all parsed clean, catching nothing this time but at least ruling out
+what the earlier NSIS `StrStr` bug would have looked like here. Rendered
+`AppxManifest.xml.template` with dummy values and validated it as
+well-formed XML with both `xml.dom.minidom` and `xmllint`. Actually ran
+`generate-assets.py` and confirmed all four output PNGs at their exact
+required pixel dimensions. What's explicitly NOT verified: `makeappx
+pack`/`Add-AppxPackage` themselves, since both are Windows-only with no
+Linux-runnable equivalent — flagged plainly in both the workflow file and
+`docs/MSIX_DISTRIBUTION.md` rather than presented as tested.
+
+**Docs added**: `docs/MSIX_DISTRIBUTION.md` (full writeup, Partner Center
+submission steps, the `runFullTrust` limitation). **Docs updated**:
+`CHANGELOG.md`, this file.

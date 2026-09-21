@@ -2,6 +2,32 @@
 
 ## 1.2.4
 
+### Added: MSIX packaging workflow for Microsoft Store distribution
+
+Tauri does not build MSIX natively (only NSIS/MSI) — added a manual
+(`workflow_dispatch`) GitHub Actions workflow, `.github/workflows/msix-build.yml`,
+that hand-packages a real `.msix` using only tools already on the
+`windows-latest` runner (`makeappx.exe`/`signtool.exe` from the Windows
+SDK, no third-party CI dependency): builds the CLI sidecar, runs
+`tauri build --no-bundle` for the raw app, generates the Store's required
+tile assets from the existing icon (`windows/msix/generate-assets.py`),
+renders an `AppxManifest.xml` from a template
+(`windows/msix/AppxManifest.xml.template`) mirrored against Microsoft's own
+manual-MSIX-packaging reference, packs and signs it with a throwaway test
+certificate, and uploads it as an artifact.
+
+Also scaffolded, but deliberately **not** wired up for real use yet: a
+second workflow (`msix-build-community-tool.yml`) using the community npm
+package `@choochmeque/tauri-windows-bundle`, kept ready for an easy future
+migration once it — or the hand-rolled approach's maintenance cost — earns
+that trust. See `docs/MSIX_DISTRIBUTION.md` for the full comparison, what's
+verified vs. not (the AppxManifest template and every PowerShell step were
+checked — `xmllint`/`xml.dom.minidom` for the XML, a real PowerShell 7
+parser for the `.ps1` blocks — but `makeappx pack` itself has no
+Linux-runnable equivalent to test here, so the first real Windows CI run
+is the actual end-to-end test), and exactly what's still needed (a Partner
+Center-issued package identity) before a real Store submission.
+
 ### Fixed: Windows installer bundling failed — `Plugin not found, cannot call EnVar::SetHKCU`
 
 **Bug report** (CI log, "windows build failed again"): the previous two CI

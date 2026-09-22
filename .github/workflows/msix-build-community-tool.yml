@@ -73,15 +73,15 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '20'
 
       - name: Install Rust toolchain (x64 + arm64 targets)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: x86_64-pc-windows-msvc, aarch64-pc-windows-msvc
 
@@ -135,7 +135,7 @@ jobs:
         run: find tauri-app/src-tauri/target/msix -type f 2>/dev/null | sort || echo "no msix output found under target/msix"
 
       - name: Upload MSIX bundle artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: netpulse-msix-community-tool
           path: tauri-app/src-tauri/target/msix/*.msixbundle

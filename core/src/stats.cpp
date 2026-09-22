@@ -266,7 +266,13 @@ void ColdStore::worker_loop() {
             queue_.pop_front();
         }
         std::string path = path_for(job.target_id, job.hop);
-        std::FILE* f = std::fopen(path.c_str(), "ab");
+        // Per-target/hop RTT history -- created owner-only (see
+        // fopen_owner_only()'s comment in platform.hpp) rather than left at
+        // whatever the process umask leaves it at, since this is real
+        // network-target data (hostnames/IPs are implied by the target,
+        // and per-hop RTT timelines) some users won't want readable by
+        // other accounts on a shared machine.
+        std::FILE* f = fopen_owner_only(path, "ab");
         if (!f) continue;
         for (const auto& [ts, rtt] : job.batch) {
             double rec[2] = {ts, rtt ? *rtt : std::nan("")};

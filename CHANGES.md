@@ -1,4 +1,4 @@
-# NetPulse v1.1.2 — fixes and review
+# NetPulse v1.2.6 — fixes and review
 
 Drop these files into the corresponding paths in the repo (they're full-file
 replacements, not patches). All C++ changes were verified with:
@@ -1398,3 +1398,114 @@ Linux-runnable equivalent — flagged plainly in both the workflow file and
 **Docs added**: `docs/MSIX_DISTRIBUTION.md` (full writeup, Partner Center
 submission steps, the `runFullTrust` limitation). **Docs updated**:
 `CHANGELOG.md`, this file.
+
+## 34. Fixed: 13 CodeQL "unpinned action tag" alerts + publisher-naming answer + `runFullTrust` doc correction
+
+**Request**: four screenshots (open PRs, Partner Center age-ratings
+preview, 17 open CodeQL alerts, 7 open Dependabot alerts), plus "can we use
+both ArchismanCoder & Archisman Karmakar?" (ArchismanCoder is the Store
+publisher name) and "properly package the MSIX for publishing."
+
+**Publisher naming — answered, not a conflict**: `Package/Identity/Publisher`
+(the `CN=...` string) isn't a free choice at all — it's whatever exact
+string Partner Center issues once the app identity is reserved, and is
+invisible to end users. `Properties/PublisherDisplayName` (the Store-facing
+name shoppers see) is free text, now set to `ArchismanCoder` in
+`msix-build.yml`. `tauri.conf.json`'s `bundle.publisher: "Archisman
+Karmakar"` is a third, separate field (Tauri's own NSIS/MSI installer
+metadata) and needs no change. All three can coexist.
+
+**13 "Unpinned tag for a non-immutable Action or reusable workflow" alerts
+(CodeQL #6, #7, #9, #10, #11, #12, #13, #22, #23, #25, #26, #27)** — every
+`uses:` across all 6 workflow files (`msix-build.yml`,
+`msix-build-community-tool.yml`, `tauri-release.yml`, `tauri-ci.yml`,
+`tauri-canary-build.yml`, `obfuscated-build.yml`) now pins a full commit
+SHA (resolved for real via `git ls-remote --tags` against each action's own
+GitHub repo, not guessed) with a `# vN` comment for readability. Validated
+every file still parses as YAML after the edit.
+
+**`docs/MSIX_DISTRIBUTION.md` correction**: the doc previously overstated
+that `runFullTrust` "narrows Store review eligibility somewhat" — corrected
+to state plainly that `runFullTrust` MSIX is Microsoft's own sanctioned
+path for exactly this class of app (Discord, OBS, VS Code, Spotify all
+ship this way), and added a section spelling out the publisher-naming
+split above.
+
+## 35. Fixed: 4 CodeQL C++/JS security findings (verified end-to-end)
+
+**`cli/main.cpp:693` — "Uncontrolled process operation" (High)**: the
+`npulse console` feature read `$SHELL` from the environment and handed it
+straight to `execv()`. Fixed: `$SHELL` is now required to resolve to an
+existing, executable regular file (`stat()` + `S_ISREG` + `access(...,
+X_OK)`) before use, falling back to `/bin/sh` otherwise. Verified all 5
+cases by hand (valid shell, nonexistent path, a directory, empty, unset) —
+all resolved correctly.
+
+**`core/include/netpulse/platform.hpp:265` + `core/src/stats.cpp:269` —
+"File created without restricting permissions" (High, x2)**: the debug log
+and the per-target/hop RTT-history cold-store files were both created via
+plain `std::fopen(path, "a"/"ab")`, which leaves permissions at whatever
+the process umask allows (often `0644`, world-readable) — a real concern
+since both files can contain hostnames/IPs. Fixed: added a shared
+`fopen_owner_only()` helper in `platform.hpp` that creates new files via
+`open()` with an explicit `0600` mode on POSIX (Windows' NTFS default
+already excludes the "everyone" ACE, so it isn't in the same situation),
+used by both sites. Verified: created a file under `umask 022` and
+confirmed it came out `600`; full `netpulse_core`/`npulse`/
+`netpulse_tests` rebuild is clean and `ALL TESTS PASSED`.
+
+**`.github/scripts/checksums.mjs:19` — "Potential file system race
+condition" (High)**: the script called `statSync()` to check
+`isDirectory()`, then separately `readFileSync()` — a classic TOCTOU gap
+(the entry could change between the two calls). Fixed: removed the
+separate stat entirely; now attempts the read directly and treats
+`EISDIR` as "skip it," any other error as real. Verified: output matches
+`sha256sum` byte-for-byte on a test directory with a subdirectory and an
+existing `SHA256SUMS.txt` present.
+
+**`tauri-app/src/workers/xlsxWorker.js:34` — "Missing origin verification
+in postMessage handler" (Medium)**: this is a dedicated *module* Worker
+(`new Worker(new URL(...), { type: 'module' })` in `App.jsx`), not a
+`window` message listener — there is no cross-origin channel into a
+dedicated Worker for an `e.origin` check to guard against, so a literal
+origin check would be theater. Added a comment explaining why, plus actual
+defensive value: the handler now validates the message is a well-formed
+object with a string `type` before touching it, so a malformed message
+degrades gracefully instead of throwing. Verified with `node --check`.
+
+## 36. Fixed: 4 of 7 Dependabot alerts (npm); `glib`/Rust confirmed blocked upstream; version bumped 1.1.2 → 1.2.6
+
+**undici, postcss, browserslist, baseline-browser-mapping (npm)** — all
+four were just a stale `package-lock.json`; the existing `^` ranges in
+`package.json` already covered the patched versions
+(undici 6.27.0→6.28.1, postcss 8.5.19→8.5.28, browserslist 4.28.6→4.29.0,
+baseline-browser-mapping 2.10.43→2.11.25). Verified by regenerating the
+lockfile in an isolated tree (with the CDN-hosted `xlsx` dependency
+temporarily removed, since `cdn.sheetjs.com` isn't reachable from the
+sandbox) and confirming `npm audit` reports 0 vulnerabilities; spliced only
+those verified package entries (plus their own unavoidable co-dependents:
+`caniuse-lite`, `electron-to-chromium`, `nanoid`, `node-releases`,
+`update-browserslist-db`) into the real `package-lock.json` — nothing else
+in the dependency tree was touched. `package.json` itself needed no
+change.
+
+**glib (Rust) — confirmed blocked upstream, not fixed**: pulled in
+transitively via `tauri → tray-icon → gtk`, currently pinned at `0.18.5`
+(the exact version with the flagged `VariantStrIter` unsoundness). Checked
+directly: every published `tray-icon` release up to the latest (0.25.1)
+still requires `gtk = "^0.18"`, and there is no patched `0.18.x` release of
+`glib` — the fix only exists from `0.19` onward. `cargo update -p glib
+--precise 0.19.9` fails outright with a clear "candidate versions found
+which didn't match" error. Nothing to do here until `tray-icon`/`gtk-rs`
+itself moves past `gtk 0.18`; not worth forking over a moderate-severity
+soundness bug with no known exploit path.
+
+**Version bump**: `VERSION`, `tauri-app/package.json`,
+`tauri-app/src-tauri/Cargo.toml`, `tauri-app/src-tauri/tauri.conf.json`,
+and the `netpulse` package's own entry in `tauri-app/src-tauri/Cargo.lock`
+all moved from `1.1.2` to `1.2.6`. Worth flagging plainly: these
+version-bearing files had been stuck at `1.1.2` through at least two
+already-shipped release tags (`1.2.4`, `1.2.5`, cut and built purely from
+git tags without ever touching the source-of-truth version fields) — so
+this bump also re-synchronizes the files with where the actual releases
+already are, not just a routine +1.

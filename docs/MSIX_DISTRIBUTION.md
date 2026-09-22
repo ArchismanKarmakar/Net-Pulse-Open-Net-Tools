@@ -156,8 +156,44 @@ ingestion** if submitted as-is. Before a real submission:
 
 NetPulse is a native Win32 binary (a Tauri app, not a UWP/sandboxed app),
 so its MSIX package must declare the `runFullTrust` restricted capability
-— there's no way around this for what NetPulse actually does (raw ICMP,
-firewall rule management, etc., see `windows/hooks.nsh`). This narrows
-Store review eligibility somewhat versus a fully sandboxed UWP app, but is
-a fixed constraint of what this app is, not something either packaging
-option introduces or could remove.
+— there's no way around this for what NetPulse actually does (raw ICMP
+sockets, firewall rule management via `netsh`/COM APIs, raw TCP, etc., see
+`windows/hooks.nsh` and the core engine). A true UWP/AppContainer port is
+not feasible: the AppContainer sandbox blocks raw ICMP sockets, blocks
+spawning `netsh` or calling the firewall COM APIs, and blocks raw TCP
+outright — all of which are core to what this app does, not incidental
+features that could be trimmed away.
+
+This is **not** a Store-review penalty. `runFullTrust` MSIX is Microsoft's
+own sanctioned distribution path for exactly this class of app — Discord,
+OBS Studio, VS Code, and Spotify all ship to the Store this way. It only
+excludes a small number of narrow programs that don't apply to NetPulse
+(the Kids/Education catalog, certain enterprise-sandboxing certifications).
+Conclusion: **keep `runFullTrust` as-is; do not attempt a UWP rewrite.**
+
+## Publisher naming: `ArchismanCoder` vs. `Archisman Karmakar`
+
+Both can be used — they answer different fields and don't conflict:
+
+- **`Package/Identity/Publisher`** (the `CN=...` string in
+  `AppxManifest.xml.template` / this workflow's `publisher` input) is not a
+  free choice at all. It must be the *exact* string Partner Center issues
+  once the app identity is reserved, tied to the Partner Center account —
+  whichever name you registered that account under. This field is
+  effectively invisible to end users.
+- **`Properties/PublisherDisplayName`** (the human-readable, Store-facing
+  name shown to shoppers, currently rendered from this workflow as
+  "Archisman Karmakar") is free text and can be set to `ArchismanCoder` if
+  that's the byline wanted on the Store listing.
+- **`tauri.conf.json`'s `bundle.publisher`** (`"Archisman Karmakar"`) is
+  Tauri's own NSIS/MSI installer metadata (shown in Windows'
+  Add/Remove Programs, the installer's publisher field, etc.) — entirely
+  separate from the MSIX manifest and does not need to match it.
+
+So: if the Store listing should read "ArchismanCoder", change
+`PUBLISHER_DISPLAY_NAME` in `msix-build.yml`'s "Render AppxManifest.xml
+from template" step to `ArchismanCoder`, leave `tauri.conf.json`'s
+`bundle.publisher` untouched (that's the separate NSIS/MSI installer
+identity), and set the workflow's `publisher` input to whatever exact
+`CN=...` string Partner Center issues once the app name is reserved —
+that string is fixed by the account, not a choice between the two names.

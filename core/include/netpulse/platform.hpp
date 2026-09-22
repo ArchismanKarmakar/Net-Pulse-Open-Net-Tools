@@ -53,12 +53,15 @@
 
 #ifndef _WIN32
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #endif
 
 #include <atomic>
 #include <mutex>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 // For debug_log()'s timestamp prefix — explicit, not assumed transitively
 // available from some other header, the exact class of mistake already
@@ -190,6 +193,36 @@ struct DebugLogFile {
 };
 inline DebugLogFile& debug_log_file() { static DebugLogFile d; return d; }
 
+// Opens `path` for the given std::fopen()-style mode (e.g. "a", "ab", "rb")
+// while making sure a file CREATED by this call ends up owner-only (0600)
+// rather than whatever the process umask leaves it at (often 0644, i.e.
+// world-readable) -- used for netpulse's own diagnostic/telemetry files
+// (the debug log, per-target cold-storage stat files), which can contain
+// hostnames, IPs and other data the user may not want readable by other
+// accounts on a shared machine. Only the *creation* path is restricted:
+// opening an already-existing file (e.g. "rb", or "ab" appending to a file
+// from an earlier run) leaves its existing permissions untouched.
+inline std::FILE* fopen_owner_only(const std::string& path, const char* mode) {
+#ifndef _WIN32
+    const bool append = std::strchr(mode, 'a') != nullptr;
+    const bool read_only = std::strchr(mode, 'r') != nullptr && !std::strchr(mode, '+');
+    if (!read_only) {
+        int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
+        int fd = ::open(path.c_str(), flags, S_IRUSR | S_IWUSR);
+        if (fd < 0) return nullptr;
+        std::FILE* f = ::fdopen(fd, mode);
+        if (!f) ::close(fd);
+        return f;
+    }
+    return std::fopen(path.c_str(), mode);
+#else
+    // NTFS files are created without an "everyone" ACE by default (unlike
+    // POSIX's umask-derived world-readable default), so this doesn't carry
+    // the same over-broad-permissions risk the POSIX branch works around.
+    return std::fopen(path.c_str(), mode);
+#endif
+}
+
 // Closes the persistent handle (if open) and resets the size-cap/notice
 // state. Called when logging is turned OFF, so the file isn't held open
 // indefinitely afterward — a stale open handle would block the user from
@@ -262,7 +295,7 @@ inline void debug_log(const std::string& line) {
         return;
     }
     if (!d.f) {
-        d.f = std::fopen(path.c_str(), "a");
+        d.f = fopen_owner_only(path, "a");
         if (d.f) {
             // Only meaningful right after creating/opening for the first
             // time in this process — writing it on every open would corrupt

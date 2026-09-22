@@ -666,8 +666,21 @@ static int launch_shell_console(const char* argv0) {
     std::string aliasDir = setup_alias_dir(exePath);
     prepend_dir_to_path(aliasDir);
     prepend_dir_to_path(own_executable_dir(argv0));
-    const char* shell = std::getenv("SHELL");
-    if (!shell || !*shell) shell = "/bin/sh";
+    // $SHELL is untrusted input (any process in this login session can set
+    // it to whatever it wants before spawning us) so it isn't handed to
+    // execv() as-is: require it to name an existing, executable regular
+    // file, matching what login shells and terminal emulators already
+    // expect of it. Anything else (unset, empty, a directory, a dangling
+    // path, no execute bit) falls back to a fixed, known-safe shell rather
+    // than letting execv() attempt to run an attacker-influenced path.
+    const char* shellEnv = std::getenv("SHELL");
+    std::string shellPath = (shellEnv && *shellEnv) ? shellEnv : std::string();
+    struct stat shellStat{};
+    bool shellUsable = !shellPath.empty() &&
+        ::stat(shellPath.c_str(), &shellStat) == 0 &&
+        S_ISREG(shellStat.st_mode) &&
+        ::access(shellPath.c_str(), X_OK) == 0;
+    const char* shell = shellUsable ? shellPath.c_str() : "/bin/sh";
     PromptPlan promptPlan = prepare_prompt_plan(shell);
     set_terminal_title("npulse console");
     print_console_banner(shell);

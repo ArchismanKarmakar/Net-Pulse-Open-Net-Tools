@@ -1,5 +1,79 @@
 # Changelog
 
+## 1.2.6
+
+Note on this release's version number: the version-bearing files
+(`VERSION`, `tauri-app/package.json`, `tauri-app/src-tauri/Cargo.toml`,
+`tauri-app/src-tauri/tauri.conf.json`) had been stuck at `1.1.2` through at
+least two already-shipped release tags (`1.2.4`, `1.2.5` — cut and built
+straight from git tags without the source-of-truth version fields ever
+being bumped to match). This release re-synchronizes them, jumping
+straight to `1.2.6` rather than pretending the gap didn't happen.
+
+### Fixed: 4 CodeQL C++/JS security findings
+
+- `cli/main.cpp` — the `npulse console` feature's `$SHELL` handling now
+  validates the environment variable resolves to an existing, executable
+  regular file before passing it to `execv()`, falling back to `/bin/sh`
+  otherwise, instead of trusting `$SHELL` outright ("Uncontrolled process
+  operation").
+- `core/include/netpulse/platform.hpp` / `core/src/stats.cpp` — the debug
+  log and per-target/hop RTT-history files are now created with an
+  explicit owner-only `0600` mode via a new `fopen_owner_only()` helper,
+  rather than whatever the process umask left them at (often
+  world-readable) ("File created without restricting permissions", x2).
+- `.github/scripts/checksums.mjs` — removed a `statSync()`-then-
+  `readFileSync()` check-then-act pair (a TOCTOU race) in favor of
+  attempting the read directly and treating `EISDIR` as "skip it"
+  ("Potential file system race condition").
+- `tauri-app/src/workers/xlsxWorker.js` — added defensive message-shape
+  validation to the Worker's `onmessage` handler, with a comment
+  explaining why an `e.origin` check doesn't apply to a dedicated module
+  Worker the way it would to a `window` message listener ("Missing origin
+  verification in postMessage handler").
+
+### Fixed: 13 "unpinned action tag" CodeQL alerts across all workflow files
+
+Every `uses:` in `msix-build.yml`, `msix-build-community-tool.yml`,
+`tauri-release.yml`, `tauri-ci.yml`, `tauri-canary-build.yml`, and
+`obfuscated-build.yml` now pins a full commit SHA (resolved via
+`git ls-remote --tags` against each action's own repo) with a `# vN`
+comment, instead of a mutable tag like `@v4`.
+
+### Fixed: 4 of 7 open Dependabot alerts (npm)
+
+`undici` (6.27.0→6.28.1), `postcss` (8.5.19→8.5.28), `browserslist`
+(4.28.6→4.29.0), and `baseline-browser-mapping` (2.10.43→2.11.25) were all
+just a stale `package-lock.json` — `package.json`'s existing `^` ranges
+already covered the patched versions. `glib` (Rust, pulled in transitively
+via `tauri -> tray-icon -> gtk 0.18`) is confirmed blocked upstream: every
+published `tray-icon` release up to 0.25.1 still requires `gtk = "^0.18"`,
+which caps `glib` at `0.18.5` (the flagged version) since no patched
+`0.18.x` exists — the fix needs `glib` 0.19+, unavailable until
+`tray-icon`/`gtk-rs` moves first.
+
+### Clarified: MSIX publisher naming (`ArchismanCoder` vs. `Archisman Karmakar`)
+
+`Package/Identity/Publisher` (the manifest's `CN=...` string) is not a
+free choice — it's the exact string Partner Center issues once the app
+identity is reserved. `Properties/PublisherDisplayName` (the Store-facing
+name) is free text, now defaulted to `ArchismanCoder` in
+`msix-build.yml`. `tauri.conf.json`'s `bundle.publisher: "Archisman
+Karmakar"` is a separate, unrelated field (NSIS/MSI installer metadata).
+See `docs/MSIX_DISTRIBUTION.md` for the full breakdown.
+
+### Corrected: `docs/MSIX_DISTRIBUTION.md`'s `runFullTrust` section
+
+Previously overstated that `runFullTrust` "narrows Store review
+eligibility somewhat." Corrected: it's Microsoft's own sanctioned
+distribution path for this class of app (Discord, OBS Studio, VS Code, and
+Spotify all ship this way) — not a review penalty, and not something a
+UWP/AppContainer rewrite could avoid anyway (the AppContainer sandbox
+blocks raw ICMP sockets, `netsh`/firewall COM calls, and raw TCP outright,
+
+
+all core to what NetPulse does).
+
 ## 1.2.5
 
 ### Added: MSIX packaging workflow for Microsoft Store distribution

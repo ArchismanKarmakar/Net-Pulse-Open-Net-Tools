@@ -53,10 +53,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '20'
 
@@ -67,10 +67,10 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libayatana-appindicator3-dev libxdo-dev file
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: tauri-app/src-tauri
           key: canary
@@ -82,6 +82,31 @@ jobs:
       - name: Install Tauri CLI
         working-directory: tauri-app
         run: npm install --no-save @tauri-apps/cli
+
+      # See tauri-release.yml's identically-named step / tauri-app/src-tauri/
+      # binaries/README.md for the full convention — same sidecar, same
+      # externalBin config (tauri.conf.json, inherited by the canary config
+      # merge since tauri.canary.conf.json doesn't override bundle.externalBin),
+      # so a canary install gets the CLI too, not just a production one.
+      - name: Build CLI sidecar (npulse)
+        shell: bash
+        run: |
+          TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
+          cmake -S . -B build-cli -DCMAKE_BUILD_TYPE=Release -DNETPULSE_CLI_SIDECAR_TRIPLE="$TRIPLE"
+          cmake --build build-cli --config Release --target npulse
+          mkdir -p tauri-app/src-tauri/binaries
+          # BUG FIX (reported CI failure on windows-latest, same bug fixed
+          # in tauri-release.yml/tauri-ci.yml's identical step): a trailing
+          # wildcard here also matches MSVC's `npulse-<triple>.exe.recipe`
+          # intermediate metadata file next to the real .exe on the multi-
+          # config generator — `find` then returns two lines and `cp`
+          # fails on that as one newline-embedded argument. Exact filename
+          # match instead of a wildcard rules that out.
+          SIDECAR_EXT=""
+          case "$TRIPLE" in *windows*) SIDECAR_EXT=".exe" ;; esac
+          SIDECAR=$(find build-cli -name "npulse-${TRIPLE}${SIDECAR_EXT}" -type f)
+          echo "Sidecar: $SIDECAR"
+          cp "$SIDECAR" tauri-app/src-tauri/binaries/
 
       # --features canary → Cargo.toml's `canary = ["tauri/devtools"]`
       # --config tauri.canary.conf.json → merged over the base config:
@@ -108,7 +133,7 @@ jobs:
           ls -la collected
 
       - name: Upload canary installer (artifact only — no Release is created)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: netpulse-canary-${{ matrix.os }}
           path: collected/*

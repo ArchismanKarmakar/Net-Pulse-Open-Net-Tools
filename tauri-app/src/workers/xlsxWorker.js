@@ -32,7 +32,20 @@ let historySheetName = 'Full History'
 const decoder = new TextDecoder()
 
 self.onmessage = (e) => {
+  // No `e.origin` check here: that guard matters for `window.onmessage`,
+  // which can receive a message from an arbitrary cross-origin window,
+  // iframe, or opener. This is a dedicated *module* Worker instantiated
+  // in App.jsx as `new Worker(new URL('./workers/xlsxWorker.js',
+  // import.meta.url), { type: 'module' })` — the browser only ever
+  // delivers messages to a dedicated Worker from the same-origin script
+  // that created it; there is no channel for another origin to inject a
+  // message into it, so an origin comparison here would be theater, not a
+  // real boundary. What's still worth validating is the message *shape*
+  // (it's a worker message, not a network payload, but still not
+  // guaranteed well-formed) so a malformed message degrades gracefully
+  // instead of throwing on `msg.type` access below.
   const msg = e.data
+  if (!msg || typeof msg !== 'object' || typeof msg.type !== 'string') return
   try {
     if (msg.type === 'start') {
       wb = utils.book_new()

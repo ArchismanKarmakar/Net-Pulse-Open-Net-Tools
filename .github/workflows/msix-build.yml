@@ -1,0 +1,322 @@
+name: MSIX Build (Microsoft Store)
+
+# Builds a Microsoft Store MSIX package for NetPulse using ONLY tools that
+# already ship with the windows-latest GitHub runner's Windows SDK
+# (makeappx.exe, signtool.exe, and PowerShell's New-SelfSignedCertificate) —
+# no third-party npm/cargo packaging tool. See docs/MSIX_DISTRIBUTION.md for
+# the full rationale, including why this was chosen over
+# @choochmeque/tauri-windows-bundle (that alternative is scaffolded but
+# deliberately NOT wired up yet — see msix-build-community-tool.yml).
+#
+# Manual-only (workflow_dispatch), like tauri-canary-build.yml: an MSIX
+# suitable for real Store submission needs a Partner Center-issued package
+# identity (Name + Publisher) that this workflow cannot know on its own —
+# see the "Resolve package identity" step below — so this is not meant to
+# run unattended on every push the way tauri-ci.yml/tauri-release.yml do.
+#
+# UNVERIFIED END-TO-END (flagging plainly, same standard this project holds
+# every other fix to): makeappx.exe/signtool.exe/Add-AppxPackage are
+# Windows-only tools with no Linux-runnable equivalent, so unlike the NSIS
+# EnVar fix elsewhere in this repo's history (verified by actually running
+# the compiled installer under Wine), nothing here could be exercised
+# end-to-end outside of real Windows CI. What WAS verified before this was
+# committed: the AppxManifest.xml.template is well-formed XML (validated
+# with both Python's xml.dom.minidom and xmllint) and closely mirrors
+# Microsoft's own published manual-MSIX-packaging example rather than being
+# invented from scratch; generate-assets.py was run for real, producing
+# correctly-sized PNGs, verified by opening each one and checking its pixel
+# dimensions. The genuinely untested step is `makeappx pack` itself and the
+# resulting package installing — the first real run of this workflow is
+# that test, and its output artifact should be sideloaded
+# (Add-AppxPackage) and smoke-tested on a real Windows machine before this
+# is trusted for a Store submission.
+#
+# WHERE THE REAL IDENTITY COMES FROM: this workflow's `build` job declares
+# `environment: msix-store-release` below specifically so the Partner
+# Center-issued identity can live as GitHub Environment secrets instead of
+# being typed into the workflow_dispatch form (or, worse, committed to this
+# file) every run. An environment's secrets are ONLY visible to a job that
+# names that exact environment — no other workflow or job in this repo can
+# read them just by existing, so this is what actually satisfies "restrict
+# this to one workflow," not merely a naming convention. One-time setup
+# (repo Settings -> Environments -> New environment -> name it exactly
+# `msix-store-release`, optionally add required reviewers / branch
+# restrictions there too, then add these as environment secrets):
+#   - MSIX_PACKAGE_IDENTITY_NAME  (Partner Center's Package/Identity/Name)
+#   - MSIX_PUBLISHER              (Partner Center's Package/Identity/Publisher,
+#                                  the "CN=..." string)
+#   - MSIX_PUBLISHER_DISPLAY_NAME (optional -- the Store-facing display
+#                                  name, e.g. "ArchismanCoder"; falls back
+#                                  to the placeholder below if not set)
+# The workflow_dispatch inputs below are still there as an explicit,
+# visible-in-the-run-log OVERRIDE for one-off test builds (e.g. packaging
+# under a throwaway identity to sideload-test without touching the real
+# secrets) -- leave them blank on a normal run and the secrets above are
+# used automatically ("autofetch," nothing to paste by hand once the
+# secrets exist). Neither path ever prints the resolved values anywhere
+# other than this run's own log, which is expected/normal for a package
+# identity (it's not sensitive the way a private key is -- Partner Center
+# itself displays it in plain text), but the self-signed test certificate
+# generated further down never leaves this runner either way.
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_identity_name:
+        description: >-
+          Override for MSIX package Identity/Name. Leave BLANK on a normal
+          run -- the msix-store-release environment's MSIX_PACKAGE_IDENTITY_NAME
+          secret is used automatically. Only fill this in for a one-off
+          test build under a different identity.
+        required: false
+        default: ''
+      publisher:
+        description: >-
+          Override for MSIX package Identity/Publisher, e.g.
+          "CN=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx". Leave BLANK on a normal
+          run -- the msix-store-release environment's MSIX_PUBLISHER secret
+          is used automatically. Only fill this in for a one-off test build.
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: msix-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build MSIX (x64)
+    runs-on: windows-latest
+    # Scopes MSIX_PACKAGE_IDENTITY_NAME / MSIX_PUBLISHER /
+    # MSIX_PUBLISHER_DISPLAY_NAME (set as Environment secrets under this
+    # exact name in repo Settings -> Environments) to ONLY this job -- see
+    # this file's header comment for the one-time setup and why this is
+    # what actually restricts the secrets to this workflow, not just a
+    # naming convention. If the environment or its secrets don't exist yet,
+    # `secrets.*` below simply evaluates to an empty string and the
+    # placeholder default further down is used instead -- this workflow
+    # never fails outright for missing secrets, it just falls back.
+    environment: msix-store-release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '20'
+
+      - name: Setup Python (for generate-assets.py)
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.x'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          workspaces: tauri-app/src-tauri
+          key: msix
+
+      - name: Install frontend deps
+        working-directory: tauri-app
+        run: npm ci
+
+      - name: Install Tauri CLI
+        working-directory: tauri-app
+        run: npm install --no-save @tauri-apps/cli
+
+      # Identical to tauri-release.yml's own "Build CLI sidecar (npulse)"
+      # step (same bug fixes already applied there: exact filename match,
+      # not a wildcard, to avoid MSVC's .exe.recipe collision) — kept in
+      # sync by hand since GitHub Actions has no first-class step-sharing
+      # mechanism short of a full composite action, which felt like more
+      # indirection than this one copy-pasted step justifies.
+      - name: Build CLI sidecar (npulse)
+        shell: bash
+        run: |
+          TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
+          echo "Sidecar target triple: $TRIPLE"
+          cmake -S . -B build-cli -DCMAKE_BUILD_TYPE=Release -DNETPULSE_CLI_SIDECAR_TRIPLE="$TRIPLE"
+          cmake --build build-cli --config Release --target npulse
+          mkdir -p tauri-app/src-tauri/binaries
+          SIDECAR_EXT=""
+          case "$TRIPLE" in *windows*) SIDECAR_EXT=".exe" ;; esac
+          SIDECAR=$(find build-cli -name "npulse-${TRIPLE}${SIDECAR_EXT}" -type f)
+          echo "Sidecar: $SIDECAR"
+          cp "$SIDECAR" tauri-app/src-tauri/binaries/
+
+      # --no-bundle: we want the raw, unpacked app (target/release/netpulse.exe
+      # + whatever DLLs cargo places next to it) to stage into our OWN MSIX
+      # layout, not Tauri's NSIS/MSI bundler output — Tauri has no MSIX
+      # bundler target to ask for instead (see docs/MSIX_DISTRIBUTION.md).
+      - name: tauri build --no-bundle (produces the raw app, no installer)
+        working-directory: tauri-app
+        run: npx tauri build --no-bundle
+
+      - name: Resolve package identity + version
+        id: identity
+        shell: bash
+        env:
+          # Passed in via `env:` rather than interpolated straight into the
+          # script below -- keeps a secret's literal value out of the
+          # rendered/logged step command line, which is the one place a
+          # direct `${{ secrets.X }}` substitution inside `run:` would
+          # otherwise put it (GitHub masks known secret values in logs
+          # either way, but this avoids relying on that alone).
+          IDENTITY_NAME_SECRET: ${{ secrets.MSIX_PACKAGE_IDENTITY_NAME }}
+          PUBLISHER_SECRET: ${{ secrets.MSIX_PUBLISHER }}
+        run: |
+          set -euo pipefail
+          # Precedence: an explicit workflow_dispatch input (a deliberate,
+          # visible-in-the-run-log override for a one-off test build) wins;
+          # otherwise fall back to the msix-store-release environment's
+          # secrets (the normal path -- see this file's header comment for
+          # one-time setup); otherwise fall back to a placeholder so this
+          # workflow still runs end-to-end (as a local/sideload test build)
+          # even before those secrets are ever configured.
+          NAME="${{ github.event.inputs.package_identity_name }}"
+          PUBLISHER="${{ github.event.inputs.publisher }}"
+          if [ -z "$NAME" ]; then NAME="$IDENTITY_NAME_SECRET"; fi
+          if [ -z "$PUBLISHER" ]; then PUBLISHER="$PUBLISHER_SECRET"; fi
+          if [ -z "$NAME" ]; then NAME="ArchismanKarmakar.NetPulseOpenNetTools"; fi
+          if [ -z "$PUBLISHER" ]; then PUBLISHER="CN=00000000-0000-0000-0000-000000000000"; fi
+          # Cargo.toml is the actual source of truth for what version this
+          # build's binary reports (see build.rs/tauri.conf.json's own
+          # version field, which has drifted from Cargo.toml before in this
+          # project's history) — read it from there, not from tauri.conf.json.
+          VERSION=$(grep -m1 '^version' tauri-app/src-tauri/Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
+          # MSIX Identity/Version requires exactly 4 dot-separated numeric
+          # parts; this project's version is 3-part semver, so pad with a
+          # trailing .0 (a real 4th "revision" component would need a
+          # separate counter — not needed yet, Store also does not allow
+          # resubmitting the same 4-part version twice, so this may need
+          # revisiting once real submissions start happening regularly).
+          VERSION_4PART="${VERSION}.0"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "publisher=$PUBLISHER" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION_4PART" >> "$GITHUB_OUTPUT"
+          echo "Resolved identity: Name=$NAME Publisher=$PUBLISHER Version=$VERSION_4PART"
+
+      - name: Generate Store tile assets
+        shell: bash
+        run: |
+          pip install --disable-pip-version-check --quiet Pillow
+          mkdir -p msix-staging/Assets
+          python3 tauri-app/src-tauri/windows/msix/generate-assets.py msix-staging/Assets
+
+      - name: Stage app files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p msix-staging
+          cp tauri-app/src-tauri/target/release/netpulse.exe msix-staging/
+          # The CLI sidecar, renamed exactly the way Tauri's own
+          # externalBin bundling renames it for the NSIS/MSI installers
+          # (see windows/hooks.nsh's comment on this) -- drop the
+          # target-triple suffix so it's just npulse.exe alongside the app,
+          # matching what a real Store install should look like.
+          cp tauri-app/src-tauri/binaries/npulse-*.exe msix-staging/npulse.exe
+          # Any DLL cargo/tauri-build placed next to the built exe (e.g.
+          # WebView2Loader.dll) -- copied defensively by pattern rather
+          # than a hardcoded filename, since this sandbox can only build
+          # for Linux and can't observe what a real Windows cargo build
+          # actually drops there (flagged in this workflow's own top-of-file
+          # comment as one of the genuinely unverified parts).
+          shopt -s nullglob
+          for dll in tauri-app/src-tauri/target/release/*.dll; do
+            cp "$dll" msix-staging/
+          done
+
+      - name: Render AppxManifest.xml from template
+        shell: bash
+        env:
+          # Optional -- the Store-facing display name isn't Partner
+          # Center-issued the way Identity/Name and Identity/Publisher are,
+          # so it's not required to live in secrets, but keeping it there
+          # too means updating it (e.g. a rebrand) never needs a workflow
+          # file edit, just an environment-secret update.
+          PUBLISHER_DISPLAY_NAME_SECRET: ${{ secrets.MSIX_PUBLISHER_DISPLAY_NAME }}
+        run: |
+          set -euo pipefail
+          PUBLISHER_DISPLAY_NAME="$PUBLISHER_DISPLAY_NAME_SECRET"
+          if [ -z "$PUBLISHER_DISPLAY_NAME" ]; then PUBLISHER_DISPLAY_NAME="ArchismanCoder"; fi
+          sed \
+            -e "s|@@PACKAGE_IDENTITY_NAME@@|${{ steps.identity.outputs.name }}|g" \
+            -e "s|@@VERSION_4PART@@|${{ steps.identity.outputs.version }}|g" \
+            -e "s|@@PUBLISHER@@|${{ steps.identity.outputs.publisher }}|g" \
+            -e "s|@@DISPLAY_NAME@@|Net Pulse - Open Net Tools|g" \
+            -e "s|@@PUBLISHER_DISPLAY_NAME@@|$PUBLISHER_DISPLAY_NAME|g" \
+            -e "s|@@DESCRIPTION@@|Cross-platform network diagnostics toolkit (ping, traceroute, port scan, DNS, BGP and more)|g" \
+            tauri-app/src-tauri/windows/msix/AppxManifest.xml.template \
+            > msix-staging/AppxManifest.xml
+          cat msix-staging/AppxManifest.xml
+
+      - name: Locate Windows SDK tools (makeappx, signtool)
+        id: sdk
+        shell: pwsh
+        run: |
+          $kitsRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+          # Pick the highest-versioned x64 tools directory under the SDK --
+          # hardcoding an exact SDK build number would break the moment
+          # GitHub bumps the windows-latest image's preinstalled SDK, the
+          # same class of "don't hardcode a path that drifts under you" bug
+          # this project's build.rs/CI already had to fix once for CMake's
+          # CMakeCache.txt path baked-in problem.
+          $makeappx = Get-ChildItem -Path $kitsRoot -Recurse -Filter "makeappx.exe" -ErrorAction Stop |
+            Where-Object { $_.FullName -match '\\x64\\' } |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          $signtool = Get-ChildItem -Path $kitsRoot -Recurse -Filter "signtool.exe" -ErrorAction Stop |
+            Where-Object { $_.FullName -match '\\x64\\' } |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $makeappx) { throw "makeappx.exe not found under $kitsRoot" }
+          if (-not $signtool) { throw "signtool.exe not found under $kitsRoot" }
+          echo "makeappx=$($makeappx.FullName)" >> $env:GITHUB_OUTPUT
+          echo "signtool=$($signtool.FullName)" >> $env:GITHUB_OUTPUT
+          Write-Host "makeappx: $($makeappx.FullName)"
+          Write-Host "signtool: $($signtool.FullName)"
+
+      - name: Pack MSIX
+        shell: pwsh
+        run: |
+          $out = "netpulse.msix"
+          & "${{ steps.sdk.outputs.makeappx }}" pack /d msix-staging /p $out /overwrite
+          if ($LASTEXITCODE -ne 0) { throw "makeappx pack failed with exit code $LASTEXITCODE" }
+
+      # Self-signed test certificate ONLY -- this makes the artifact
+      # installable via Add-AppxPackage for local sideload testing. It is
+      # NOT the signature a real Store submission ships with: Partner
+      # Center re-signs the package with Microsoft's own certificate during
+      # certification, so this step's certificate never reaches end users.
+      # See docs/MSIX_DISTRIBUTION.md for the real submission flow.
+      - name: Sign MSIX with a throwaway test certificate
+        shell: pwsh
+        run: |
+          $publisher = "${{ steps.identity.outputs.publisher }}"
+          $cert = New-SelfSignedCertificate `
+            -Type Custom `
+            -Subject $publisher `
+            -KeyUsage DigitalSignature `
+            -FriendlyName "NetPulse MSIX test certificate (CI-generated, not for distribution)" `
+            -CertStoreLocation "Cert:\CurrentUser\My" `
+            -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
+          # Sign by thumbprint (/sha1), not by subject substring (/n) --
+          # signtool's /n match is against the certificate's parsed common
+          # name, not the raw "CN=..." string this cert's Subject was set
+          # to, so the two don't reliably line up. The thumbprint from the
+          # cert PowerShell just created is unambiguous.
+          & "${{ steps.sdk.outputs.signtool }}" sign /fd SHA256 /s My /sha1 $cert.Thumbprint netpulse.msix
+          if ($LASTEXITCODE -ne 0) { throw "signtool sign failed with exit code $LASTEXITCODE" }
+
+      - name: Upload MSIX artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: netpulse-msix-x64
+          path: netpulse.msix
+          if-no-files-found: error
+          retention-days: 30

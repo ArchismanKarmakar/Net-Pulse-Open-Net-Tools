@@ -2193,7 +2193,7 @@ dependencies = [
 
 [[package]]
 name = "netpulse"
-version = "0.9.5"
+version = "1.2.6"
 dependencies = [
  "cxx",
  "cxx-build",

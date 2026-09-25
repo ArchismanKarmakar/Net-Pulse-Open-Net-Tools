@@ -1,4 +1,23 @@
-build/
+# BUG FIX (reported CI failure on all three OSes): this used to be just
+# `build/` — an exact-name match that does NOT cover `build-cli-sidecar/`,
+# `build-cli/`, `build-verify/`, `build-asan/`, or any other local CMake
+# scratch directory a developer (or this engineering session) creates
+# alongside it. `build-cli-sidecar/` specifically had its CMakeCache.txt
+# committed as a result — a file that bakes in the exact local absolute
+# path it was configured from — which then made every fresh CI checkout
+# (Windows, Linux, AND macOS runners all showed the same committer's local
+# Windows path in their error output) fail with "CMakeCache.txt directory
+# ... is different than the directory ... where it was created", since
+# CMake correctly refuses to reuse a cache recorded against a path that
+# isn't the current one. `build*/` (trailing slash: directories only, so
+# it can't accidentally also match the `build-and-run.sh`/`.ps1` FILES at
+# the repo root) covers this whole family of directories generically
+# instead of needing a new .gitignore line every time a new one shows up.
+# (build.rs also got a matching defensive fix: it now detects and wipes a
+# stale/mismatched cache itself rather than hard-failing, so this class of
+# problem can't come back even if a build dir slips past this ignore rule
+# some other way — e.g. `git add -f`.)
+build*/
 *.o
 *.a
 web/node_modules
@@ -11,6 +30,14 @@ tauri-app/node_modules
 tauri-app/dist
 tauri-app/src-tauri/target
 tauri-app/src-tauri/gen
+# CLI sidecar binaries (Tauri externalBin — tauri.conf.json's bundle.
+# externalBin) are built fresh by CI immediately before each `tauri build`
+# (see .github/workflows/tauri-release.yml's "Build CLI sidecar" step) and
+# are OS/arch-specific — never something to commit. The directory itself
+# (with its README) stays tracked so `bundle.externalBin`'s referenced path
+# exists in a fresh checkout even before that step has ever run.
+tauri-app/src-tauri/binaries/*
+!tauri-app/src-tauri/binaries/README.md
 
 
 # Env files
@@ -38,5 +65,17 @@ tauri-app/src-tauri/Cargo.lock
 .mypy_cache/
 
 
-Unnecessary files
+# Unnecessary files
 step0_classifier.py
+
+
+# Key Files
+netpulse_signing_private_key.pem
+netpulse_signing_private_key_password.txt
+netpulse_signing_public_key.pem
+netpulse_signing_public_key.pub
+netpulse_signing_public_key.pub.asc
+netpulse_signing_public_key.pub.asc.sig
+
+netpulse-updater.key
+netpulse-updater.key.pub

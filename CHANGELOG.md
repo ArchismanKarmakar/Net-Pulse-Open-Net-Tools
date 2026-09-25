@@ -1,11 +1,1609 @@
 # Changelog
 
+## 1.2.6
+
+Note on this release's version number: the version-bearing files
+(`VERSION`, `tauri-app/package.json`, `tauri-app/src-tauri/Cargo.toml`,
+`tauri-app/src-tauri/tauri.conf.json`) had been stuck at `1.1.2` through at
+least two already-shipped release tags (`1.2.4`, `1.2.5` — cut and built
+straight from git tags without the source-of-truth version fields ever
+being bumped to match). This release re-synchronizes them, jumping
+straight to `1.2.6` rather than pretending the gap didn't happen.
+
+### Fixed: 4 CodeQL C++/JS security findings
+
+- `cli/main.cpp` — the `npulse console` feature's `$SHELL` handling now
+  validates the environment variable resolves to an existing, executable
+  regular file before passing it to `execv()`, falling back to `/bin/sh`
+  otherwise, instead of trusting `$SHELL` outright ("Uncontrolled process
+  operation").
+- `core/include/netpulse/platform.hpp` / `core/src/stats.cpp` — the debug
+  log and per-target/hop RTT-history files are now created with an
+  explicit owner-only `0600` mode via a new `fopen_owner_only()` helper,
+  rather than whatever the process umask left them at (often
+  world-readable) ("File created without restricting permissions", x2).
+- `.github/scripts/checksums.mjs` — removed a `statSync()`-then-
+  `readFileSync()` check-then-act pair (a TOCTOU race) in favor of
+  attempting the read directly and treating `EISDIR` as "skip it"
+  ("Potential file system race condition").
+- `tauri-app/src/workers/xlsxWorker.js` — added defensive message-shape
+  validation to the Worker's `onmessage` handler, with a comment
+  explaining why an `e.origin` check doesn't apply to a dedicated module
+  Worker the way it would to a `window` message listener ("Missing origin
+  verification in postMessage handler").
+
+### Fixed: 13 "unpinned action tag" CodeQL alerts across all workflow files
+
+Every `uses:` in `msix-build.yml`, `msix-build-community-tool.yml`,
+`tauri-release.yml`, `tauri-ci.yml`, `tauri-canary-build.yml`, and
+`obfuscated-build.yml` now pins a full commit SHA (resolved via
+`git ls-remote --tags` against each action's own repo) with a `# vN`
+comment, instead of a mutable tag like `@v4`.
+
+### Fixed: 4 of 7 open Dependabot alerts (npm)
+
+`undici` (6.27.0→6.28.1), `postcss` (8.5.19→8.5.28), `browserslist`
+(4.28.6→4.29.0), and `baseline-browser-mapping` (2.10.43→2.11.25) were all
+just a stale `package-lock.json` — `package.json`'s existing `^` ranges
+already covered the patched versions. `glib` (Rust, pulled in transitively
+via `tauri -> tray-icon -> gtk 0.18`) is confirmed blocked upstream: every
+published `tray-icon` release up to 0.25.1 still requires `gtk = "^0.18"`,
+which caps `glib` at `0.18.5` (the flagged version) since no patched
+`0.18.x` exists — the fix needs `glib` 0.19+, unavailable until
+`tray-icon`/`gtk-rs` moves first.
+
+### Clarified: MSIX publisher naming (`ArchismanCoder` vs. `Archisman Karmakar`)
+
+`Package/Identity/Publisher` (the manifest's `CN=...` string) is not a
+free choice — it's the exact string Partner Center issues once the app
+identity is reserved. `Properties/PublisherDisplayName` (the Store-facing
+name) is free text, now defaulted to `ArchismanCoder` in
+`msix-build.yml`. `tauri.conf.json`'s `bundle.publisher: "Archisman
+Karmakar"` is a separate, unrelated field (NSIS/MSI installer metadata).
+See `docs/MSIX_DISTRIBUTION.md` for the full breakdown.
+
+### Corrected: `docs/MSIX_DISTRIBUTION.md`'s `runFullTrust` section
+
+Previously overstated that `runFullTrust` "narrows Store review
+eligibility somewhat." Corrected: it's Microsoft's own sanctioned
+distribution path for this class of app (Discord, OBS Studio, VS Code, and
+Spotify all ship this way) — not a review penalty, and not something a
+UWP/AppContainer rewrite could avoid anyway (the AppContainer sandbox
+blocks raw ICMP sockets, `netsh`/firewall COM calls, and raw TCP outright,
+
+
+all core to what NetPulse does).
+
+## 1.2.5
+
+### Added: MSIX packaging workflow for Microsoft Store distribution
+
+Tauri does not build MSIX natively (only NSIS/MSI) — added a manual
+(`workflow_dispatch`) GitHub Actions workflow, `.github/workflows/msix-build.yml`,
+that hand-packages a real `.msix` using only tools already on the
+`windows-latest` runner (`makeappx.exe`/`signtool.exe` from the Windows
+SDK, no third-party CI dependency): builds the CLI sidecar, runs
+`tauri build --no-bundle` for the raw app, generates the Store's required
+tile assets from the existing icon (`windows/msix/generate-assets.py`),
+renders an `AppxManifest.xml` from a template
+(`windows/msix/AppxManifest.xml.template`) mirrored against Microsoft's own
+manual-MSIX-packaging reference, packs and signs it with a throwaway test
+certificate, and uploads it as an artifact.
+
+Also scaffolded, but deliberately **not** wired up for real use yet: a
+second workflow (`msix-build-community-tool.yml`) using the community npm
+package `@choochmeque/tauri-windows-bundle`, kept ready for an easy future
+migration once it — or the hand-rolled approach's maintenance cost — earns
+that trust. See `docs/MSIX_DISTRIBUTION.md` for the full comparison, what's
+verified vs. not (the AppxManifest template and every PowerShell step were
+checked — `xmllint`/`xml.dom.minidom` for the XML, a real PowerShell 7
+parser for the `.ps1` blocks — but `makeappx pack` itself has no
+Linux-runnable equivalent to test here, so the first real Windows CI run
+is the actual end-to-end test), and exactly what's still needed (a Partner
+Center-issued package identity) before a real Store submission.
+
+### Fixed: Windows installer bundling failed — `Plugin not found, cannot call EnVar::SetHKCU`
+
+**Bug report** (CI log, "windows build failed again"): the previous two CI
+fixes both held — the sidecar built and copied cleanly, and the full
+Rust/Tauri release build succeeded (`Finished \`release\` profile`, `Built
+application at: ...\target\release\netpulse.exe`) — but `makensis` then
+failed while producing the installer:
+```
+Plugin not found, cannot call EnVar::SetHKCU
+Error in macro NSIS_HOOK_POSTINSTALL on macroline 36
+Error in script "...\installer.nsi" on line 706 -- aborting creation process
+failed to bundle project: `Failed to bundle app with makensis`
+```
+
+**Root cause**: `windows/hooks.nsh`'s `NSIS_HOOK_POSTINSTALL`/
+`NSIS_HOOK_POSTUNINSTALL` macros used the third-party **EnVar** NSIS plugin
+(`EnVar::SetHKCU`, `EnVar::AddValue`, `EnVar::DeleteValue`) to add/remove
+`$INSTDIR` from the current user's `PATH`, on the assumption — recorded in
+the hook file's own (now corrected) comment — that "Tauri's bundled NSIS
+template ships common plugins including EnVar." That assumption was wrong:
+`tauri-action`/`tauri-bundler` download a fresh NSIS plus Tauri's own
+`nsis_tauri_utils` plugin only (visible succeeding a few lines above the
+failure in the CI log) — EnVar is a separate, third-party plugin nothing in
+this pipeline fetches. Reproduced locally: a stock `apt install nsis`
+(v3.09, the same bare NSIS this pipeline effectively gets) has no
+`EnVar.dll` in any of its `Plugins/*` directories, and a minimal script
+calling `EnVar::SetHKCU` against it fails with the identical "Plugin not
+found" error.
+
+**Fix**: dropped the EnVar dependency entirely. The `PATH` add/remove logic
+in `windows/hooks.nsh` now uses only NSIS's own built-in instructions
+(`ReadRegStr`/`WriteRegExpandStr`/`StrCpy`/`StrLen`/`IntOp`/`SendMessage`),
+plus a small public-domain `StrStr` substring-search helper (defined once
+for the installer and once, as `un.StrStr`, for the uninstaller, per NSIS's
+own install/uninstall scoping rules) — no plugin required at all, so
+nothing can go missing from the CI-downloaded NSIS toolchain again.
+
+**Verification**: this one is easy to get subtly wrong (and did, once — see
+below), so it was checked by actually running the compiled installer and
+uninstaller, not just by getting `makensis` to accept the script. Installed
+`nsis` and `wine`/`wine32` locally, reproduced the exact CI error first
+(`EnVar::SetHKCU` against a stock NSIS: "Plugin not found"), then compiled
+the real `hooks.nsh` into a throwaway test installer/uninstaller and ran
+both under Wine, checking `HKCU\Environment\Path` after each step:
+install with an empty `PATH`, install again (no duplicate), install onto an
+existing unrelated `PATH` (correct `;`-join), install again (still no
+duplicate), and uninstall with the entry in the middle/at the
+start/at the end/as the sole value/not present/appearing twice — all ten
+cases produced the correct `PATH` value. This caught a real bug in the
+first draft of the `StrStr` helper (it measured the *haystack's* length
+instead of the *needle's* for the comparison window), which compiled
+cleanly and even made "install" appear to work, but silently made every
+match fail, so "uninstall" would never have actually removed the `PATH`
+entry — `makensis` compiling without error would not have caught this.
+
+### Fixed: "build installer (windows-latest)" failed — `cp: cannot stat` two filenames at once
+
+**Bug report** (CI log): the "Build CLI sidecar (npulse)" step compiled
+the sidecar successfully, then failed on the very next line —
+`cp: cannot stat 'build-cli/cli/npulse.dir/Release/npulse-x86_64-pc-
+windows-msvc.exe.recipe\nbuild-cli/sidecar/Release/npulse-x86_64-pc-
+windows-msvc.exe': No such file or directory`.
+
+**Root cause**: `SIDECAR=$(find build-cli -name "npulse-${TRIPLE}*" -type
+f)` used a trailing wildcard to handle CMake's generator-dependent output
+nesting (correct idea — a single-config generator like Ninja and a
+multi-config one like Visual Studio put the binary in different places).
+On Windows specifically, MSVC's build also leaves behind
+`npulse-<triple>.exe.recipe` — an MSBuild-generated intermediate metadata
+file for its custom build rule, not a binary — sitting right next to the
+real `.exe`, and the wildcard matched BOTH. `find` printed both paths on
+separate lines, the command substitution captured them as one string with
+an embedded newline, and `cp` tried to `stat` that whole two-line string
+as a single (nonexistent) filename.
+
+**Fix** (`tauri-release.yml`, `tauri-ci.yml`, `tauri-canary-build.yml` —
+all three had the identical line): build the exact expected filename
+(`npulse-<triple>.exe` on Windows, `npulse-<triple>` elsewhere — the same
+`.exe`-if-windows logic `build.rs` already uses for the same binary) and
+match on that exactly instead of a wildcard, so it can't also match a
+same-stem file with anything appended, `.recipe` or otherwise. Reproduced
+locally against a fake MSVC-shaped output tree (both files present): the
+old pattern returned both paths, the new one returns exactly the real
+binary.
+
+### Fixed: CI (`cargo check --features obfuscate`) failed on Windows, Linux AND macOS with a CMake "CMakeCache.txt directory ... is different" error
+
+**Bug report** (CI logs, all three OS runners): every job failed inside
+`build.rs`'s CLI-sidecar step with `CMake Error: The current
+CMakeCache.txt directory .../build-cli-sidecar/CMakeCache.txt is
+different than the directory c:/Users/Archisman/Downloads/NetPulse-cpp-
+web/33/NetPulse-cpp-web/build-cli-sidecar where CMakeCache.txt was
+created`, then a panic ("Could not automatically build the CLI sidecar").
+
+**Root cause**: `build-cli-sidecar/` wasn't covered by `.gitignore` (only
+the exact name `build/` was listed — `build-cli-sidecar` doesn't match
+that), so a `CMakeCache.txt` generated on a local machine — which bakes
+in the exact absolute source path it was configured from — got committed.
+Every fresh checkout, on every OS (all three jobs' error output shows the
+SAME committer's local Windows path, confirming it's one committed file
+being cloned everywhere), inherited a cache that could never match ITS
+OWN checkout path. CMake correctly refuses to silently reuse a
+cache recorded against a different location, so the build hard-failed
+before compiling anything.
+
+**Fix, two parts**:
+1. `.gitignore`: `build/` widened to `build*/` (directories only — can't
+   match the `build-and-run.sh`/`.ps1` *files* at the repo root) so this
+   whole family of local CMake scratch directories (`build-cli-sidecar/`,
+   `build-cli/`, `build-verify/`, `build-asan/`, and any future one) is
+   covered generically instead of needing a new line every time.
+2. `build.rs` (`ensure_cli_sidecar`): now checks the existing cache's own
+   recorded `CMAKE_HOME_DIRECTORY` against the current repo root before
+   reusing it, and if they don't match, deletes the whole
+   `build-cli-sidecar/` directory and reconfigures from scratch instead of
+   handing CMake a cache it will just refuse and panic on. Makes the build
+   self-healing regardless of how a mismatched cache gets there again (a
+   moved checkout, a CI cache-restore action, ...), not just for this one
+   already-committed file.
+
+**Action still needed** (can't be done from a code patch alone): the
+already-committed `build-cli-sidecar/CMakeCache.txt` needs removing from
+version control in the real repository —
+`git rm -r --cached build-cli-sidecar` (and any other stray `build*`
+directory `git status` shows as tracked), then commit. The `build.rs`
+self-heal above means CI will now recover even before that cleanup
+lands, but the stale file should still come out of history.
+
+**Verified**: reproduced the exact failure locally (planted a
+`CMakeCache.txt` with a bogus `CMAKE_HOME_DIRECTORY`, deleted the sidecar
+binary to force a rebuild) — confirmed it previously panicked, and with
+this fix `cargo build` completes cleanly and produces a real, working
+sidecar binary instead.
+
+### Fixed: Settings tab was also boxed into a fixed ~640px column, same as the Interfaces table
+
+**Follow-up** to the Interfaces fix directly below — the same complaint
+applied to Settings too: `SettingsPage.jsx` used the generic `"toolpage"`
+class (a fixed `max-width: 900px`) plus its own inline `maxWidth: 640` on
+top of that, so on any window wider than ~700px the page sat in a fixed
+box with the rest of the window left empty next to it.
+
+**Fix**: `SettingsPage.jsx` now renders `<div className="toolpage
+fluid">` with no width cap, and the "Auto-refresh" / "New target
+defaults" field grids switched from a fixed 2-column layout to
+`grid-template-columns: repeat(auto-fit, minmax(200px, 260px))` — more
+fields per row as the window gets wider (up to 6 on a large window, down
+to 1 on a narrow one), so the extra space is actually used instead of
+sitting empty. Verified in a real headless run: 6 fields per row at
+1900px wide, 4 at the app's configured minimum (1280px), no dead space
+either way, vertical scrolling from the previous fix still intact.
+
+### Fixed: Interfaces table was boxed into a fixed ~900px column with a horizontal scrollbar, leaving the rest of a wide window empty
+
+**Bug report** (with screenshot): on a wide window, the Interfaces table
+sat in a narrow fixed-width box requiring its own sideways scroll to see
+every column, while the remaining ~half of the window next to it was
+just empty background — the page wasn't using the space the window
+actually gave it.
+
+**Root cause**: `InterfacesPage.jsx` used the same generic `"toolpage"`
+class as every prose/form tool page (Settings, DNS, Ping), which carries
+a fixed `max-width: 900px` — a sensible cap for a page of text or a form
+(nobody wants a paragraph stretched across a 1900px window), but wrong
+for a data table, which should use whatever width the window actually
+has. On top of that, the previous round's fix for the table's own
+overflow had added an explicit `min-width: 660px` to `.iface-table` —
+redundant on top of `white-space: nowrap` (which already sets a real,
+content-driven floor) — that made the table need its own horizontal
+scroll even more readily than the content required.
+
+**Fix**: `InterfacesPage.jsx` now renders `<div className="toolpage
+fluid">` — a new `.toolpage.fluid` modifier (`styles.css`) that drops the
+`max-width` entirely for this page only (Settings/DNS/Ping keep their
+existing reading-width caps, which are correct for forms). Removed the
+redundant `min-width: 660px` on `.iface-table`. Verified in a real
+headless run at both a wide window (1900×1000 — table now spans the full
+width, no dead space, no scrollbar) and the app's configured minimum
+(1280×720 — table still fits cleanly with room to spare).
+
+### Fixed: Interfaces and Settings tabs had no scrollbar on a small window — content (MTU/Egress columns, the Appearance section, Save button) was clipped, not missing
+
+**Bug report**: on a small window, the bottom of the Settings tab (the
+Appearance section and the Save/Reset buttons) and the right side of the
+Interfaces table (the MTU and Egress columns specifically) were simply
+unreachable — no scrollbar, nothing to scroll, in either direction.
+
+**Root cause, vertical** (`styles.css`'s `.toolpage`): every tool page
+(Interfaces, Settings, DNS, Port Scanner, Ping) renders as a direct sibling
+of `<nav class="tabbar">` inside `.app`, and `.app` is a fixed-height flex
+column (`flex flex-col h-screen overflow-hidden`). `.toolpage` itself had
+no `flex`/`overflow` rules at all, so on a window short enough that a
+page's content didn't fit, the parent's `overflow: hidden` just clipped
+everything past the bottom edge — there was nothing there to scroll.
+
+**Root cause, horizontal** (`.iface-table-wrap`): this card used
+`overflow: hidden` to keep its rounded corners. On a narrow window, that
+didn't just clip the corners — it clipped the whole right side of the
+table along with them, MTU and Egress columns included. They weren't
+missing from the data or the markup; they were rendered and then silently
+cut off with no scrollbar to reach them.
+
+**Fix**: `.toolpage` now gets `flex: 1 1 auto; min-height: 0; overflow-y:
+auto` — `min-height: 0` matters as much as the other two, since a flex
+item's default `min-height: auto` means "never shrink below my content's
+height," which would otherwise defeat `overflow-y: auto` entirely.
+`.iface-table-wrap` switched to `overflow-x: auto`, and `.iface-table`
+gained a `min-width` (plus `white-space: nowrap` on cells) so it actually
+overflows its wrapper on a narrow window and produces a real horizontal
+scrollbar, instead of just shrinking every column illegibly and never
+triggering one. Verified in a real headless run at the window's configured
+minimum size (1280×720): the Settings tab's scrollbar appears and reaches
+the Appearance section and Save button; the Interfaces table's MTU/Egress
+columns render correctly with room to spare (this build's added "Kind"
+column, below, would have made this worse without the fix).
+
+### Fixed: TCP/UDP hops that were never actually probed yet showed a green "healthy" dot, identical to a real reply
+
+**Bug report** (with screenshots): a TCP:443 trace to 1.1.1.1 showed hops
+4–9 with `SENT=0, RECV=0, LOSS=0.0%` — i.e. no probe had ever been sent to
+those hops at all — yet each one's status dot was green, indistinguishable
+from a hop that had actually replied. The equivalent ICMP trace correctly
+showed grey/hollow dots for hops that were genuinely asked and got nothing
+back.
+
+**Root cause** (`tauri-app/src/App.jsx`, `hopStatus()`/`isDiscovering()`/
+`destLamp()`/`pathLamp()`/`targetState()`): every one of these derived a
+"no reply" condition as `sent > 0 && recv === 0` — correct for "asked,
+got nothing back", but it left a gap for `sent === 0` ("never asked at
+all"), which fell through every check to the same `return 'ok'` default
+as a real healthy reply. TCP/UDP hit this far more than ICMP: TCP's
+hop-discovery only sends a probe for a given TTL once discovery actually
+reaches it (see `session.cpp`'s outstanding-probe bookkeeping), so a hop
+beyond where discovery currently is — or beyond where the destination was
+already confirmed at a lower TTL — sits at `sent=0/recv=0`, sometimes for
+a while, sometimes indefinitely. ICMP's discovery sends every TTL up
+front, so it rarely shows this gap.
+
+**Fix**: `sent === 0` is now checked explicitly, first, everywhere the old
+`noReply` pattern appeared:
+- `hopStatus()` returns a new `'pending'` state for an unprobed hop,
+  rendered as a **hollow ring** (`.hopdot.st-pending`, `styles.css`) —
+  visually distinct from both a real green reply and a grey "silent"
+  (asked, no answer) hop, instead of collapsing into the same green as a
+  healthy one.
+- `isDiscovering()` no longer treats a destination-hop record that exists
+  but hasn't been probed yet (`sent === 0`) as "not discovering" — which
+  was letting `targetState()`/`destLamp()`/`pathLamp()` fall through their
+  own thresholds with all-zero data and land on a false "ok" the same way.
+
+Verified live in this sandbox: a real ICMP trace to 1.1.1.1 produced
+exactly this shape mid-discovery (hop 1 real green reply, hop 2 not yet
+probed, hop 3 probed/100% loss) and the three hops now render as three
+visibly different dots — filled green, hollow ring, filled grey —
+matching the fix's intent (see the engineering session's own note; the
+same code path drives TCP/UDP identically since `hopStatus()` etc. are
+protocol-agnostic).
+
+### Improved: source-Interface dropdown and the Interfaces tab now show each adapter's kind (Wi-Fi / Ethernet / Virtual)
+
+**Follow-up to the report above** ("fix the interface thing... add more
+details here"): a generic, driver-assigned adapter name (a Windows
+GUID-derived name, or a Linux `enp3s0`/`wlp2s0`) gave no way to tell which
+dropdown entry actually WAS the Wi-Fi adapter without separately checking
+the OS's own network settings.
+
+**Fix**: `NetInterface` (`core/include/netpulse/transport.hpp`) gained a
+best-effort `kind` field — `"Wi-Fi"`, `"Ethernet"`, `"Virtual"` (VPN/
+hypervisor/container adapters: vEthernet, VMware, Docker, tun/tap, ...) or
+`"Other"`. Windows derives it from the adapter's `IfType`
+(`IF_TYPE_IEEE80211` / `IF_TYPE_ETHERNET_CSMACD`); Linux checks for
+`/sys/class/net/<name>/wireless` or `/phy80211`, falling back to naming
+conventions on other POSIX platforms. Threaded through
+`list_interfaces_json`/`list_interfaces_detailed_json` (`netpulse_ffi.cpp`)
+and shown:
+- in the "Add target" and per-target "Edit config" Interface dropdowns, as
+  a `[Wi-Fi]`/`[Ethernet]`/`[Virtual]` prefix on each option;
+- as a new "Kind" column on the Interfaces tab (`InterfacesPage.jsx`);
+- as a new `KIND` column in the CLI's `npulse ifconfig` (`cli/main.cpp`),
+  so all three surfaces agree.
+
+Also added a manual ⟳ refresh button next to the "Add target" Interface
+dropdown (calls straight into the existing 20-second poll rather than
+waiting on the timer) and a hint line when the list comes back empty,
+plus an empty-list check pointing at the Interfaces tab.
+
+### Fixed: "Add target" source-Interface dropdown never picked up an adapter that came up after launch
+
+**Bug report:** an adapter that was up and usable per the Interfaces tab
+(Wi-Fi, specifically) never appeared in the main window's "Add target"
+source-Interface dropdown.
+
+**Root cause**: the dropdown's interface list (`/api/interfaces` →
+`list_interfaces_json`) was fetched exactly ONCE, in a `useEffect` with an
+empty dependency array, right when the app mounted (`App.jsx`). If an
+adapter connected or reconnected any time after that — Wi-Fi joining a
+network a few seconds after launch, a laptop resuming from sleep, a VPN
+coming up — it was permanently invisible to that dropdown until the app
+was restarted, even though the separate Interfaces tab (which the
+connectivity-alert check already polls every 20 seconds) showed it as up
+correctly the whole time.
+
+**Fix** (`tauri-app/src/App.jsx`): the dropdown's interface list is now
+derived from that SAME existing 20-second poll of `/api/interfaces/detailed`
+(filtered to up + non-loopback, exactly matching what
+`list_interfaces_json` itself returns), instead of a separate one-shot
+fetch — no extra native call added, and the dropdown now genuinely tracks
+current adapter state the same way the Interfaces tab does.
+
+### Changed: Settings moved from a separate window into a tab (fixes blank window + app not exiting)
+
+**Bug report:** in real-world testing (not reproducible in this sandbox,
+which has no way to launch a real desktop session to click through), the
+separate Settings *window* came up blank, and — separately — closing the
+main window did not end the app's process while the Settings window was
+still open, since Tauri does not tie a secondary window's lifetime to the
+main one; with no visible window left, there was nothing left to close it
+from short of killing the process externally.
+
+**Fix, per explicit direction ("move it in beside the Interfaces tab in
+the same window")**: Settings is no longer a second OS window at all —
+it's a new "⚙️ Settings" tab in the main window, right beside "Interfaces".
+This removes the whole class of bug rather than patching either symptom:
+- It can't come up blank independently of the rest of the app, because
+  it's the same page, the same JS context, the same webview as everything
+  else — there is nothing separate left to fail to load.
+- There is no second window to outlive the first, so closing the main
+  window always ends the process, unconditionally.
+
+**Removed**: `open_settings_window` (`commands.rs`, `lib.rs`'s handler
+list, `build.rs`'s `COMMANDS`, `capabilities/default.json`'s
+`allow-open-settings-window`), `capabilities/settings.json` (deleted — no
+second window means no second, narrower IPC surface to scope), and
+`SettingsWindow.jsx`/`main.jsx`'s `?window=settings` query-param branch
+(also deleted — the whole reason that branch existed).
+
+**Added**: `SettingsPage.jsx` (`tauri-app/src/components/tools/`) — the
+same settings UI and load/save logic as before, now rendered as an
+ordinary tab (`App.jsx`'s tab bar + `Settings → Open Settings…` menu item
+both just call `setTab('settings')`). `tauri-bridge.js`'s
+`loadAppSettings`/`saveAppSettings`/`getRecheckTuning`/
+`emitSettingsChanged`/`onSettingsChanged` are all unchanged and still used
+by the new page exactly as the old window used them — only
+`openSettingsWindow` itself is gone, since there's nothing left to open.
+
+**Verified**: a real `cargo build`/`clippy` (clean) and a real production
+`vite build` of the frontend (same one-off registry-`xlsx` workaround as
+before, for this test only). Launched the actual debug binary headless
+under Xvfb serving that real bundle, took a screenshot of the rendered
+main window (all five original tabs plus the new "⚙️ Settings" tab
+visible in the tab bar), then scripted a click on the Settings tab and
+screenshotted again — the full settings form renders (auto-refresh
+tuning, new-target defaults, appearance, Save/Reset) with no blank page.
+The full C++ suite (untouched — this change is frontend/Rust-only) still
+100% passes.
+
+### Improved: Interfaces and Settings tabs now look like part of the app, not pasted-in content
+
+**Report**: both tabs read as bare, borderless content sitting directly on
+the window background — no card boundaries, no depth, nothing tying them
+visually to the rest of the app's designed dashboard (`.dcard`s, headers,
+shadows).
+
+**Fix**: `.toolpage` (shared by every tool page — Interfaces, Settings,
+DNS, Port Scanner, Ping) gets a proper header treatment (a bottom border
+under the title, a muted subtitle line). New `.tool-section` class gives
+Settings' three groups (auto-refresh, new-target defaults, appearance)
+real cards — background, border, radius, shadow — instead of plain `<div>`s
+with inline margin between headings. The Interfaces table now sits inside
+a bordered, shadowed card (`.iface-table-wrap`) with a shaded header row
+and zebra striping, instead of floating bare on the window background.
+Also added a `.tool-card.success` variant so Settings' "saved" banner gets
+the same green-tinted card treatment its "error" banner already had,
+instead of losing its color entirely once the layout stopped using inline
+styles for it.
+
+**Verified**: a real production `vite build` (same one-off registry-`xlsx`
+workaround as the other frontend changes this round) and screenshots of
+both tabs from the actual debug binary running headless under Xvfb, before
+and after.
+
+### Fixed: opening the Settings window could crash the whole app
+
+**Bug report:** opening the new Settings window (added below) could bring
+down the entire application, not just fail to open that one window.
+
+**Root cause:** `open_settings_window` is the *only* command in this
+codebase that creates a native OS window/webview on demand from a
+`#[tauri::command]` handler — every other command is a pure data
+operation. Confirmed by instrumentation that such handlers run on a
+background thread, never the main/event-loop thread. Window/webview
+creation is native-toolkit work (GTK on Linux, WebView2/COM on Windows,
+WKWebView on macOS) with main-thread — or, for WebView2, COM-apartment- —
+requirements, and the previous code called
+`tauri::WebviewWindowBuilder::build()` straight from that background
+thread, trusting Tauri's runtime to dispatch it across threads safely.
+That trust turned out to be well-placed on this project's own Linux/GTK
+testing (a real debug build, run headless, with the actual production
+frontend, deliberately invoked off-thread, did not crash) — but WebView2's
+stricter apartment-thread rules on Windows make that implicit dispatch a
+narrower guarantee there, and either way, nothing on this path caught a
+panic: an unwind escaping through a native callback boundary (a COM
+callback, a GTK signal handler) is undefined behavior that typically
+surfaces as the *entire process* aborting rather than one command failing
+— exactly matching "the whole app crash" instead of just a failed-to-open
+Settings window.
+
+**Fix** (`tauri-app/src-tauri/src/commands.rs`, `open_settings_window`):
+window/webview construction is now explicitly dispatched onto the main
+thread via `AppHandle::run_on_main_thread` (Tauri's own documented
+mechanism for this), removing any dependence on the runtime's internal
+thread handling, and wrapped in `std::panic::catch_unwind` so any panic
+during construction becomes an ordinary `Err(String)` — already shown to
+the user via the existing "Could not open Settings" modal in `App.jsx` —
+instead of taking the whole process down. The result crosses back to the
+calling thread over a one-shot channel with a 10s timeout, so a wedged
+main thread can't hang the IPC call forever either.
+
+**Verified:** a real `cargo build` of the fixed binary, run headless under
+Xvfb with the actual obfuscated production frontend bundle (built via a
+one-off `npm install`/`vite build` for this test only — see the previous
+entry's own verification note on why that isn't normally possible in this
+sandbox), with `open_settings_window` deliberately invoked from a spawned
+background thread (mirroring real IPC dispatch, confirmed via
+`std::thread::current().id()`): the window opens, the call returns `Ok`,
+and the process stays up. `cargo check`/`cargo build`/`clippy` all clean;
+the C++ suite (unaffected — this fix is Rust-only) still passes in full.
+This sandbox has no Windows target to compile or run against, so the
+Windows/WebView2-specific half of the hypothesis couldn't be reproduced
+directly here — the fix is written to hold regardless of which platform's
+specifics actually triggered it, since it removes the implicit-dispatch
+assumption entirely rather than patching around one platform.
+
+### New: app-wide Settings window, auto-refresh frequency now 30s by default (and configurable)
+
+Two related, explicitly requested changes:
+
+1. **The passive background "auto refresh" mechanism now defaults to 30
+   seconds** (lowered from 45s) between legacy-probe rechecks on an
+   already-confirmed hop — see the previous entry below for what this
+   controls and why it was ~90s+ before anything happened. This was a
+   compile-time-only constant; it's now a process-wide **runtime**
+   default (`set_default_recheck_tuning()`, `session.hpp`/`session.cpp`),
+   clamped to a sane 5–300s / 2–10-misses range, so it can be changed
+   without a rebuild.
+
+2. **A new Settings window** (`Settings → Open Settings…`) — a genuinely
+   separate OS window, not a panel — lets you change that frequency (and
+   its miss-threshold), the defaults a freshly opened "Add target" form
+   starts pre-filled with (probe interval, trace interval, timeout,
+   payload size, max hops, destination port, family, protocol, raw mode),
+   and the dark/light theme. Settings are saved to a JSON file in the app's
+   config directory and **loaded automatically every time the app starts**
+   — a save takes effect immediately, live, with no restart required, and
+   is also broadcast to the main window so its own "Add target" form and
+   theme update without a restart either.
+
+Implementation: `core/include/netpulse/session.hpp` +
+`core/src/session.cpp` (`set_default_recheck_tuning`/
+`default_recheck_window_secs`/`default_recheck_threshold`, backed by two
+atomics, replacing the old bare `kHopRecheckSecs`/`kLegacyMissThreshold`
+constants at their three real call sites) → `netpulse_ffi.hpp`/`.cpp`
+(`set_recheck_tuning`/`get_recheck_tuning_json`) → `ffi.rs`/`commands.rs`
+(`AppSettings`, `load_app_settings`/`save_app_settings` reading/writing
+the settings file and re-applying the tuning, `open_settings_window`
+spawning the new window, `get_recheck_tuning` for a post-save readback) →
+`tauri-bridge.js`/`SettingsWindow.jsx`/`App.jsx`. New
+`tests/test_core.cpp` coverage: the default is 30s/2, `set_
+default_recheck_tuning`'s clamping at both ends, and its "≤0 leaves that
+field unchanged" convention.
+
+**Also fixed while touching this area** (found only because a real
+Rust/Tauri toolchain — `cargo check`/`cargo build`, previously
+unavailable in every prior round's sandbox — was available this time):
+`list_interfaces_detailed` (the Interfaces diagnostics page's data
+source, added in an earlier round) was registered as a Tauri command and
+granted in `capabilities/default.json`, but never added to `build.rs`'s
+own `COMMANDS` list — the one place that actually makes tauri-build
+generate the permission the capabilities file grants. Without this fix,
+the Interfaces page's API call would have failed with a permission-denied
+error in any real install; it was never caught before because no prior
+round could actually build the Tauri app to notice.
+
+Verified: full `netpulse_tests` suite (including three new
+`set_default_recheck_tuning` cases) passes clean under both a normal
+Debug build and a fresh ASan/UBSan build. `cargo check`/`cargo build`
+(Rust host + cxx bridge to the C++ engine) succeed cleanly with zero
+warnings — the first round in this whole engagement where that toolchain
+was actually available, so the Rust/FFI side of this and prior rounds'
+changes has now been compiled for real, not just reviewed. The exact
+frontend (`.jsx`) changes were syntax/parse-verified with `esbuild`
+(the sandbox's package registry allowlist blocks `xlsx`'s CDN
+dependency, so a full `npm run build` isn't possible here) rather than
+a real Vite build — disclosed plainly, not glossed over.
+
+### A "stale, live via another target" hop was showing even with only one target running
+
+Reported live: a hop marked stale (its address wiped after a route change)
+displayed "live via another target" in its tooltip/badge, despite only one
+target being active at the time — which should have been impossible if the
+global shared-hop cache really means "another target". It was a real bug,
+not a misreading: the cache's secondary "is this IP alive right now" index
+(`SharedHopTable::ip_last_seen`) stored only a timestamp, with no record of
+*who* published it. A hop's own last real reply — recorded right before it
+goes stale, as `stale_since` — always falls inside the 30s freshness window
+this check uses, so the very act of a hop going stale would routinely make
+it look like it was "still being heard from elsewhere", even with a single
+target and no other session ever having touched that IP.
+
+Fixed by having `ip_last_seen` also record the publishing session's id
+(`IpLastSeen{ts, owner_session_id}`), and having `shared_last_seen_from()`
+(and its process-global wrapper `shared_last_seen()`) take the querying
+session's own id and exclude entries whose owner is the caller itself —
+mirroring the same owner-exclusion `shared_adopt_from()` has always done for
+RTT adoption. The legitimate case (a genuinely different target's edge to
+the same public IP still getting real replies via asymmetric/ECMP routing)
+is unaffected and still surfaces correctly.
+
+Verified with new `tests/test_core.cpp` cases: a single session publishing
+and then querying its own last publish as "self" now correctly sees nothing
+("no evidence of elsewhere"); a second, different session's publish to the
+same IP is still correctly surfaced; `max_age` expiry still applies
+regardless of owner. Full `netpulse_tests` suite re-run and passing.
+
+### Force Recheck resumed a stale target quickly; the passive background self-heal ("auto refresh") also does it, but much more slowly — clarified, not changed
+
+Reported live: after a route change left a hop stale, the manual Force
+Recheck button resumed/re-verified it, but the passive background mechanism
+that is supposed to do the same thing on its own ("auto refresh") appeared
+not to. Traced through the current code (`core/src/session.cpp`): both
+paths share the exact same underlying "guarded wipe" logic and the exact
+same safety gate (`kGuardedWipeMaxRecentLossPct`/`kMaxGuardedWipesPerHop`) —
+there is no separate, missing "auto refresh" feature. The difference is
+purely timing, and it is a large one:
+- **Force Recheck** arms a short burst of `kForceVerifyProbes` (3) probes
+  sent at the session's **normal** probe cadence (1s by default) — a
+  verdict lands within a few seconds of pressing the button.
+- **The passive path** only sends one legacy TTL-elicited probe per
+  `kHopRecheckSecs` (45s) on an already-confirmed hop, and requires
+  `kLegacyMissThreshold` (2) of those misses spanning at least
+  `kLegacyMissWindowSecs` (also 45s) before it will act — a minimum of
+  roughly **90 seconds**, and often longer depending on when in that cycle
+  the route actually changed, before the passive path even reaches a
+  verdict, let alone wipes and rediscovers the hop.
+That gap is a deliberate trade-off (a single probe's timing alone is not
+reliable route-change evidence — see the code's own `kLegacyMissWindowSecs`
+rationale), not an oversight, but it fully explains "force refresh did it,
+auto refresh did not [yet]": whoever checked did so well inside that ~90s
+window. No code change was needed here — this is a documentation/behavior
+clarification only, captured in `ARCHITECTURE.md` §6 and `cli/CLI.md`/the
+GUI help text so this asymmetry is no longer surprising.
+
+### `tracert-mtr`/`ifconfig -w` could corrupt the parent shell's prompt (PowerShell specifically), plus a visible "you're in npulse" indicator
+
+Reported live: running either directly from an already-open PowerShell
+session (not through the `npulse` console, which hosts `cmd.exe` and was
+unaffected) could leave the prompt corrupted afterward — text fragments
+appearing to type themselves, spurious continuation prompts, arrow keys
+inserting garbage. Root cause: a live-redraw view repositioning the
+cursor inside the same screen buffer a line editor (PSReadLine) is also
+tracking desyncs that editor's bookkeeping from the real cursor position.
+Fixed with the standard technique: `tracert-mtr`'s live view and
+`ifconfig -w` now switch to the alternate screen buffer
+(`\033[?1049h`/`\033[?1049l`) once for the whole session instead of
+repositioning the cursor in the shell's own buffer — the same guarantee
+`vim`/`less`/`htop` give on quit, on every exit path including Ctrl-C.
+Two further defensive layers: the Windows console mode this tool enables
+is now saved and restored via `atexit()` rather than left changed after
+exit, and any input the terminal sent but this process never read is
+explicitly discarded on exit (`FlushConsoleInputBuffer`/`tcflush`).
+
+Also added the visible indicator asked for: a window/tab title
+(`npulse console`, or `npulse tracert-mtr HOST` for a directly-run live
+view) via `SetConsoleTitleA`/the OSC 0 escape sequence, and — inside the
+`npulse` console specifically — the spawned shell's own prompt prefixed
+with `[npulse] ` (a `PROMPT` env var for `cmd.exe`; bash/zsh needed
+`--rcfile`/`ZDOTDIR` specifically, since a plain inherited `PS1` gets
+unconditionally overwritten by the shell's own startup file before the
+first prompt ever shows — confirmed by testing a genuinely interactive
+shell, not assumed).
+
+Verified with a real pseudo-terminal on Linux: captured the actual escape
+bytes (not just visual inspection) confirming the alt-screen sequence and
+title are correct, confirmed the `[npulse]`-prefixed bash prompt renders
+live, confirmed a real SIGTERM mid-session completes promptly (~3s, not a
+hang). Re-verified on the cross-compiled Windows `.exe` under Wine across
+multiple runs. Two testing-tool artifacts surfaced and were resolved by
+reproducing in isolation rather than assumed to be real bugs: a hang
+traced to the `script` pty-recording utility's own quirks (not this code
+— confirmed by removing it and re-running), and one non-reproducible Wine
+flake (three immediate reruns clean).
+
+### `npulse` console: `ping`/`tracert`/`mtr`/etc. weren't actually runnable inside it — now they are
+
+Reported live: `tracert-mtr host` typed inside the console failed with
+"not recognized as an internal or external command." Root cause: the
+console's own banner promised "use `ping`/`tracert`/`mtr`/`ifconfig`
+directly," but nothing ever created a file by any of those names — the
+`argv[0]`-dispatch logic only activates for a name that exists somewhere
+on PATH, and the console only ever prepended `npulse`'s own directory
+(containing just `npulse` itself). Fixed: entering the console now also
+creates a session-scoped temporary directory of hard links to the
+`npulse` executable under each standard-command name (`ping`, `tracert`,
+`traceroute`, `mtr`, `tracert-mtr`, `ifconfig`, `ipconfig`, `nslookup`),
+prepended to PATH, and removed automatically when the session ends. Also
+added `tracert-mtr` itself as a recognized `argv[0]` alias (previously
+only `mtr` was). This only shadows the system's own tools for the
+lifetime of the one console explicitly opened for this purpose — the
+same reasoning `conda activate`/a virtualenv already rely on — not a
+permanent PATH change.
+
+Verified precisely against the report: on Linux, confirmed every alias
+name resolves and runs correctly from inside a spawned session, confirmed
+the alias directory is fully cleaned up afterward, clean under ASan/UBSan.
+On the cross-compiled Windows `.exe` under Wine: confirmed hard-link
+creation and a directly-invoked alias binary both work correctly in
+isolation; the full nested chain (console spawns a shell, which spawns an
+alias binary) hung reliably under Wine specifically despite every
+individual piece checking out — most consistent with a Wine limitation,
+but not confirmed against real Windows, and documented as an open
+question in `CLI.md` rather than assumed away.
+
+### `tracert-mtr`: a long hostname could hide its own `[DEST]` marker
+
+Reported live, alongside the above: the destination marker was appended
+to a hop's display text before truncating it to the Host column's width,
+so a long (routinely long, for real IPv6 reverse-DNS names) hostname
+could cut the marker off partially or entirely — hiding exactly the
+information that matters most, on exactly the row most likely to trigger
+it. Fixed by truncating the hostname/address text first, reserving room
+for the marker, then appending it after — it can no longer be truncated
+away. Also widened the Host column (38 → 46 characters) since the same
+report showed truncation is the common case for real hostnames, not a
+rare edge case. Also fixed two remaining em-dash characters (in the
+Auto-family retry message and the `ifconfig -w` refresh message) that a
+final sweep had missed in an earlier mojibake fix — same class of bug,
+caught proactively this time rather than waiting for another report.
+
+### `npulse` console: clarified to trigger uniformly on every OS and invocation style, not just a fresh Windows console
+
+Second-round clarification: the console-hosting feature (VS Developer
+Command Prompt style — spawn the user's real shell with `npulse`'s own
+directory on PATH) was meant to trigger whether `npulse`/`netpulse` is
+typed bare into an already-open terminal OR the file is run directly, on
+every OS — not gated on Windows' "was this console freshly allocated"
+distinction the way the first version was (which left an already-open
+shell's bare `npulse` still just showing help). Removed that gate;
+`launch_shell_console()` now runs on any zero-argument invocation of the
+canonical `npulse`/`netpulse` name, on Windows (`%COMSPEC%` via
+`CreateProcessA`) and POSIX (`$SHELL`, falling back to `/bin/sh`, via
+`fork()`/`execl()`) alike. An alias invocation (`ping`, `tracert`, `mtr`,
+`ifconfig`) with no arguments is unaffected — that alias's own usage
+applies, unchanged.
+
+Verified completely on Linux this time, not just cross-compiled: a bare
+invocation spawns the real `$SHELL` (confirmed explicitly with `/bin/sh`
+and `/bin/bash`), the spawned shell's `PATH` genuinely has `npulse`'s
+directory prepended (`which npulse` resolves it), `npulse help` runs
+correctly from inside that session, the spawned shell's exit code
+propagates back correctly, and every alias with no arguments correctly
+keeps its own behavior. Also re-verified on the cross-compiled `.exe`
+under Wine, repeated multiple times for stability after one transient
+false alarm during testing (traced to Wine flakiness, not a real bug, by
+first reproducing the exact `CreateProcessA` pattern in isolation and
+confirming it worked correctly on its own).
+
+### New: `npulse.exe` opened directly (Windows) hosts a real shell, VS Dev Command Prompt style
+
+Clarified request: double-clicking `npulse.exe` (or a shortcut to it) —
+i.e. no arguments, no existing console — should open a console that stays
+open, running the user's actual shell (`cmd.exe`) with `npulse`'s folder
+on `PATH` for that session, exactly like "VS Developer Command Prompt" is
+genuinely just `cmd.exe` with an environment script run first, not a
+custom shell of its own. Implemented via `GetConsoleProcessList()`
+reporting exactly 1 attached process — the standard, Microsoft-documented
+way to tell "this console was freshly allocated for me" apart from "I was
+run from an already-open shell" (confirmed against Microsoft's own
+official guidance, not assumed) — so `npulse` typed with no arguments into
+an existing cmd/PowerShell/Windows Terminal session is completely
+unaffected and still just prints help as before.
+
+Also installed a MinGW-w64 cross-compiler and Wine in this environment
+specifically to verify this and the rest of the CLI's Windows-specific
+code properly: cross-compiled the entire engine + CLI for a real Windows
+target and ran the resulting `.exe` under Wine, confirming real `ping`,
+`ifconfig` (via actual `GetAdaptersAddresses`), and `dns` lookups all work
+correctly against real network traffic — substantially stronger
+verification than the compile-only/manual-review approach used for
+Windows-specific code earlier in this project's history. One caveat:
+Wine's console emulation doesn't faithfully reproduce the exact
+`GetConsoleProcessList()` count a genuine Windows double-click produces,
+so that one specific boundary condition still needs a real Windows machine
+to fully confirm — noted plainly in `CLI.md` rather than claimed as fully
+verified.
+
+### `tracert-mtr` garbled ("Γÿà"), and hops showed `*` next to real, good numbers
+
+Reported live: the destination row's marker rendered as literal garbage
+("Γÿà" instead of "★"), and a route-change wipe briefly left a hop showing
+`*` (unresolved) alongside a full set of healthy loss/RTT stats, which
+reads as a broken/inconsistent row.
+
+Both fixed at the root, not patched around:
+
+- **Mojibake**: "★"/"…"/"⚠" were UTF-8 multi-byte sequences. A Windows
+  console not explicitly in UTF-8 output mode reads each byte of a
+  multi-byte character as a SEPARATE legacy-codepage character — exactly
+  what "Γÿà" is. Replaced all three with plain ASCII (`[DEST]`, `...`,
+  `!`) — the correct, guaranteed-portable fix, not a font/codepage
+  workaround — plus added `SetConsoleOutputCP(CP_UTF8)` defensively for
+  anything else (a reverse-DNS hostname, say) that could still legitimately
+  contain non-ASCII bytes. Also caught and fixed the same class of issue in
+  `print_help()`'s em-dashes, which hadn't been reported but would have hit
+  the identical bug.
+- **`*` next to good stats**: a hop the guarded-wipe/Frankenstein-route
+  guard just cleared (ARCHITECTURE.md §6) can briefly show real, recent,
+  healthy numbers even though its address field is now empty — the wipe
+  only ever fires on a hop that WAS looking healthy, so the stats window
+  still has genuinely good recent samples in it right after. Previously
+  rendered as bare `*`, indistinguishable from a hop that's never resolved
+  at all. Now shows `(re-resolving)` specifically when there's an address
+  gap WITH real recent data, vs. plain `*` for a hop with no data at all —
+  the same underlying (correct, intentional) engine behavior, made
+  self-explanatory instead of looking like a rendering bug.
+
+Also matured `ping` and `tracert` to match `tracert-mtr`'s presentation
+level rather than staying plain: color-coded replies/RTT-severity/loss
+percentage (green/yellow/red, the same thresholds used everywhere else),
+bold banners and summary lines, protocol/payload/probe-count shown in
+`ping`'s banner, a `[DEST]`-tagged, colored final row in `tracert`. All
+fully suppressed automatically the instant output isn't a real terminal
+(piped/redirected), exactly like the rest of this tool's color handling.
+
+Verified: full rebuild, `netpulse_tests` clean (plain + ASan/UBSan);
+grepped the actual binary's output for any remaining non-ASCII byte across
+every command (zero found); re-ran `ping`/`tracert`/`tracert-mtr` under a
+real pseudo-terminal (Linux `script`) to confirm color renders correctly
+and no control-code or encoding artifacts leak into either the live or
+piped paths.
+
+### `tracert-mtr` printed a new table every refresh instead of updating in place (real Windows report)
+
+Reported live against Windows PowerShell (`powershell.exe`, not `pwsh.exe`):
+every redraw scrolled a fresh copy of the table below the last one. Root
+cause: a Windows console only interprets ANSI/VT escape codes once a
+process explicitly opts in via `SetConsoleMode(...,
+ENABLE_VIRTUAL_TERMINAL_PROCESSING)` — classic `powershell.exe`, unlike
+Windows Terminal/PowerShell 7, doesn't do this automatically, so the escape
+codes being printed were just inert bytes and every redraw's output simply
+appended below the last. Separately, even once VT mode is enabled, a full
+`\033[2J\033[H` screen clear every single frame (what this used) is its own
+real UX problem — visible flicker on every refresh — independent of the
+VT-mode bug.
+
+Fixed properly, not worked around: `term_init()` explicitly enables VT
+processing on Windows and checks for a real terminal (not piped/redirected)
+before enabling any ANSI feature; the live views (`tracert-mtr`,
+`ifconfig -w`) no longer clear the whole screen every frame at all — they
+move the cursor home and overwrite in place (clearing only a leftover
+trailing line or shorter final frame), the same flicker-free technique
+`mtr`/`htop`/SolarWinds Traceroute NG use. `-r`/`--report`/`--json` output
+now never includes any redraw control codes, even when run attached to a
+real terminal rather than piped (color is separate and still applies
+there, exactly like `git status`/`ls --color=auto`, fully suppressed the
+instant output isn't a real terminal).
+
+Also, per the same report: the table's visual presentation was made more
+professional — bold headers, a clean separator rule, green/yellow/red
+loss-percentage coloring matching the GUI's own severity bands, a ★
+destination marker matching the GUI's, and long hostnames truncated with
+`…` instead of breaking column alignment. Applied consistently to both
+`tracert-mtr` and `ifconfig -w` (the latter previously used a different,
+older, uncolored rendering path entirely).
+
+Verified: captured the raw bytes emitted under a real pseudo-terminal
+(Linux `script`, since this environment has no real Windows/interactive
+session to test against directly) and confirmed the exact escape sequence
+is correct (`\033[H` once per frame, `\033[K` per line, `\033[J` once at
+frame end) — not just visually, but at the byte level; confirmed report
+mode emits zero redraw codes under the same real-terminal test while still
+showing color; confirmed color is fully suppressed the instant output is
+piped instead. Full rebuild and `netpulse_tests` clean (plain + ASan/UBSan)
+throughout.
+
+### CLI matured toward GUI parity: split `tracert`/`tracert-mtr`, added iface/timer options, auto-refresh
+
+`trace` split into two commands matching two genuinely different real-world
+tools rather than one command with a mode flag: `tracert` (also
+`traceroute`) is now a classic one-shot, progressive route trace — prints
+each hop once, in order, as it settles, stopping at the destination or
+`--max-hops`, matching Windows `tracert`/Linux `traceroute`'s output shape;
+`tracert-mtr` (also `mtr`) is the live, continuously-refreshing table the
+old `trace` command was.
+
+Both gained the rest of the GUI's Add Target option set that was missing
+before: `-T`/`--trace-interval` (`Settings::trace_interval`, the GUI's
+"Trace" field — route re-discovery interval, distinct from `-i`'s per-hop
+probe interval), `-W`/`--timeout`, `-s`/`--payload`, `-I`/`--interface`
+(`Settings::source_addr`, the GUI's "iface" dropdown), and
+`--unprivileged` (the inverse of the GUI's "Raw" checkbox). `ping` gained
+`-I`/`--interface` too.
+
+**Auto-refresh, as the Force-Recheck alternative asked for**: `Family:
+Auto` in `tracert-mtr` now self-heals a stuck "no local egress" state
+automatically — `Session::resolve()` only ever runs once, at session
+start, so a trace begun before a real route came up used to just sit there
+showing a stale error forever. Now, under `Auto` specifically, a
+persistent error auto-restarts the session (re-running family detection)
+every few seconds until it resolves or Ctrl-C. A pinned `-4`/`-6` never
+does this. `ifconfig` separately gained `-w`/`--watch` for continuously
+monitoring the adapter list itself (a cable unplugged/replugged, a VPN
+connecting) — the interfaces-specific counterpart to the same idea.
+
+Verified: full rebuild and unit-test suite clean (plain and ASan+UBSan);
+every new/changed command run against real traffic, including the
+auto-refresh restart loop specifically (confirmed it retries under `Auto`
+family, confirmed a pinned family does NOT retry, confirmed Ctrl-C still
+stops the retry loop immediately with no thread-safety issues under ASan
+from the internal poller thread this needed to combine "real interrupt"
+and "internal restart decision" into the one stop signal `Session::run()`
+accepts).
+
+### `tauri dev`/`cargo build` failed outright: "resource path binaries\npulse-... doesn't exist"
+
+Reported against a real Windows dev run — `bundle.externalBin` makes
+`tauri_build::try_build()` (`build.rs`) hard-fail immediately, before
+compiling anything, if the per-target sidecar file it names isn't already
+on disk. The CI workflows each have their own step that builds it before
+`tauri build` runs, so releases were never affected — but a plain local
+checkout has no such step, so this broke `tauri dev` for literally anyone
+building the project for the first time, which is about as bad as a
+regression gets. Fixed by having `build.rs` build the CLI sidecar itself,
+automatically, via the same top-level `CMakeLists.txt`/`cmake` invocation
+the rest of this file already uses for the C++ engine — before calling
+`tauri_build::try_build()`, and skipped entirely on every build after the
+first (checks whether the target file already exists). If `cmake`/a C++
+compiler genuinely isn't available, this now fails with a clear, actionable
+message (exact commands to run manually) instead of the cryptic Tauri
+internal error above. Verified as thoroughly as this environment allows: no
+Tauri/cargo toolchain here to compile the real `build.rs` end-to-end, but
+the exact new function was extracted into a standalone Rust program,
+compiled and run for real against the actual repository (fresh build, then
+a second skip-if-exists run, then a simulated `cmake`-missing failure to
+confirm the panic message), and the complete `build.rs` was syntax/type-
+checked with `rustc` directly — the only errors are the two external crates
+(`tauri_build`, `cxx_build`) this sandbox genuinely can't provide, nothing
+in the new or reordered code.
+
+### CLI: standalone-runnable confirmed, published as a separate download too, dev commands documented
+
+Confirmed the CLI has zero dependency on the GUI/Tauri stack — `ldd` on the
+built binary shows only `libc`/`libstdc++`/`libm`/`libgcc_s`, nothing
+GTK/WebKit/X11/Wayland-related — so it runs as a fully standalone process on
+a machine that will never install the desktop app: a headless server, a
+minimal/no-desktop Linux install (Arch and similar), Windows without the
+GUI app installed at all. This project's whole CLI development and testing
+this round was already done in exactly such an environment (a headless
+Linux container), which is itself a real demonstration of this working, not
+just a claim.
+
+Added: the CLI sidecar is now ALSO published as its own standalone download
+on the GitHub Release (`npulse-<os>[.exe]`), separate from every installer —
+this project has no native Arch package (no PKGBUILD/AUR) and no way to put
+the CLI on PATH from an AppImage (no install step exists for that format at
+all), so a plain per-OS binary download is the practical way to get just the
+CLI there today. `README.md` now documents this plus explicit dev-mode
+commands for running the GUI and the CLI independently (`npm run dev` for
+frontend-only, `npx tauri dev` for the full GUI, `cmake --build build
+--target npulse` for the CLI alone — no Node/Rust/Tauri needed for that
+last one).
+
+### New: netpulse-cli (`npulse`) — a real, tested CLI, plus standard-command aliases
+
+Added `cli/main.cpp` and `cli/CMakeLists.txt`: a genuine, built, and
+tested command-line tool reusing the exact same engine (`Session`,
+`PingRun`, `list_interfaces`) the desktop app uses — no new probing logic.
+`argv[0]`-based dispatch means a copy/symlink of the binary named `ping`,
+`tracert`, `traceroute`, `mtr`, `ifconfig`, `ipconfig`, or `nslookup`
+behaves like that command directly; the canonical form is `npulse
+ping|trace|ifconfig|dns|portscan|completion HOST [options]`. Live-tested
+against real traffic on the machine this was built on (ping/trace against
+a real gateway, dns against real records, portscan against real ports,
+argv[0] aliasing confirmed by literally copying the binary under each
+alias name and running it) and clean under ASan+UBSan across every
+subcommand. Full reference: `cli/CLI.md`; architecture rationale:
+`ARCHITECTURE.md` §11.
+
+Also added: `npulse completion bash|zsh|fish|powershell` (shell
+auto-completion scripts, the same pattern `kubectl`/`docker` use).
+
+### New: CLI bundled into every OS installer via a Tauri `externalBin` sidecar
+
+`tauri.conf.json` now declares `bundle.externalBin`, and each of
+`tauri-ci.yml`/`tauri-release.yml`/`tauri-canary-build.yml` builds the CLI
+for that job's exact OS/architecture and places it where Tauri's sidecar
+convention expects before packaging — see `tauri-app/src-tauri/binaries/
+README.md`. Windows gets the CLI added to the current user's PATH via an
+extended `windows/hooks.nsh` (NSIS `EnVar` plugin, plus a pre-install
+`taskkill` working around a real, documented Tauri/NSIS externalBin
+reinstall gotcha); Linux `.deb` gets it placed at `/usr/bin/npulse`
+directly via `bundle.linux.deb.files` (dpkg handles PATH automatically, no
+script needed). **Honest scope note**: the CLI binary itself is
+build-verified (compiles, runs, passes ASan) on the machine this was
+built on; the actual Tauri/cargo packaging pipeline and the Windows/Linux
+installer behavior described above could not be run end-to-end in that
+same environment (no Tauri toolchain, no real Windows/macOS runner) —
+written to match Tauri's and NSIS/EnVar's documented conventions as
+closely as possible, and cross-checked against Tauri's own current
+documentation and a real reported issue for the exact sidecar-reinstall
+gotcha addressed, but flagged as unverified rather than presented as
+tested. macOS `.dmg`/`.app` bundling works the same way but has no
+PATH-registration step at all yet (a `.dmg` has no install-time script
+execution point) — noted as a known gap with a concrete proposed fix (an
+in-app "install to PATH" action) in `CLI.md`'s Packaging section.
+
+### `Family: IPv6` treated link-local-only machines as having real IPv6 egress
+
+Found while specifically re-checking IPv6 correctness. `Session::run()`'s
+"does this machine have a usable local IPv6 egress" check
+(`has_local_v6`) counted **any** IPv6 address on **any** active interface
+as proof of usable egress — including link-local (`fe80::/10`). Link-local
+addresses are auto-assigned to every active interface by SLAAC on every
+major OS regardless of whether the machine has any real route to the
+internet at all, so this check passed on virtually every machine, IPv6
+connectivity or not. With `Family: IPv6` explicitly selected on a
+link-local-only (i.e. actually IPv6-less in practice) machine, this meant
+the engine skipped straight past the "No local IPv6 egress available —
+waiting for IPv6 or change family" message — the exact case that message
+exists to catch — and instead proceeded to open a real IPv6 socket and
+attempt real probing to a destination it could never actually reach,
+producing confusing 100%-loss/no-discovery behavior instead of the clear
+wait-and-explain message. The IPv4 side of the same check had the
+equivalent gap for `169.254.0.0/16` (APIPA) — much rarer in practice
+(IPv4 only self-assigns link-local when DHCP fails) but fixed identically
+for consistency. Fixed by filtering interface addresses through
+`is_cacheable_ip()` (already excludes link-local, loopback, and
+unspecified addresses while still correctly accepting private/CGNAT ones —
+a home LAN behind NAT is a perfectly real egress) before counting them
+toward `has_local_v4`/`has_local_v6`. Added direct unit-test coverage for
+`is_cacheable_ip()` itself (`tests/test_core.cpp`) to lock this in.
+
+### IPv6 audit: checksum/type-code/packet-parsing confirmed correct, one gap found and fixed above
+
+Went through every IPv6-specific code path in `core/` line by line, since
+IPv6 issues can't be live-tested from this environment (see the
+Verification section, `CHANGES.md`) and are easy to miss otherwise:
+ICMPv6 type codes (128/129 Echo Request/Reply, 3 Time Exceeded, 1
+Destination Unreachable — all correct per RFC 4443, and distinct from
+ICMPv4's 8/0/11/3), the deliberate omission of ICMPv6 checksum computation
+in `build_echo()` (correct — RFC 3542-compliant raw ICMPv6 sockets have the
+kernel compute and overwrite it regardless of what userspace writes; already
+documented in `ARCHITECTURE.md` §5 as the reason Paris-traceroute-style
+checksum pinning is IPv4-only), the no-IP-header-prepended raw-socket
+convention `parse_v6()` correctly assumes (unlike `parse_v4()`, which does
+expect one), and `IP_TTL`/`IPV6_UNICAST_HOPS` branching in all three of
+`transport.cpp`/`probe_tcp.cpp`/`probe_udp.cpp` (HTTP mode reuses
+`ProbeTcp` internally, so it inherits this for free). All confirmed
+correct — the link-local-egress-detection bug above was the one real gap
+found.
+
+### Adding a hostname under a different IP family was rejected as a duplicate
+
+`addTarget()`'s own duplicate-check comment said trace identity is `(host,
+protocol, port)` and explicitly called "IPv4 vs IPv6" a legitimately
+different measurement — but the actual comparison had dropped `family` from
+the tuple, so adding the same host as v4 and then v6 got rejected as
+"already in the list." Separately, `addTargetHost()` (the quick-trace menu
+shortcuts) hardcoded `family: 'auto'` on every call and deduped on hostname
+alone, so it could never add a second family for a host at all. Fixed: family
+is back in the identity tuple, compared via each target's *resolved* family
+with a fallback to the configured label while unresolved; `addTargetHost`
+takes a real `family` parameter. Also added: adding on Family=Auto when the
+host already has exactly one family being traced now steers the new request
+at the *missing* family instead of silently duplicating the one already
+there.
+
+### Force Recheck could only nudge the Frankenstein-route guard, never resolve it
+
+`force_recheck()` used to zero `hop_recheck_at`, firing exactly one legacy
+probe — it's reset to `now` the instant it's sent — so a single click could
+contribute at most one miss toward the passive guard's
+`kLegacyMissThreshold`-misses-over-`kLegacyMissWindowSecs` (≈45s) gate,
+never enough on its own to decisively confirm or clear a stuck hop. Fixed:
+Force Recheck now seeds a burst of `kForceVerifyProbes` (3) back-to-back
+legacy probes at normal probe cadence (completes in a couple of seconds).
+If every probe in the burst misses, that's treated as sufficient real-time
+evidence (several clustered misses rule out ordinary jitter as well as the
+wall-clock-separated pair does) and the same guarded wipe fires immediately,
+through the same safety gates. See `ARCHITECTURE.md` §6 for the full
+mechanism.
+
+### Private/CGNAT hops were never cross-target-cached, even when safe to be
+
+The shared-hop cache (`SharedHopTable`) excluded every private/CGNAT
+responder IP outright, because the cache key's `source` component
+(`source_addr`) is usually an empty string — most targets never explicitly
+bind an egress interface — which can't disambiguate two sessions actually
+routed through different physical interfaces. Fixed: added
+`local_egress_ip()` (`transport.cpp`), the standard "UDP `connect()` trick,"
+to determine the real local egress address for a destination with zero
+configuration required; private IPs are now cacheable whenever that (or an
+explicitly configured `source_addr`) is available, and fall back to the
+original public-only behavior only when it can't be determined. See
+`ARCHITECTURE.md` §4.
+
+### Protocol-parity bug found while verifying the above: UDP/TCP/HTTP used an unsafe predecessor lookup ICMP had already been fixed away from
+
+While confirming the shared-hop cache fixes apply identically across all
+four probe protocols, found that `predecessor_of()` — which decides the
+cache key — was implemented two different ways in the same codebase: the
+ICMP loop used a safe, deliberately-argued-for version (hop-1 only, a
+per-depth `"UNKN-<h>"` sentinel when unresolved), while UDP, TCP, and HTTP
+all still used an older "walk back to the nearest resolved hop" version
+that the ICMP code's own comment explicitly warns against — it can make two
+targets that have genuinely diverged share one cache entry and stomp each
+other's real measurements. Not introduced by the fixes above, but exposed
+by verifying them; all four protocols now use the identical, safe logic.
+
+## 1.1.2
+
+### macOS build: missing AudioToolbox framework link
+
+The very first real macOS CI build of this codebase (obfuscated-build.yml)
+failed at the link stage: `Undefined symbols for architecture arm64:
+_AudioServicesPlaySystemSound`. The core engine itself linked fine on macOS
+(its own CI job passed) — this was isolated to `netpulse_ffi.cpp`'s
+`play_alert_sound()`, whose macOS branch calls `AudioServicesPlaySystemSound`
+(declared correctly via `<AudioToolbox/AudioServices.h>`, compiling without
+complaint) without `build.rs` ever telling the linker about the
+`AudioToolbox` framework it lives in. Tauri's own build links AppKit,
+WebKit, Security, and several other frameworks it needs for its own
+windowing/webview — none of which happen to pull in AudioToolbox as a side
+effect, since nothing else in the binary uses it. This project's own
+build.rs has to link the frameworks its own code needs explicitly, and
+never did for this one — this exact code path had no macOS cross-compiler
+available while it was being written, so this was the first time it was
+ever actually compiled for the platform. Fixed by adding the missing
+`cargo:rustc-link-lib=framework=AudioToolbox` directive specifically for
+`cfg!(target_os = "macos")`, distinct from the generic Unix branch Linux
+also falls into (which correctly needs no such framework at all, since its
+own `play_alert_sound()` branch is a deliberate no-op).
+
+Two more warnings visible in that same build log — unused `discovering`
+(session.cpp) and an orphaned `kDirectEchoTtl` constant, both flagged by
+clang's warning set but not GCC's, which is what `verify.sh`'s own
+warning-budget check runs against — were confirmed genuinely dead (not a
+functional gap: each `ProbeStrategy`'s own `send_direct_probe()` already
+independently hardcodes TTL 255 with the identical reasoning comment) and
+removed.
+
+### Release pipeline: `latest.json` never existed at all, regardless of signing
+
+With the macOS build fixes above landing, the first real release run (all
+three OS installers built successfully) still failed in the publish job, at
+"Merge per-OS updater manifests into one latest.json": zero manifests found.
+
+The first diagnosis here was wrong, and worth recording honestly rather
+than quietly editing out: `CODE_SIGNING.md`'s own heading ("future
+implementation") made it look like a missing signing key was the cause, and
+a first fix made the merge step tell apart "no key configured" (expected)
+from "key configured but still failed" (a real problem) — reasonable
+handling for a genuinely different bug, but not this one. A real build log,
+requested specifically to settle it, proved that theory wrong directly:
+signing had genuinely succeeded (`Finished 1 updater signature at
+...exe.sig`), yet the very next line from `tauri-action` itself was `No
+releaseId or tagName provided, skipping all uploads...`.
+
+Tracing that message into `tauri-action`'s own source confirmed the actual
+root cause: `latest.json` is never a file `tauri build` writes to disk at
+all — `createUpdaterArtifacts: true` only makes it emit the `.sig`
+signature files. `latest.json` is constructed by `tauri-action` itself,
+entirely in memory, exclusively as part of its own upload-to-release logic,
+which requires `tagName`/`releaseId`. This project's build job never
+passed either (deliberately, on the theory that `latest.json` was some
+other local build output the "Collect installer files" step further down
+could just find and copy — it never could, since it never existed on disk
+to begin with). No version of the signing key, its password, or the merge
+script downstream could ever have produced a `latest.json`, regardless of
+how correct any of their own logic was, because `tauri-action`'s manifest-
+generation code path was never being reached at all — with or without a
+signing key.
+
+Fixed by switching to `tauri-action`'s own documented pattern for a multi-
+OS matrix release: `GITHUB_TOKEN` + `tagName` + `releaseDraft: true`,
+letting each of the three concurrent OS jobs safely share one draft release
+that `tauri-action` finds-or-creates and merges every platform's entry into
+one real `latest.json` natively — the exact job the project's own custom
+`merge-latest-json.mjs` script was trying to reimplement, and could never
+succeed at no matter how correct its own logic was, since it depended on a
+local file that was never going to exist. That script is now genuinely
+unused and was removed rather than left as dead code.
+
+This changed the shape of the whole release pipeline, not just one step —
+`softprops/action-gh-release` (the tool that used to create the release)
+was removed too: with the build job now creating the release itself via
+`tauri-action`, asking a second, different tool to "create or update" the
+same tag has real, documented failure modes for exactly this scenario
+(`softprops/action-gh-release` issues #445 and #403, both `already_exists`
+against a release created by something else — and the fix for reusing an
+existing draft correctly only landed in v3.0.2, while this file was pinned
+to v2). Replaced with the official `gh` CLI directly for the publish job's
+final step: `gh release upload` unambiguously requires an already-existing
+release (no create-vs-update ambiguity at all), and `gh release edit
+--draft=false` reliably publishes it.
+
+Two real mistakes were caught and fixed while making this change, both
+before it shipped: a `str_replace` edit that inserted the new, correctly-
+configured `tauri-action build` step without removing the old one, briefly
+leaving two copies of the same step in the file (caught by re-grepping for
+step names immediately after the edit, not assumed correct); and a job-
+level `permissions: contents: write` block that would have silently
+*removed* the `id-token`/`attestations` permissions the same job's build-
+provenance-attestation step depends on, since GitHub Actions job-level
+permissions override the workflow-level ones rather than adding to them,
+not something either would have been flagged by YAML validation alone.
+
+
+The same build log also showed the final link command using
+`-mmacosx-version-min=11.0.0`, not the `10.15` `build.rs` sets via
+`MACOSX_DEPLOYMENT_TARGET` — a real, separate bug from the AudioToolbox one
+above. Root cause: `build.rs`'s `std::env::set_var(...)` only ever affects
+`build.rs`'s own process and whatever it spawns itself (`cc`-rs's clang
+invocations, compiling the C++ engine) — it cannot reach backward to affect
+Cargo's own, separate `rustc` invocation for the actual link step, since
+that's a sibling process Cargo spawns directly, not a child of `build.rs`.
+Every macOS build had silently been linking against whichever deployment-
+target default the Rust target triple happens to have (11.0 for
+`aarch64-apple-darwin`, since ARM64 Mac hardware never existed before that
+version) rather than the `10.15` `tauri.conf.json`'s own
+`macOS.minimumSystemVersion` claims the app supports — and, for the release
+workflow's universal binary specifically, meant the x86_64 and aarch64
+slices within the same binary could disagree on their own deployment
+targets, not just disagree with the app's stated one. Fixed by setting
+`MACOSX_DEPLOYMENT_TARGET` in each CI workflow's own job-level `env:` block
+(`obfuscated-build.yml`, `tauri-ci.yml`, `tauri-release.yml`,
+`tauri-canary-build.yml`) — the actual top of the process tree, correctly
+inherited by both Cargo's link step and `build.rs`. `build.rs`'s own
+fallback still matters for a local build invoked without that env block
+already set; its comment now says so explicitly rather than calling itself
+"the single source of truth", which this real build proved it wasn't.
+
+### Single source of truth for the version number
+
+`/VERSION` at the repo root is now the one canonical version string, with
+`scripts/sync-version.mjs` propagating it into the three files that each
+need their own literal copy (`tauri-app/src-tauri/tauri.conf.json`,
+`tauri-app/src-tauri/Cargo.toml`, `tauri-app/package.json` — none of Cargo,
+npm, or Tauri's bundler support reading their `version` field from an
+external file, so each still needs it written in directly). `node
+scripts/sync-version.mjs` rewrites all three; `--check` verifies they
+already match without changing anything, which is what CI now calls instead
+of duplicating the same three-way comparison inline. `tauri-version-
+release.yml` was updated to watch `/VERSION` (not `tauri.conf.json`) and to
+call the script's own `--check` rather than re-implementing the same
+consistency logic a second time — two copies of that logic drifting apart
+from each other was exactly the kind of thing this system exists to
+prevent.
+
+### Path/MTR and Ping: TCP and UDP measurement accuracy
+
+A long series of root-caused, individually-verified fixes to the actual
+correctness of TCP/UDP/HTTP measurement, most surfaced only once the app
+was exercised on real hardware and real networks rather than a sandboxed
+loopback:
+
+- **TCP/HTTP RTT quantization (100ms floor).** `run_tcp`/`run_http` sent a
+  probe, then unconditionally blocked up to 100ms on the ICMP inbox before
+  ever checking `poll_completions()` — but TCP/HTTP replies never arrive
+  through that inbox at all, so every pass measured the sleep, not the
+  network. Both a LAN router and 8.8.8.8 read a suspiciously flat ~100ms.
+  Fixed with an adaptive wait (2ms while a probe is in flight, 100ms when
+  idle). The identical bug independently existed a second time in the
+  standalone Ping tool's own engine (`ping_run.cpp`) and was missed on the
+  first pass — found later from a live report showing 8.8.8.8 and 1.1.1.1,
+  genuinely different real RTTs, both reading an identical ~50ms; fixed the
+  same way there.
+- **TCP/HTTP hop-correlation bug (unchecked `bind()`).** On Windows, `bind()`
+  to an ephemeral port in the Hyper-V/WSL2-reserved range (49152+) can fail
+  (`WSAEACCES`) — the original code never checked this, so the probe left
+  from a random port the router's Time-Exceeded didn't match, and
+  intermediate hops silently never resolved even though the destination
+  still worked. Fixed by confirming the actual bound port via
+  `getsockname()` *after* `connect()` and correlating on that instead of
+  arithmetic.
+- **HTTP negative RTT (`-0.1ms`).** `poll_completions()` used the caller's
+  `now` (captured before the probe was even sent) instead of a fresh
+  timestamp, so `now - sent_at` could go negative. Fixed to compute `now`
+  fresh, matching how the TCP path already did it.
+- **ICMP MTR hop starvation after sleep/wake.** The already-answered-hop
+  keepalive phase iterated hops in a fixed, non-rotating order under a
+  shared global pacer; hop 1 could consume every available token every
+  pass, starving hops 9+ entirely under contention. Fixed with a rotating
+  cursor for that phase, mirroring the one the unanswered-hop phase already
+  had.
+- **Monotonic clock for RTT.** TCP/HTTP RTT and timeout comparisons used
+  wall-clock (`system_clock`), vulnerable to NTP corrections and sleep/wake
+  jumps corrupting every in-flight probe's measured time. Split into a
+  wall-clock timestamp (kept for the reported sample time) and a separate
+  monotonic one (`steady_clock`) used only for RTT/timeout math.
+- **Windows raw-socket ICMP delivery.** Root cause of TCP/UDP hop discovery
+  never working on Windows at all: a raw `SOCK_RAW`/`IPPROTO_ICMP` socket
+  there does not receive ICMP errors generated in response to a *different*
+  socket's traffic (the router's Time-Exceeded for a TCP/UDP probe never
+  reaches it) unless the socket is both bound to a real local address *and*
+  put into `SIO_RCVALL` receive-all mode. Implemented, logged either
+  outcome explicitly (`SIO_RCVALL enabled`/`FAILED`) so this is diagnosable
+  rather than a silent dead end, and — after an earlier version incorrectly
+  claimed this doesn't work for IPv6 with no actual source for that
+  restriction — extended to IPv6 too, since the ioctl itself doesn't encode
+  an address family and the call is already fully best-effort.
+- **UDP-mode port-allocation collision (the most severe of these).**
+  `allocate_flow_port_block()` handed out one of only 64 fixed port blocks
+  via a blind, process-wide, never-resetting round-robin counter — every
+  MTR target and every Ping run consumes one call, so 64 *cumulative*
+  allocations (not 64 simultaneous ones, which the original code's own
+  comment incorrectly claimed) is trivially reached over a real working
+  session. Once the counter wrapped, a brand-new session could be handed
+  the exact same block as a still-running one, silently overwriting its
+  ICMP-reply-routing registry entries — explaining a live report of UDP
+  ping working for one target and then completely failing for others
+  moments later, unrelated to the actual destination. Fixed by checking
+  registry occupancy before committing to a candidate block, falling back
+  to the old round-robin choice only if every one of the 64 is genuinely
+  occupied. Verified against the *actual* pre-fix code, not just reasoned
+  about: an executable test simulating realistic sustained use (a
+  long-lived session plus 80 short-lived ones cycling through) reproduces
+  a real collision at exactly call #63 against the old allocator and shows
+  zero collisions against the fixed one.
+- **UDP base-port collisions with real services.** Choosing an unusually
+  low UDP base port (e.g. 50) means a mid-range hop offset can land on a
+  well-known service port (50+3 = 53, DNS) that has something genuinely
+  listening — the destination silently discards the malformed non-DNS
+  payload instead of replying with Port-Unreachable, which looks like a
+  bug but is a direct, predictable consequence of not using an
+  intentionally-obscure base port the way classic `traceroute` does.
+  Confirmed by reproducing the exact scenario against a real listener on
+  that port.
+- **Stale, permanent "N automatic reconnect attempts" banner.** The counter
+  behind this banner (`silence_rebuild_count_`) only ever incremented and
+  was never reset anywhere, despite existing specifically to answer "is
+  this session actively retrying right now" — a session that briefly lost
+  ICMP (e.g. a VPN toggle) and then fully recovered kept the banner pinned
+  at its outage-time value forever, contradicting hop data that was
+  simultaneously showing a fully healthy path. Fixed by resetting it
+  alongside the existing, already-correct local counters it should have
+  mirrored from the start. Verified live: genuinely blocked ICMP via
+  `iptables`, watched the counter climb, removed the block, watched it
+  reset to zero within seconds of a real reply.
+
+### Ping tool: TCP and UDP added, NMAP-style reply detail, validation
+
+- **TCP and UDP ping**, alongside the existing ICMP mode — new
+  `PingProtocol::Tcp`/`Udp` in the shared `PingRun` engine, wired through
+  the full stack (native FFI, Rust command, JS bridge, UI). TCP ping needs
+  no elevation or capture driver on any platform (the SYN-ACK/RST answer
+  arrives on the TCP socket itself, not as an ICMP message); UDP ping's
+  reply is an ICMP Port-Unreachable, which does need elevated privileges to
+  receive.
+- **NMAP-style reply detail.** A TCP reply used to render with the exact
+  same generic "Reply from…" text ICMP uses, even though the underlying
+  evidence is completely different — the C++ layer already distinguished a
+  completed handshake from a refused connection internally and was simply
+  discarding that distinction before it reached the UI. Now shown plainly:
+  "Connected (port open)" vs. "Port closed, but host responded (RST) — host
+  is reachable".
+- **Local/remote port shown in every reply and timeout line**, both TCP and
+  UDP, including on a timeout (previously a `Request timed out` line
+  carried zero identifying detail — exactly the missing piece needed to
+  diagnose the base-port-collision issue above from a log alone).
+- **Full input validation before starting a probe.** Count/Size/Timeout/
+  Interval/TTL/remote-port only ever had soft HTML5 `min`/`max` hints,
+  which do not actually stop the browser from using an out-of-range typed
+  value — nothing validated them before launching. Now checked against
+  explicit limits before every run, blocking with a native warning dialog
+  (and the OS alert sound) listing every problem at once rather than
+  starting with silently-clamped or nonsensical values.
+
+### Diagnostic logging
+
+A new, opt-in file-based logging system for exactly the class of bug this
+whole line of fixes came from — the state that's easiest to misdiagnose
+from the UI alone.
+
+- **Toggle lives in Tools → Diagnostic logging**, not an environment
+  variable: `NETPULSE_DEBUG=1` cannot be set for a "Run as Administrator"
+  relaunch at all (a fresh elevated process inherits none of the launching
+  terminal's environment), which is exactly the scenario most in need of
+  diagnosing. The file-based toggle works no matter how the app was
+  started.
+- **Persistent file handle, not fopen/fclose per line.** The very first
+  version of this reopened the log file on every single call — including
+  from the shared RX dispatcher's hot path, hit by every incoming packet
+  across every active session. Over a long session with several targets,
+  that's tens of thousands of raw file-open syscalls, and on Windows
+  specifically each one is a real-time-antivirus-scan hook opportunity.
+  Fixed with one handle kept open and flushed (not closed) after each
+  write, plus a 20MB size cap so a long session degrades to "logging
+  stops" rather than filling the disk.
+- **UTF-8 BOM + timestamps.** A real log file showed messages like `SIO_
+  RCVALL enabled ΓÇö raw socket...` — the classic signature of a correct
+  UTF-8 em-dash being decoded as CP1252 by a viewer with no other signal
+  about the file's encoding. Fixed by writing a UTF-8 BOM as the first
+  bytes of a newly-created log file (written exactly once, verified not to
+  duplicate across a disable/re-enable cycle), and every line now carries a
+  `[HH:MM:SS.mmm]` timestamp automatically.
+- **NMAP-style "filtered" logging on every timeout**, across TCP/UDP/HTTP
+  hop discovery, with the specific hop, target, and local/remote port —
+  the same detail level added to the Ping tool's own timeout lines.
+
+### Protocol prerequisite detection and prompts
+
+- **Real capability detection**, not guesses: `process_is_elevated()`
+  (Windows token check / `geteuid()`) and `capture_driver_present()` (tries
+  to actually load `wpcap.dll`, including Npcap's non-default search path
+  — proving the driver is genuinely usable now, not just that a registry
+  key an uninstall could have left behind still exists).
+- Selecting UDP or TCP now checks prerequisites **immediately**, before a
+  host is even typed, rather than only at "Add" time; "Add" still
+  re-checks authoritatively as a safety net, since capabilities can change
+  between selection and click (elevating in another window, installing
+  Npcap).
+- **"Restart as Administrator"** actually restarts the app elevated
+  (PowerShell `Start-Process -Verb RunAs`, chosen specifically to avoid a
+  new `windows-sys` dependency); declining the UAC prompt leaves the
+  running instance untouched rather than treating it as a crash.
+- Every prerequisite/IP-translation/update dialog is genuinely blocking —
+  an earlier version could be dismissed by an accidental outside click,
+  which for two of the IP-translation dialogs meant the click silently
+  triggered the same *fallback-and-proceed* path a deliberate button choice
+  would have, rather than actually canceling. Reworked to three explicit
+  outcomes (Cancel / a real fallback choice / the primary action) with an
+  executable test proving all four ways of resolving the dialog (including
+  the dialog's own × close button) do what they're supposed to.
+
+### In-app modal system
+
+The generic confirmation dialog used throughout the app went through
+several real, found-and-fixed bugs of its own while being extended:
+
+- **The modal was never actually rendered at all.** `showModal()`/
+  `closeModal()` worked by resolving a Promise only when a rendered
+  button's `onClose` ran — but the `<Modal>` component itself was defined
+  and never once placed in the render tree. Every one of the ~30 call
+  sites across the app hung forever, silently, with no error — this is
+  what a live report of "TCP/UDP alerts never appear, and clicking Add
+  does nothing" turned out to be, unrelated to protocol logic entirely.
+- **Missing CSS.** Even after fixing the render, none of `.modal-overlay`/
+  `.modal-box`/etc. had a single CSS rule anywhere — an unstyled block in
+  normal document flow, effectively invisible. Both had to be fixed
+  together; fixing only one would have looked identical to the original
+  bug.
+- **Constant remount ("flashing").** `Modal` was declared *inside* the
+  `App()` component body — a new function value on every single App
+  re-render, which happens continuously while a session streams live data.
+  React treats a changed component identity as "unmount and remount",
+  invisible before any CSS entrance animation existed, but very visible
+  once one did: every remount replayed the open animation. Fixed by
+  hoisting it to module scope (it never closed over anything from `App`'s
+  own scope, so this was always safe). Hoisting it also surfaced a second,
+  pre-existing bug: a stale, never-actually-used duplicate `Modal.jsx` file
+  had been silently shadowed by the in-component one this whole time —
+  deleted rather than left as a second, drifting copy.
+- **No close animation.** The close transition reused the *same*
+  `@keyframes` name as the open one with `animation-direction: reverse` —
+  once an animation with a given name has already finished on an element,
+  changing only its direction/duration via a class swap does not reliably
+  restart it in Chromium/WebView2; the element just sat at its settled end
+  state until JS removed it. Fixed with genuinely distinct keyframe names
+  for open vs. close, which forces a real restart. The delayed-unmount
+  timing this depends on (keep the element mounted long enough for the CSS
+  transition to actually play) had its own subtle bug: resolving the
+  dialog's Promise *before* that delay let a caller show a follow-up dialog
+  mid-animation, which the first dialog's own pending cleanup would then
+  incorrectly null out from under it — proven with an executable
+  reproduction before and after the fix, not just reasoned about.
+- **× close button**, always available even on a blocking dialog (a
+  deliberate click is not the accidental-outside-click case blocking
+  exists to guard against), and the same animation/blocking treatment
+  extended to the separate About dialog.
+- **Native OS alert sound**, decoupled from showing a native OS dialog box:
+  `play_alert_sound(kind)` plays only the platform sound (Windows
+  `MessageBeep`, tiered info/warning/error; macOS `AudioServicesPlay
+  SystemSound`; an honest no-op on Linux, which has no single standard
+  API across desktop environments) with no dialog shown at all — added
+  specifically so the app's own styled, resizable modal could get the same
+  attention-getting sound a native dialog gets for free, without giving up
+  control over the dialog's own appearance (a native OS dialog's text size
+  cannot be influenced by the app at all). Along the way, found and removed
+  an entirely separate, ad-hoc synthesized WebAudio beep `showModal()` had
+  always played on every call — meaning some dialogs were briefly playing
+  two unrelated sounds simultaneously once the real OS sound was added
+  alongside it.
+- **Semantic button colors** — teal/confirm, amber/warning, burnt-orange/
+  danger, plain/neutral — replacing a single color used for every action
+  regardless of how consequential it was. Two rounds of real fixes here:
+  the first color choice used bright, high-saturation fills that read as
+  glare next to white text even though they numerically passed WCAG
+  contrast; darkened and unified across both themes. Separately, a CSS
+  specificity bug (`.modal-actions button`, an element+class selector,
+  unconditionally beating a single-class `.btn-warning`/`.btn-danger`
+  regardless of source order) meant the color frequently didn't render at
+  all inside any modal — the exact same specificity trap had already been
+  found and fixed once for the primary/confirm button, but not extended to
+  its two siblings until a live screenshot showed neither had any color.
+
+### Path/MTR: Edit Config, NMAP-style port state, port visibility
+
+- **Remote port is now editable** in Edit Config (previously read-only
+  display text). Session::run_tcp()/run_udp()/run_http() were found to
+  never consult the rebuild mechanism a settings change is supposed to
+  trigger at all — only the ICMP-mode loop ever did — so a live in-place
+  port change would have silently done nothing useful while leaving stale,
+  port-specific correlation state behind. Rather than hand-write a new
+  in-place rebuild for three separate loops under time pressure, a port or
+  protocol change is routed through the already-correct, already-tested
+  remove-and-re-add path instead, with an explicit warning (hop history for
+  that target is genuinely lost, not resumed) and confirmation before it
+  happens.
+- **NMAP-style open/filtered/closed** shown per hop for TCP mode, using the
+  same SYN-ACK/RST distinction added to the Ping tool, threaded through to
+  the destination hop specifically (only the real endpoint can ever answer
+  with a genuine TCP-layer reply — an intermediate hop's only possible
+  evidence is an ICMP Time-Exceeded, which has no open/closed concept at
+  all).
+- **Local port surfaced as a per-hop tooltip**, not a single CONFIG-bar
+  summary value — a summary showing one hop's value implied a single,
+  session-wide answer that doesn't actually exist for TCP (a fresh socket
+  per probe, by design) and could go stale for UDP after a silence-
+  rebuild reassigns the session's shared socket. The per-hop tooltip reads
+  directly from that specific hop's own latest recorded value and can't be
+  misleading the same way.
+
+### Resource lifecycle and long-session stability
+
+- **`ColdStore`'s background persistence queue had no size cap at all.**
+  One thread services every target's cold-tier flush jobs; if disk I/O
+  ever fell behind generation rate (a slow disk, or real-time antivirus
+  scanning intercepting every write), jobs piled up in memory indefinitely.
+  Capped with oldest-drop-and-log rather than blocking, since blocking
+  would stall live probing, which is worse than losing some historical
+  detail.
+- **Removing a target never cleaned up its `ColdStore` state.** Neither the
+  in-memory compute cache nor the on-disk history files for a removed
+  target were ever released — invisible in a short test session, a real
+  problem for a long-running deployment where targets get added and
+  removed over days or weeks, since both grow with every target *ever*
+  added rather than every target currently active. Fixed with a proper
+  `forget_target()`, wired into removal and verified directly (pushed
+  data, confirmed it existed in both cache and on disk, removed it,
+  confirmed both were gone).
+
+### Deployment and cross-platform build parity
+
+A full read-through of the GitHub Actions release pipeline, none of which
+had been directly audited before — several real, concrete gaps found:
+
+- **macOS builds were architecture-incomplete.** The release workflow
+  specified no target at all for the macOS job; `macos-latest` runners are
+  Apple Silicon, so with nothing else specified the build produced an
+  ARM64-only binary — not "runs slower on Intel via Rosetta", genuinely
+  unable to run there at all, since Tauri does not produce a universal
+  binary unless explicitly told to. Fixed by installing both Rust targets
+  and building with `--target universal-apple-darwin`.
+- **The documented "rebuild an existing tag" workflow_dispatch input was
+  silently broken.** Neither checkout step in the release workflow
+  specified a `ref`, so triggering a rebuild for an old tag would have
+  silently built whatever `main` currently looks like instead of the
+  actual historical tagged commit. Fixed on both the build and publish
+  jobs.
+- **No `.icns` file existed anywhere** for the macOS bundle icon — absent
+  from disk and from `tauri.conf.json`'s icon list. Generated one from the
+  largest available source PNG.
+- **A referenced-but-never-created workflow.** `Cargo.toml`'s own doc
+  comment on the `canary` feature (a devtools-enabled debug build) named
+  `tauri-canary-build.yml` as how to produce one — that file never existed,
+  despite the feature flag and its dedicated Tauri config
+  (`tauri.canary.conf.json`) being real, correct, and already wired up.
+  Created it: manual-dispatch only, uploads artifacts rather than
+  publishing a Release (a debug/devtools build should never be mistaken
+  for a real release), same universal-macOS-binary treatment as the real
+  release workflow.
+- **Verification suite (`scripts/verify.sh`) expanded** to cover several
+  classes of bug found the hard way during this work and unlikely to be
+  caught by ordinary code review: every `core/src/*.cpp` and
+  `netpulse_ffi.cpp` compiled standalone (catches a missing `#include`
+  masked by a different file in the same static-library link happening to
+  provide it — this exact bug shipped once), the same files cross-compiled
+  for Windows via MinGW-w64 (catches Win32-only API/header mistakes that
+  native Linux compilation can't see at all — including a Windows-only
+  `winsock.h`/`winsock2.h` header-ordering conflict this caught directly),
+  a three-way consistency check across every Tauri command's registration
+  in `lib.rs`/`build.rs`/`capabilities/default.json` (a command missing
+  from any one of the three either fails the whole build or is silently
+  uninvokable at runtime with no compile error at all — both happened
+  during this work before this check existed), every workflow YAML file
+  parsed for validity, and version consistency across `VERSION`/
+  `tauri.conf.json`/`Cargo.toml`/`package.json`.
+
 ## 0.9.5 revised
 
-Version files (`tauri.conf.json` / `Cargo.toml` / `package.json`) are still at
-`0.9.5` — this section isn't tied to a version bump yet. When ready to ship
-it, bump all three (the `tauri-version-release.yml` workflow checks they
-match) and rename this heading.
+The work below shipped as part of the 1.1.2 release above rather than
+getting its own dedicated version bump.
 
 ### Ping tool: rebuilt on the native engine, not an OS subprocess
 

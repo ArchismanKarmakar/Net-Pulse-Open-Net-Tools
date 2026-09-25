@@ -40,6 +40,15 @@ pub struct TargetConfig {
     pub src: String,
     #[serde(default)]
     pub paused_hops: Vec<u8>,
+    // "icmp" (default) | "udp" | "tcp" — see Session::run()'s doc comment
+    // (session.cpp) for why "tcp" is accepted here but currently surfaces
+    // a clear error at the engine level rather than actually probing:
+    // the C++ side already refuses it explicitly, so there's no need to
+    // duplicate that validation here and risk the two falling out of sync.
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
+    #[serde(default = "default_dest_port")]
+    pub dest_port: f64,
 }
 fn default_probe() -> f64 { 1.0 }
 fn default_trace() -> f64 { 30.0 }
@@ -47,12 +56,15 @@ fn default_payload() -> f64 { 56.0 }
 fn default_maxhops() -> f64 { 30.0 }
 fn default_raw() -> bool { true }
 fn default_family() -> String { "auto".into() }
+fn default_protocol() -> String { "icmp".into() }
+fn default_dest_port() -> f64 { 33434.0 }
 
 #[tauri::command]
 pub fn add_target(cfg: TargetConfig) -> Result<u64, String> {
     ffi::add_target(
         &cfg.target, cfg.probe, cfg.trace, cfg.timeout, cfg.payload,
         cfg.maxhops, cfg.raw, &cfg.family, &cfg.src, &cfg.paused_hops,
+        &cfg.protocol, cfg.dest_port,
     )
     .map_err(|e| e.to_string())
 }
@@ -80,6 +92,8 @@ pub struct PartialTargetConfig {
     pub family: Option<String>,
     pub src: Option<String>,
     pub paused_hops: Option<Vec<u8>>,
+    pub protocol: Option<String>,
+    pub dest_port: Option<f64>,
 }
 
 #[tauri::command]
@@ -96,10 +110,13 @@ pub fn update_target(id: u64, cfg: PartialTargetConfig) -> Result<bool, String> 
         family: cfg.family.unwrap_or(current.family),
         src: cfg.src.unwrap_or(current.src),
         paused_hops: cfg.paused_hops.unwrap_or(current.paused_hops),
+        protocol: cfg.protocol.unwrap_or(current.protocol),
+        dest_port: cfg.dest_port.unwrap_or(current.dest_port),
     };
     ffi::update_target(
         id, merged.probe, merged.trace, merged.timeout, merged.payload,
         merged.maxhops, merged.raw, &merged.family, &merged.src, &merged.paused_hops,
+        &merged.protocol, merged.dest_port,
     )
     .map_err(|e| e.to_string())
 }
@@ -127,6 +144,8 @@ fn current_config(id: u64) -> Result<TargetConfig, String> {
         raw: c.get("raw").and_then(|x| x.as_bool()).unwrap_or(true),
         family: c.get("family").and_then(|x| x.as_str()).unwrap_or("auto").to_string(),
         src: c.get("src").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        protocol: c.get("protocol").and_then(|x| x.as_str()).unwrap_or("icmp").to_string(),
+        dest_port: getf("destPort", 33434.0),
         paused_hops: c
             .get("pausedHops")
             .and_then(|x| x.as_array())
@@ -166,6 +185,17 @@ pub fn get_state(focus_secs: Option<f64>) -> String {
 #[tauri::command]
 pub fn list_interfaces() -> String {
     ffi::list_interfaces_json()
+}
+
+/// Full diagnostic listing (every adapter, up or down, including loopback,
+/// with up/loopback/mtu/usable) — backs the interfaces diagnostics page and
+/// the no-IPv4/no-IPv6 critical alert. See list_interfaces_detailed_json's
+/// doc comment (netpulse_ffi.hpp) for why this is a separate command rather
+/// than a flag on list_interfaces() above: that one's payload shape and
+/// filtering are relied on by the existing source-address dropdown.
+#[tauri::command]
+pub fn list_interfaces_detailed() -> String {
+    ffi::list_interfaces_detailed_json()
 }
 
 /// Every raw sample this target has ever recorded, across every hop —
@@ -234,6 +264,12 @@ pub struct PingArgs {
     pub interval: Option<f64>,
     pub family: Option<String>,
     pub continuous: Option<bool>,
+    // "icmp" (default, matches pre-existing behavior if omitted) or "udp" —
+    // see netpulse_ffi.hpp's ping_start doc comment for what each measures.
+    pub protocol: Option<String>,
+    // UDP-only; ignored for ICMP. Same classic-traceroute default
+    // (33434) as ping_run.hpp's PingConfig itself uses when this is absent.
+    pub dest_port: Option<u32>,
 }
 
 #[derive(Serialize, Clone)]
@@ -286,13 +322,15 @@ pub async fn ping_start(app: AppHandle, host: String, args: PingArgs) -> Result<
     let ttl = args.ttl.unwrap_or(255) as f64;
     let interval_secs = args.interval.unwrap_or(1.0);
     let family = args.family.clone().unwrap_or_default();
+    let protocol = args.protocol.clone().unwrap_or_default();
+    let dest_port = args.dest_port.unwrap_or(33434) as f64;
 
     // Raw ICMP (same requirement, and same default, as the main engine —
     // see build.rs's comment on why this app doesn't run elevated by
     // default but every probe still needs a raw socket) and no explicit
     // source binding; PingPage.jsx doesn't currently expose either as a
     // user-facing option, matching its pre-existing scope.
-    let json = ffi::ping_start(&host, count, continuous, size, timeout_secs, ttl, interval_secs, &family, true, "")
+    let json = ffi::ping_start(&host, count, continuous, size, timeout_secs, ttl, interval_secs, &family, true, "", &protocol, dest_port)
         .map_err(|e| e.to_string())?;
     let parsed: serde_json::Value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
     let id = parsed.get("id").and_then(|v| v.as_u64()).ok_or_else(|| "ping_start: malformed response".to_string())?;
@@ -353,3 +391,216 @@ pub fn write_file(path: String, data: Vec<u8>) -> Result<(), String> {
 pub fn read_file(path: String) -> Result<Vec<u8>, String> {
     std::fs::read(&path).map_err(|e| e.to_string())
 }
+// ---------------------------------------------------------------------------
+// Capability probe + elevation relaunch.
+//
+// The UI gates protocol selection on these: UDP-style hop discovery needs
+// elevation, and TCP hop discovery on Windows additionally needs a capture
+// driver. Reporting this up front — and refusing to add a target that cannot
+// possibly work — is far better than silently spinning in "discovering".
+// ---------------------------------------------------------------------------
+#[tauri::command]
+pub fn capabilities() -> Result<String, String> {
+    ffi::capabilities_json().map_err(|e| e.to_string())
+}
+
+// Relaunch this same executable elevated, then ask the current instance to
+// exit. Windows has no way to elevate a running process in place — a new
+// process must be started via the "runas" verb, which triggers the UAC
+// prompt — so "run as administrator" is necessarily a restart, and the UI
+// says so before calling this.
+#[tauri::command]
+pub fn relaunch_elevated(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        // Deliberately shelled out through PowerShell's Start-Process -Verb
+        // RunAs rather than calling ShellExecuteW directly: that would pull in
+        // a windows-sys dependency this crate does not currently have, and the
+        // one-shot cost here is irrelevant since the process is about to exit.
+        // Same net effect — a UAC prompt, then a fresh elevated instance.
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let exe_s = exe.to_string_lossy().replace('\'', "''"); // escape for the single-quoted PS string
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command",
+                   &format!("Start-Process -FilePath '{}' -Verb RunAs", exe_s)])
+            .status()
+            .map_err(|e| format!("Could not start the elevation prompt: {e}"))?;
+        // A non-zero exit means the UAC prompt was declined (or failed). That
+        // must NOT kill the running instance — the user simply chose to stay
+        // unelevated, and the app is still perfectly usable for ICMP and TCP
+        // destination measurement.
+        if !status.success() {
+            return Err("Elevation was cancelled. Still running without administrator rights.".into());
+        }
+        app.exit(0);
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        Err("Relaunching elevated is Windows-only. On Linux/macOS start the app with sudo instead.".into())
+    }
+}
+
+// Enable/disable diagnostic logging to a file in the app data dir.
+// Deliberately file-based rather than env-var-driven: "Run as administrator"
+// launches a brand-new elevated process that inherits none of the
+// environment of whatever terminal you were in, so NETPULSE_DEBUG=1 simply
+// cannot be set for the elevated case — which is precisely the case that
+// most needs diagnosing. Returns the log file path for the UI to display.
+#[tauri::command]
+pub fn set_debug_logging(app: tauri::AppHandle, on: bool) -> Result<String, String> {
+    use tauri::Manager;
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    // The directory may not exist yet on a fresh install; the C++ side only
+    // joins a filename onto it and fopen()s, so it must exist first.
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    ffi::set_debug_logging(on, &dir.to_string_lossy()).map_err(|e| e.to_string())
+}
+
+// Plays the OS alert/notification sound alone, no dialog shown — pairs
+// with a custom in-app modal that wants the same attention-getting sound a
+// native OS dialog gets automatically, without giving up the app's own
+// consistent visual styling for a plain native message box.
+#[tauri::command]
+pub fn play_alert_sound(kind: String) {
+    ffi::play_alert_sound(&kind);
+}
+
+// ---------------------------------------------------------------------------
+// App-wide Settings window: a separate, savable/loadable settings surface —
+// FEATURE (user-requested) — covering both the passive "auto refresh"
+// engine tuning (see set_default_recheck_tuning's doc comment, session.hpp,
+// for the full mechanism this changes) and the defaults every NEW target
+// starts from (App.jsx's `form` state used to hardcode these inline; they're
+// now sourced from here instead, so changing them here changes what a
+// freshly opened "Add target" form starts pre-filled with, without touching
+// any already-running target). Persisted as one JSON file in the app's own
+// config directory — survives an update/reinstall that leaves user data
+// alone, same directory class Tauri itself recommends for this
+// (`app_config_dir`, distinct from `app_local_data_dir` used for the engine's
+// cold-tier stats store above in lib.rs — config vs. bulk data).
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSettings {
+    // Passive background "auto refresh" (guarded-wipe) tuning — see
+    // set_default_recheck_tuning's doc comment (session.hpp) for what these
+    // actually control, and ARCHITECTURE.md §6 for the full mechanism and
+    // why this is much slower by design than the per-target Force Recheck
+    // button. 30s/2 misses out of the box (lowered from the old hardcoded
+    // 45s per explicit request).
+    #[serde(default = "default_auto_refresh_secs")]
+    pub auto_refresh_secs: f64,
+    #[serde(default = "default_auto_refresh_threshold")]
+    pub auto_refresh_threshold: i32,
+
+    // Defaults a freshly opened "Add target" form starts pre-filled with —
+    // same fields/defaults as TargetConfig above, intentionally: changing
+    // one of these is exactly "change what a new target defaults to",
+    // nothing more (an already-added target keeps whatever it was given at
+    // the time, exactly like editing this doesn't retroactively touch
+    // targets added under the old default).
+    #[serde(default = "default_probe")]
+    pub default_probe: f64,
+    #[serde(default = "default_trace")]
+    pub default_trace: f64,
+    #[serde(default)]
+    pub default_timeout: f64,
+    #[serde(default = "default_payload")]
+    pub default_payload: f64,
+    #[serde(default = "default_maxhops")]
+    pub default_maxhops: f64,
+    #[serde(default = "default_raw")]
+    pub default_raw: bool,
+    #[serde(default = "default_family")]
+    pub default_family: String,
+    #[serde(default = "default_protocol")]
+    pub default_protocol: String,
+    #[serde(default = "default_dest_port")]
+    pub default_dest_port: f64,
+
+    // Consolidates the theme toggle that used to live ONLY in localStorage
+    // (App.jsx's `np-theme` key) — kept working the same way for the main
+    // window's own instant-apply toggle, but now also settable/visible from
+    // the Settings window and included in the same saved/loaded file, so
+    // "export my settings" or a fresh machine picks it up too.
+    #[serde(default = "default_theme")]
+    pub theme: String,
+}
+
+fn default_auto_refresh_secs() -> f64 { 30.0 }
+fn default_auto_refresh_threshold() -> i32 { 2 }
+fn default_theme() -> String { "dark".into() }
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            auto_refresh_secs: default_auto_refresh_secs(),
+            auto_refresh_threshold: default_auto_refresh_threshold(),
+            default_probe: default_probe(),
+            default_trace: default_trace(),
+            default_timeout: 0.0,
+            default_payload: default_payload(),
+            default_maxhops: default_maxhops(),
+            default_raw: default_raw(),
+            default_family: default_family(),
+            default_protocol: default_protocol(),
+            default_dest_port: default_dest_port(),
+            theme: default_theme(),
+        }
+    }
+}
+
+fn settings_file_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    use tauri::Manager;
+    let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("settings.json"))
+}
+
+// Loads the saved settings file if one exists (falling back to built-in
+// defaults for a fresh install, OR for a corrupt/hand-edited file that
+// fails to parse — a bad settings file degrading to defaults, rather than
+// breaking app startup outright, matches the same "clamp/degrade, don't
+// hard-fail" philosophy set_default_recheck_tuning already uses for
+// out-of-range values). ALSO applies the loaded auto-refresh tuning to the
+// engine immediately — called once from lib.rs's `.setup()`, before any
+// target can be added, so the very first target already sees the saved
+// default rather than the compiled-in one until the Settings window happens
+// to be opened.
+#[tauri::command]
+pub fn load_app_settings(app: tauri::AppHandle) -> Result<AppSettings, String> {
+    let path = settings_file_path(&app)?;
+    let settings = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<AppSettings>(&text).unwrap_or_default(),
+        Err(_) => AppSettings::default(), // no file yet — first run
+    };
+    ffi::set_recheck_tuning(settings.auto_refresh_secs, settings.auto_refresh_threshold);
+    Ok(settings)
+}
+
+// Reads back what the ENGINE currently has in effect right now (not what's
+// in the settings file, which — if this ever disagrees with the file after
+// a Save — would itself be worth surfacing as a bug). Used by the Settings
+// window as a "confirmed applied" readout after Save, independent of
+// trusting that the write-then-set_recheck_tuning sequence in
+// save_app_settings actually took.
+#[tauri::command]
+pub fn get_recheck_tuning() -> serde_json::Value {
+    serde_json::from_str(&ffi::get_recheck_tuning_json()).unwrap_or_default()
+}
+
+// Persists the settings file and applies the auto-refresh tuning immediately
+// (process-wide, live — see set_default_recheck_tuning's doc comment) so
+// Save takes effect without restarting the app.
+#[tauri::command]
+pub fn save_app_settings(app: tauri::AppHandle, settings: AppSettings) -> Result<(), String> {
+    let path = settings_file_path(&app)?;
+    let text = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    std::fs::write(&path, text).map_err(|e| e.to_string())?;
+    ffi::set_recheck_tuning(settings.auto_refresh_secs, settings.auto_refresh_threshold);
+    Ok(())
+}
+

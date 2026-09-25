@@ -19,15 +19,50 @@ struct Incoming {
     double at; // epoch seconds
 };
 
-// A usable local network interface (one entry per address).
+// A local network interface address. Historically only ever populated with
+// "up, non-loopback" entries (see list_interfaces()'s `include_all` param
+// below) for use as a source-address dropdown — `up`/`loopback`/`mtu` exist
+// so the SAME struct can also serve the full interfaces-diagnostics page
+// (App.jsx's InterfacesPage), which needs to show down/loopback adapters
+// too, not just the usable ones. Default member initializers keep every
+// existing 3-field aggregate-init call site (`{name, ip, v6}`) valid.
 struct NetInterface {
-    std::string name;    // adapter name / friendly name
-    std::string address; // local IP (textual)
-    bool v6;             // false = IPv4, true = IPv6
+    std::string name;      // adapter name / friendly name
+    std::string address;   // local IP (textual)
+    bool v6;                // false = IPv4, true = IPv6
+    bool up = true;         // operational status; only meaningful when include_all=true — a
+                             // default (non-include_all) call already filtered to up-only
+    bool loopback = false;  // true for the loopback adapter's own addresses
+    uint32_t mtu = 0;       // 0 = unknown/unavailable (best-effort; not every OS/adapter exposes it the same way)
+    // FEATURE (user-requested: "add more details" to the interface list/
+    // dropdown): best-effort adapter kind — "Wi-Fi", "Ethernet", "Virtual"
+    // (VPN/hypervisor/container adapters — vEthernet, VMware, Docker, tun/
+    // tap, ...) or "Other" when nothing distinguishes it. This exists
+    // because generic driver-assigned names (a Windows GUID-derived name, or
+    // a Linux "enp3s0"/"wlp2s0" the user has never had to read before) gave
+    // no way to tell which dropdown entry WAS the Wi-Fi adapter without
+    // cross-referencing the OS's own network settings — see
+    // list_interfaces()'s doc comment below for how each platform derives
+    // this.
+    std::string kind = "Other";
 };
 
-// Enumerate local interfaces with usable unicast addresses.
-std::vector<NetInterface> list_interfaces();
+// Enumerate local interfaces. Default (include_all=false, unchanged from
+// before this parameter existed): only UP, non-loopback unicast addresses —
+// what every existing caller (the source-address dropdown, the
+// has_local_v4/has_local_v6 egress check) wants, since a down or loopback
+// adapter was never a usable egress. Pass include_all=true for a full
+// diagnostic listing (every adapter, up or down, including loopback) with
+// `up`/`loopback`/`mtu` populated meaningfully — used by the interfaces
+// diagnostics page, not by any probing decision.
+std::vector<NetInterface> list_interfaces(bool include_all = false);
+
+// The local address the OS routing table would use to reach `dest_ip` —
+// see transport.cpp's doc comment on the implementation for the full
+// rationale (it's what lets private/CGNAT hop IPs be safely added to the
+// cross-target shared-hop cache, session.cpp). std::nullopt if it can't be
+// determined (no route, sandboxed environment, malformed dest_ip, ...).
+std::optional<std::string> local_egress_ip(Family family, const std::string& dest_ip);
 
 // One PooledSocket owns one raw socket for a (family, privileged, source)
 // combination and is SHARED — via acquire_pooled_socket() (session.cpp) — by

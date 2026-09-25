@@ -7,14 +7,18 @@ import TargetCard from './TargetCard'
 
 // useDragControls() is a hook, so it can only be called once per rendered
 // item — this thin wrapper is what makes that possible per-row inside a
-// .map(), while still handing the resulting `controls` object down into
-// TargetCard so its existing drag-handle icon (⠿) is what actually starts
-// the drag (dragListener={false} below disables "drag from anywhere on the
-// card", matching the previous hand-rolled behavior's dedicated handle).
+// .map(). dragControls is still handed down into TargetCard so the ⠿ icon
+// keeps working as an explicit grab point, but dragListener is left at its
+// default (true) so Reorder.Item itself also listens for a pointer-down
+// anywhere on the card — dragging no longer requires hitting that small
+// icon precisely. Motion's drag gesture has its own built-in movement
+// threshold before a drag actually starts, so a plain tap/click elsewhere
+// on the card (selecting the target, pressing a button) still registers
+// normally instead of being swallowed as a drag.
 function ReorderableTargetCard({ t, ...cardProps }) {
   const dragControls = useDragControls()
   return (
-    <Reorder.Item as="div" value={t} dragListener={false} dragControls={dragControls} className="target-card-reorder-item">
+    <Reorder.Item as="div" value={t} dragControls={dragControls} className="target-card-reorder-item">
       <TargetCard t={t} dragControls={dragControls} {...cardProps} />
     </Reorder.Item>
   )
@@ -26,7 +30,7 @@ export default function TargetPanel({
   targetSearch, setTargetSearch,
   dashSortCol, dashSortDir, toggleDashSort, selectDashSort,
   onQuickAdd, onOpenTool,
-  onReorder,
+  onReorder, moveTarget,
   forceRecheckOne, pauseOne, removeTarget, openTarget,
   targetState, destLamp, pathLamp, destHopOf, familyLabel, fmt, STATE_LABEL,
   view, alertMs, sel,
@@ -138,6 +142,7 @@ export default function TargetPanel({
               t={t}
               compact={compact}
               isSel={!!(sel && sel.id === t.id)}
+              moveTarget={moveTarget}
               forceRecheckOne={forceRecheckOne}
               pauseOne={pauseOne}
               removeTarget={removeTarget}

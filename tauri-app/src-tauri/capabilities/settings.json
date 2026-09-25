@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "settings-window",
+  "description": "The Settings window's own IPC surface — deliberately separate from capabilities/default.json's \"main\" grant (see that file's own description for the narrow-explicit-surface philosophy this follows) rather than just adding \"settings\" to its windows array: a settings window with the FULL main-window surface (target management, port scans, file read/write, elevation relaunch, etc.) would be needlessly broad for a window that only ever loads/saves the settings file and re-applies the auto-refresh tuning. Scoped to exactly that.",
+  "windows": ["settings"],
+  "permissions": [
+    "allow-load-app-settings",
+    "allow-save-app-settings",
+    "allow-get-recheck-tuning",
+    "core:app:allow-version",
+    "core:event:default"
+  ]
+}

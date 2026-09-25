@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-recheck-tuning"
+description = "Enables the get_recheck_tuning command without any pre-configured scope."
+commands.allow = ["get_recheck_tuning"]
+
+[[permission]]
+identifier = "deny-get-recheck-tuning"
+description = "Denies the get_recheck_tuning command without any pre-configured scope."
+commands.deny = ["get_recheck_tuning"]

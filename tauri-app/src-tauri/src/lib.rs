@@ -25,6 +25,7 @@ pub fn run() {
             commands::force_recheck,
             commands::get_state,
             commands::list_interfaces,
+            commands::list_interfaces_detailed,
             commands::export_target_csv,
             commands::export_all_targets_csv,
             commands::engine_build,
@@ -35,6 +36,13 @@ pub fn run() {
             commands::ping_stop,
             commands::write_file,
             commands::read_file,
+            commands::capabilities,
+            commands::relaunch_elevated,
+            commands::set_debug_logging,
+            commands::play_alert_sound,
+            commands::load_app_settings,
+            commands::save_app_settings,
+            commands::get_recheck_tuning,
         ])
         .setup(|app| {
             // Desktop-only (mobile has no update mechanism via this plugin —
@@ -67,6 +75,26 @@ pub fn run() {
             if let Ok(dir) = app.path().app_local_data_dir() {
                 let _ = std::fs::create_dir_all(&dir);
                 ffi::set_data_dir(&dir.to_string_lossy());
+            }
+
+            // FEATURE (user-requested): load the saved app-wide Settings
+            // (auto-refresh tuning + new-target defaults + theme — see
+            // commands::AppSettings's doc comment) as early as possible, so
+            // the engine's runtime auto-refresh default (see
+            // set_default_recheck_tuning, session.hpp) reflects whatever was
+            // saved BEFORE the main window's own JS has even loaded, let
+            // alone before a user could add a target — "loadable when app
+            // starts" means this, not "loaded whenever the Settings window
+            // happens to first be opened". The frontend also calls
+            // load_app_settings itself (to populate the Settings window's
+            // fields and the "Add target" form's defaults), which re-does
+            // this same file read; harmless — it's idempotent and cheap.
+            if let Err(e) = commands::load_app_settings(app.handle().clone()) {
+                // Not fatal — the engine already has its own compiled-in
+                // defaults (see set_default_recheck_tuning, session.hpp);
+                // this only means those hardcoded defaults stay in effect
+                // instead of whatever was saved.
+                eprintln!("[NetPulse] Failed to load app settings at startup (using built-in defaults): {e}");
             }
 
             if let Some(window) = app.get_webview_window("main") {

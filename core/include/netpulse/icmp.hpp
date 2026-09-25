@@ -16,6 +16,20 @@ struct ParsedReply {
     ReplyKind kind;
     uint16_t id;
     uint16_t seq;
+    // Which protocol the EMBEDDED original packet was, for TimeExceeded/
+    // Unreachable — 1=ICMP, 6=TCP, 17=UDP (standard IP protocol numbers),
+    // meaningless (left at 1) for EchoReply, which has no embedded packet.
+    // Exists because id/seq are read from different byte offsets/meanings
+    // depending on this: an ICMP-embedded original's id/seq is its echo
+    // identifier/sequence; a TCP-embedded original's id/seq is its source
+    // port / low 16 bits of its sequence number; a UDP-embedded original's
+    // id/seq is its source port / destination port. See parse_v4/parse_v6's
+    // implementation (icmp.cpp) — this one raw-ICMP-socket dispatch path is
+    // now shared by every protocol's sessions (see probe_udp.hpp's top
+    // comment for why UDP mode's hop AND destination replies both arrive
+    // here), so the parser sniffs the embedded IP header's protocol field
+    // rather than assuming ICMP.
+    uint8_t orig_proto = 1;
     // RFC 4950 MPLS label stack from a Time Exceeded/Unreachable's RFC 4884
     // extension structure, top-of-stack first. Each entry is the raw 32-bit
     // MPLS shim value: label:20 | exp/tc:3 | S:1 | ttl:8. Empty when the

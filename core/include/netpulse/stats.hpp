@@ -75,6 +75,18 @@ public:
     // cold file too, not just the RAM hot tier.
     void reset(uint64_t target_id, uint8_t hop);
 
+    // BUG FIX: removing a target used to leave EVERY (target_id, hop) pair
+    // it ever touched sitting in cache_ forever — nothing on the removal
+    // path ever called reset() or erased them. For a tool meant to run for
+    // a long time with targets added and removed over that span (exactly
+    // an enterprise monitoring workflow, not the short single-session use
+    // this was originally exercised under), that is unbounded in-memory
+    // growth keyed on total targets EVER added, not targets currently
+    // active. Also removes the on-disk cold-tier files for this target —
+    // those would otherwise accumulate on disk indefinitely too. Called
+    // from remove_target() (manager.hpp).
+    void forget_target(uint64_t target_id);
+
 private:
     ColdStore() = default;
 
@@ -112,6 +124,12 @@ private:
     std::condition_variable qcv_;
     std::deque<FlushJob> queue_;
     bool worker_started_ = false;
+    // See enqueue_flush()'s own doc comment (stats.cpp) for the full
+    // reasoning. Sized generously — this is meant to absorb a real backlog
+    // (a slow disk, AV scanning every write) without discarding anything
+    // under ordinary conditions, not to be a tight budget hit in normal use.
+    static constexpr size_t kMaxQueuedFlushJobs = 5000;
+    bool drop_notice_shown_ = false;
 };
 
 struct HopStat {
@@ -129,6 +147,20 @@ struct HopStat {
     // isn't aggregated over the focus window, it's just the most recent
     // non-empty stack this hop has reported.
     std::vector<uint32_t> mpls_labels;
+    // Local (source) port the most recent probe to this hop actually used
+    // — CONFIRMED (getsockname()), not assumed — TCP/UDP hop discovery only,
+    // 0 for ICMP or a hop that has never answered. The remote/destination
+    // port is deliberately NOT duplicated here: it's the same single value
+    // for every hop in a session (already shown once at the target level,
+    // e.g. the "TCP:443" badge), not a per-hop fact.
+    uint16_t local_port = 0;
+    // TCP only, destination hop only: was the most recent direct-probe
+    // completion a SYN-ACK (port genuinely open) or an RST (closed, but
+    // the host itself answered — still proof of reachability)? nullopt for
+    // anything else (ICMP/UDP, an intermediate hop, or a hop that has
+    // never gotten a direct reply) — NMAP-style "filtered" is the correct
+    // word for that case: a probe was sent and nothing came back at all.
+    std::optional<bool> tcp_port_open;
     // Only populated when `address` above is empty (a hop currently showing
     // `*`) AND this hop has answered at some point in the past — the last
     // address/hostname it had, and when it was last actually confirmed
@@ -139,6 +171,12 @@ struct HopStat {
     std::optional<std::string> stale_address;
     std::optional<std::string> stale_hostname;
     std::optional<double> stale_since;
+    // Set only alongside stale_address above: the last time ANY target
+    // (not necessarily this one) got a real reply from stale_address, per
+    // the shared-hop table in session.hpp — lets the UI distinguish "gone
+    // quiet everywhere" from "still answering other targets, just not
+    // this flow right now".
+    std::optional<double> stale_seen_elsewhere_at;
 };
 
 class HopStats {
@@ -156,6 +194,9 @@ public:
     void set_hostname(std::string h) { hostname_ = std::move(h); }
     const std::vector<uint32_t>& mpls_labels() const { return mpls_labels_; }
     void set_mpls_labels(std::vector<uint32_t> labels) { mpls_labels_ = std::move(labels); }
+    uint16_t local_port() const { return local_port_; }
+    void set_local_port(uint16_t port) { local_port_ = port; }
+    void set_tcp_port_open(bool open) { tcp_port_open_ = open; }
 
     // Assign / change the hop's IP. A real change (route flap) clears history.
     void set_address(const std::string& addr);
@@ -191,6 +232,8 @@ private:
     std::optional<std::string> hostname_;
     bool is_dest_ = false;
     std::vector<uint32_t> mpls_labels_;
+    uint16_t local_port_ = 0;
+    std::optional<bool> tcp_port_open_;
     std::deque<Sample> samples_; // hot tier only — bounded to kHotWindowSecs, see push()
     std::optional<std::string> stale_address_;
     std::optional<std::string> stale_hostname_;

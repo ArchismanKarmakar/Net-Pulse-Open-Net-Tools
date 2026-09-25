@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\Archisman\Downloads\NetPulse-cpp-web\33\NetPulse-cpp-web\build-cli-sidecar\CMakeFiles\3b2db2f2b4115e66dcd6b80ed536a488\RUN_TESTS_force.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{CEC07269-EF0A-3E14-AA79-191FA605F3F0}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

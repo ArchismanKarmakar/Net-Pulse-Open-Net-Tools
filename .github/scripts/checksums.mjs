@@ -5,7 +5,7 @@
 // issues with filenames electron-builder produces that contain spaces/em
 // dashes (e.g. "Net Pulse — Open Net Tools Setup 0.8.1.exe").
 import { createHash } from 'node:crypto';
-import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const dir = process.argv[2] || 'release';
@@ -14,9 +14,21 @@ const outFile = process.argv[3] || join(dir, 'SHA256SUMS.txt');
 const lines = [];
 for (const name of readdirSync(dir).sort()) {
   const full = join(dir, name);
-  if (statSync(full).isDirectory()) continue;
   if (name.startsWith('SHA256SUMS')) continue; // never hash a checksum file into itself
-  const hash = createHash('sha256').update(readFileSync(full)).digest('hex');
+  // No separate statSync()-then-readFileSync() check here on purpose: a
+  // check-then-act pair like that is a TOCTOU race (the entry could be
+  // replaced -- e.g. a directory swapped for a file, or vice versa --
+  // between the two calls). Just attempt the read and let it fail on its
+  // own terms; EISDIR is the only expected/benign failure (a subdirectory
+  // under `dir`), everything else is a real problem worth surfacing.
+  let data;
+  try {
+    data = readFileSync(full);
+  } catch (err) {
+    if (err.code === 'EISDIR') continue;
+    throw err;
+  }
+  const hash = createHash('sha256').update(data).digest('hex');
   lines.push(`${hash}  ${name}`);
 }
 

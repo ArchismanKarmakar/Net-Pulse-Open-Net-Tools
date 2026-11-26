@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.1.11
+
+First release of Net Pulse 2.x. Binaries only (Windows, macOS, Linux and the
+`npulse` CLI), free to use under the NetPulse Terms of Use; the 2.x source is
+not published. Download, install notes and checksums:
+[`docs/2.1.11/README.md`](docs/2.1.11/README.md). The entries below are
+Net Pulse 1.x, whose source is in this repository.
+
 ## 1.2.6
 
 Note on this release's version number: the version-bearing files

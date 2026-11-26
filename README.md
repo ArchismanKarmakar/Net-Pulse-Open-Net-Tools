@@ -17,6 +17,20 @@
   <a href="https://github.com/sponsors/ArchismanKarmakar">Sponsor</a>
 </p>
 
+> ### ⬇️ Net Pulse 2.1.11 is out
+> Free for personal and business use, on Windows, macOS and Linux, with the
+> `npulse` command line for servers.
+> **[Download 2.1.11](https://github.com/ArchismanKarmakar/Net-Pulse-Open-Net-Tools/releases/tag/2.1.11)** ·
+> [Website](https://netpulse.archismancoder.com/download/) ·
+> [Install & notes](docs/2.1.11/README.md) ·
+> [Terms of use](docs/2.1.11/TERMS.md) ·
+> [Privacy](docs/2.1.11/PRIVACY.md)
+>
+> 2.x is published as ready-to-run builds under the NetPulse Terms of Use; its
+> source code is not published. The source in this repository is
+> **Net Pulse 1.x (1.2.6)** under AGPL-3.0, and the rest of this README
+> describes 1.x.
+
 > ### 🦀 Now on Tauri + Rust + React (the C++ engine is unchanged)
 > The desktop shell moved from Electron/Node-API to **Tauri + Rust**, calling
 > the *same* C++ probe engine through a `cxx` bridge — statically linked into
